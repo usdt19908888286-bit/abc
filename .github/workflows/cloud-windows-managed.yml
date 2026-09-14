@@ -550,70 +550,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
-        shell: pwsh -NoLogo -NoProfile -WindowStyle Hidden -Command ". '{0}'"
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
 
-          # Keep the GitHub Actions job alive without exposing its shell/console on
-          # the managed desktop. The shell itself is launched hidden above; this
-          # Win32 layer also hides console-host windows that are not direct children
-          # of Runner.Worker (for example conhost/OpenConsole/Cascadia hosts).
+          # Keep the GitHub Actions job alive without exposing its pwsh/cmd/conhost
+          # windows on the managed desktop. Only hide windows owned by the GitHub
+          # Runner process tree; never hide terminals opened manually by the user.
           try {
             Add-Type -TypeDefinition @'
           using System;
           using System.Collections.Generic;
-          using System.Diagnostics;
           using System.Runtime.InteropServices;
-          using System.Text;
           public static class ManagedRunnerConsole {
               private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
               [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
               [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-              [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
-              [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-              [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
               [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
               [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
-
-              private static bool IsConsoleClass(string value) {
-                  if (String.IsNullOrWhiteSpace(value)) return false;
-                  return value.Equals("ConsoleWindowClass", StringComparison.OrdinalIgnoreCase)
-                      || value.IndexOf("CASCADIA", StringComparison.OrdinalIgnoreCase) >= 0
-                      || value.IndexOf("PseudoConsole", StringComparison.OrdinalIgnoreCase) >= 0;
-              }
-
-              public static long[] CaptureVisibleConsoleWindows() {
-                  var handles = new List<long>();
-                  EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
-                      if (!IsWindowVisible(hWnd)) return true;
-                      var cls = new StringBuilder(256);
-                      var title = new StringBuilder(512);
-                      GetClassName(hWnd, cls, cls.Capacity);
-                      GetWindowText(hWnd, title, title.Capacity);
-                      string c = cls.ToString();
-                      string t = title.ToString();
-                      bool console = IsConsoleClass(c)
-                          || t.IndexOf("cmd.exe", StringComparison.OrdinalIgnoreCase) >= 0
-                          || t.IndexOf("powershell.exe", StringComparison.OrdinalIgnoreCase) >= 0
-                          || t.IndexOf("pwsh.exe", StringComparison.OrdinalIgnoreCase) >= 0;
-                      if (console) handles.Add(hWnd.ToInt64());
-                      return true;
-                  }, IntPtr.Zero);
-                  var ownConsole = GetConsoleWindow();
-                  if (ownConsole != IntPtr.Zero) handles.Add(ownConsole.ToInt64());
-                  return handles.ToArray();
-              }
-
-              public static int HideWindowHandles(long[] handles) {
-                  int hidden = 0;
-                  foreach (var raw in handles ?? new long[0]) {
-                      var hWnd = new IntPtr(raw);
-                      if (hWnd == IntPtr.Zero) continue;
-                      if (ShowWindowAsync(hWnd, 0)) hidden++;
-                  }
-                  return hidden;
-              }
-
               public static int HideWindowsForProcesses(int[] processIds) {
                   var allowed = new HashSet<int>(processIds ?? new int[0]);
                   int hidden = 0;
@@ -635,7 +589,6 @@ jobs:
 
             $workflowSessionId = (Get-Process -Id $PID).SessionId
             $preconnectConsolePids = [System.Collections.Generic.HashSet[int]]::new()
-            $preconnectConsoleHwnds = [System.Collections.Generic.HashSet[long]]::new()
 
             function Add-PreConnectConsoleHosts {
               $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
@@ -645,9 +598,6 @@ jobs:
                 if ($name -match '^(conhost|OpenConsole|cmd|powershell|pwsh|WindowsTerminal|Runner\.(Worker|Listener))\.exe$') {
                   [void]$preconnectConsolePids.Add([int]$proc.ProcessId)
                 }
-              }
-              foreach ($hwnd in [ManagedRunnerConsole]::CaptureVisibleConsoleWindows()) {
-                [void]$preconnectConsoleHwnds.Add([long]$hwnd)
               }
             }
 
@@ -674,20 +624,19 @@ jobs:
                 }
               }
               [void][ManagedRunnerConsole]::HideWindowsForProcesses([int[]]@($managed))
-              [void][ManagedRunnerConsole]::HideWindowHandles([long[]]@($preconnectConsoleHwnds))
             }
 
-            # Nothing can connect yet, so every visible console present during this
-            # settling window belongs to runner/bootstrap. Freeze both its process IDs
-            # and exact HWNDs. After publication this set never grows, which means a
-            # CMD/Terminal opened manually by the user later remains visible.
-            for ($hideAttempt = 0; $hideAttempt -lt 25; $hideAttempt++) {
+            # Before the connection address is published, repeatedly collect every
+            # console host that belongs to the runner's interactive session. conhost /
+            # OpenConsole can be parented outside Runner.Worker, so process-tree-only
+            # hiding is insufficient. The set is frozen before users can connect.
+            for ($hideAttempt = 0; $hideAttempt -lt 20; $hideAttempt++) {
               Add-PreConnectConsoleHosts
               Hide-ManagedRunnerWindows
               Start-Sleep -Milliseconds 200
             }
           } catch { Write-Host "RUNNER_CONSOLE_HIDE_SKIPPED=$($_.Exception.Message)" }
-          Write-Host "MANAGED_RUNNER_CONSOLE_HIDDEN frozenWindows=$($preconnectConsoleHwnds.Count) frozenPids=$($preconnectConsolePids.Count)"
+          Write-Host 'MANAGED_RUNNER_CONSOLE_HIDDEN'
 
           # Do not publish the connection until the Runner console is already hidden.
           Write-Host "::add-mask::$env:BOOTSTRAP_TICKET"
@@ -1015,21 +964,30 @@ jobs:
             } catch { }
 
             if ($null -ne $issue -and $issue.body) {
+              $cmd = $null
               try {
                 $cmd = $issue.body | ConvertFrom-Json
-                if (
-                  $cmd.command -eq 'backup' -and
-                  [string]$cmd.system_type -eq 'windows' -and
-                  [string]$cmd.machine_id -eq $env:MACHINE_ID -and
-                  [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID
-                ) {
-                  Write-Host "BACKUP_REQUEST_RECEIVED issue=$($issue.number)"
-                  Set-Content -Path (Join-Path $env:RUNNER_TEMP 'managed-backup-issue-number.txt') -Value $issue.number -Encoding ASCII
+              } catch {
+                Write-Warning "BACKUP_COMMAND_PARSE_SKIPPED issue=$($issue.number) error=$($_.Exception.Message)"
+              }
+              if (
+                $null -ne $cmd -and
+                $cmd.command -eq 'backup' -and
+                [string]$cmd.system_type -eq 'windows' -and
+                [string]$cmd.machine_id -eq $env:MACHINE_ID -and
+                [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID
+              ) {
+                Write-Host "BACKUP_REQUEST_RECEIVED issue=$($issue.number)"
+                Set-Content -Path (Join-Path $env:RUNNER_TEMP 'managed-backup-issue-number.txt') -Value $issue.number -Encoding ASCII
+                try {
                   Stage-ManagedBackup
-                  'should_save=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-                  exit 0
+                } catch {
+                  Write-Error "BACKUP_STAGE_FAILED issue=$($issue.number) error=$($_.Exception.Message)"
+                  throw
                 }
-              } catch { }
+                'should_save=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+                exit 0
+              }
             }
 
             Hide-ManagedRunnerWindows
