@@ -341,6 +341,9 @@ jobs:
             Write-Host "MANAGED_WINDOWS_SOFTWARE_ROOT_RESTORED volume=$volume relative=$relative exit=$copyExit"
           }
           Write-Host "MANAGED_WINDOWS_SOFTWARE_FILES_RESTORED roots=$restoredRoots"
+          # Robocopy uses exit codes 1-7 for successful copies. GitHub's pwsh wrapper
+          # propagates the last native exit code unless we normalize it explicitly.
+          exit 0
 
       - name: Bind managed desktop to runner session and restore profile data
         shell: pwsh
