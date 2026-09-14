@@ -53,7 +53,7 @@ concurrency:
 jobs:
   desktop:
     runs-on: ${{ inputs.runner_image }}
-    timeout-minutes: 330
+    timeout-minutes: 360
     env:
       MACHINE_ID: ${{ inputs.machine_id || '001' }}
       MACHINE_NAME: ${{ inputs.machine_name || 'WINDOWS-001' }}
@@ -741,12 +741,24 @@ jobs:
           $stateRoot = Join-Path $backupRoot 'state'
           $deltaPath = Join-Path $stateRoot 'installed-apps-delta.json'
           $allowLegacyMissingPayload = $false
+          $backupVersion = 1
           $metadataPath = Join-Path $backupRoot 'metadata.json'
           if (Test-Path -LiteralPath $metadataPath) {
             try {
               $backupMetadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-              $allowLegacyMissingPayload = ([int]$backupMetadata.version -le 6 -and [int]$backupMetadata.software_app_delta_count -gt 0 -and [int]$backupMetadata.software_root_count -eq 0)
+              $backupVersion = if ($null -eq $backupMetadata.version) { 1 } else { [int]$backupMetadata.version }
+              $allowLegacyMissingPayload = ($backupVersion -le 7 -and [int]$backupMetadata.software_app_delta_count -gt 0 -and [int]$backupMetadata.software_root_count -eq 0)
             } catch { }
+          }
+          $payloadEvidenceByRegistry = @{}
+          $payloadEvidencePath = Join-Path $stateRoot 'app-payload-evidence.json'
+          if (Test-Path -LiteralPath $payloadEvidencePath) {
+            foreach ($entry in @(Get-Content -LiteralPath $payloadEvidencePath -Raw | ConvertFrom-Json)) {
+              $entryKey = ([string]$entry.registry_path).ToLowerInvariant()
+              if (-not $entryKey) { continue }
+              if (-not $payloadEvidenceByRegistry.ContainsKey($entryKey)) { $payloadEvidenceByRegistry[$entryKey] = @() }
+              $payloadEvidenceByRegistry[$entryKey] = @($payloadEvidenceByRegistry[$entryKey]) + @($entry)
+            }
           }
           if (-not (Test-Path -LiteralPath $deltaPath)) {
             Write-Host 'MANAGED_WINDOWS_APP_RESTORE_VERIFY none'
@@ -791,6 +803,22 @@ jobs:
               if (-not $exe) { continue }
               $declaredEvidence++
               if (Test-Path -LiteralPath $exe) { [void]$existingEvidence.Add("command:$exe") }
+            }
+            $regKey = $regPath.ToLowerInvariant()
+            foreach ($payload in @($payloadEvidenceByRegistry[$regKey])) {
+              $payloadPath = [Environment]::ExpandEnvironmentVariables(([string]$payload.path).Trim().Trim('"'))
+              if (-not $payloadPath -or -not [IO.Path]::IsPathRooted($payloadPath)) { continue }
+              $declaredEvidence++
+              if (Test-Path -LiteralPath $payloadPath -PathType Container) {
+                $payloadFile = Get-ChildItem -LiteralPath $payloadPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($null -ne $payloadFile) {
+                  [void]$existingEvidence.Add("payload:$payloadPath")
+                  Write-Host "MANAGED_WINDOWS_APP_PAYLOAD_RESTORE_OK name=$name path=$payloadPath sample=$($payloadFile.FullName)"
+                }
+              }
+            }
+            if ($backupVersion -ge 8 -and $declaredEvidence -eq 0) {
+              throw "Restored app has no payload evidence in a strict V8+ backup: $name registry=$regPath"
             }
             if ($declaredEvidence -gt 0 -and $existingEvidence.Count -eq 0) {
               if ($allowLegacyMissingPayload) {
@@ -1288,6 +1316,12 @@ jobs:
             Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID } | ForEach-Object {
               [void]$fixedVolumes.Add(([string]$_.DeviceID).ToUpperInvariant())
             }
+            # CIM inventory should always include the system volume, but keep an explicit
+            # fallback so a transient WMI/CIM failure can never silently discard Program Files.
+            if (-not [string]::IsNullOrWhiteSpace([string]$env:SystemDrive)) {
+              [void]$fixedVolumes.Add(([string]$env:SystemDrive).TrimEnd('\\').ToUpperInvariant())
+            }
+            Write-Host "MANAGED_WINDOWS_FIXED_VOLUMES=$(@($fixedVolumes) -join ',')"
             $softwareCandidates = [System.Collections.Generic.List[object]]::new()
             $softwareExcludePrefixes = [System.Collections.Generic.List[string]]::new()
             foreach ($candidate in @(
@@ -1319,18 +1353,39 @@ jobs:
               if ([string]::IsNullOrWhiteSpace($Path)) { return }
               try {
                 $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
-                if (-not [IO.Path]::IsPathRooted($expanded)) { return }
+                if (-not [IO.Path]::IsPathRooted($expanded)) {
+                  Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=not-rooted source=$Path evidence=$Reason"
+                  return
+                }
                 $full = [IO.Path]::GetFullPath($expanded).TrimEnd('\')
-                if (-not (Test-Path -LiteralPath $full -PathType Container)) { return }
-                if (Test-ManagedSoftwareExcludedPath -Path $full) { return }
+                if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+                  Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=missing source=$full evidence=$Reason"
+                  return
+                }
+                if (Test-ManagedSoftwareExcludedPath -Path $full) {
+                  Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=excluded source=$full evidence=$Reason"
+                  return
+                }
                 $volumeRoot = [IO.Path]::GetPathRoot($full)
-                if ([string]::IsNullOrWhiteSpace($volumeRoot)) { return }
+                if ([string]::IsNullOrWhiteSpace($volumeRoot)) {
+                  Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=no-volume source=$full evidence=$Reason"
+                  return
+                }
                 $volume = $volumeRoot.TrimEnd('\').ToUpperInvariant()
-                if (-not $fixedVolumes.Contains($volume)) { return }
+                if (-not $fixedVolumes.Contains($volume)) {
+                  Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=non-fixed-volume volume=$volume source=$full evidence=$Reason"
+                  return
+                }
                 $relative = $full.Substring($volumeRoot.Length).TrimStart('\')
-                if ([string]::IsNullOrWhiteSpace($relative)) { return }
+                if ([string]::IsNullOrWhiteSpace($relative)) {
+                  Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=volume-root source=$full evidence=$Reason"
+                  return
+                }
                 [void]$softwareCandidates.Add([pscustomobject]@{ volume=$volume; relative=$relative; source=$full; reason=$Reason })
-              } catch { }
+                Write-Host "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_ACCEPT volume=$volume relative=$relative evidence=$Reason"
+              } catch {
+                Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_REJECT reason=exception source=$Path evidence=$Reason detail=$($_.Exception.Message)"
+              }
             }
 
             function Resolve-CommandExecutablePath {
@@ -1407,13 +1462,34 @@ jobs:
                 foreach ($programDir in $programDirectoryInventory) {
                   $leafToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileName($programDir))
                   if ($leafToken -eq $registryToken) {
-                    Add-SoftwareRootCandidate -Path $programDir -Reason "registry-identity:$($app.name)"
-                    Write-Host "MANAGED_WINDOWS_APP_DIRECTORY_MATCH app=$($app.name) registryLeaf=$registryLeaf path=$programDir"
+                    # This path is already bounded by the Program Files inventory above, so
+                    # persist it directly as app payload evidence as well as feeding the
+                    # generic candidate path. This prevents a defensive candidate filter from
+                    # turning a proven registry-identity match into a registry-only backup.
+                    $payloadPath = [IO.Path]::GetFullPath($programDir).TrimEnd('\')
+                    $payloadVolumeRoot = [IO.Path]::GetPathRoot($payloadPath)
+                    $payloadVolume = $payloadVolumeRoot.TrimEnd('\').ToUpperInvariant()
+                    $payloadRelative = $payloadPath.Substring($payloadVolumeRoot.Length).TrimStart('\')
+                    Add-SoftwareRootCandidate -Path $payloadPath -Reason "registry-identity:$($app.name)"
+                    if (-not ($softwareCandidates | Where-Object { ([string]$_.source).Equals($payloadPath,[System.StringComparison]::OrdinalIgnoreCase) })) {
+                      [void]$softwareCandidates.Add([pscustomobject]@{ volume=$payloadVolume; relative=$payloadRelative; source=$payloadPath; reason="registry-identity-direct:$($app.name)" })
+                      Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_DIRECT app=$($app.name) path=$payloadPath"
+                    }
+                    [void]$appPayloadEvidence.Add([pscustomobject]@{
+                      registry_path = [string]$app.registry_path
+                      name = [string]$app.name
+                      path = $payloadPath
+                      volume = $payloadVolume
+                      relative = $payloadRelative
+                      evidence = 'registry-identity'
+                    })
+                    Write-Host "MANAGED_WINDOWS_APP_DIRECTORY_MATCH app=$($app.name) registryLeaf=$registryLeaf path=$payloadPath"
                     break
                   }
                 }
               }
             }
+            ConvertTo-Json -InputObject @($appPayloadEvidence) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-payload-evidence.json') -Encoding UTF8
 
             $baselineServiceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $baselineServicesPath = Join-Path $baselineRoot 'services.json'
@@ -1801,10 +1877,13 @@ jobs:
             $softwareMeasure = Get-ChildItem -LiteralPath $backupSoftware -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
             $softwareBytes = if ($null -eq $softwareMeasure.Sum) { [int64]0 } else { [int64]$softwareMeasure.Sum }
             $softwareFiles = [int64]$softwareMeasure.Count
+            if (@($appPayloadEvidence).Count -gt 0 -and (@($softwareRoots).Count -eq 0 -or $softwareFiles -eq 0)) {
+              throw "Strict app payload backup failed: evidence=$(@($appPayloadEvidence).Count) roots=$(@($softwareRoots).Count) files=$softwareFiles"
+            }
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 7
+              version = 8
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1812,7 +1891,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v7-registry-identity-program-roots'
+              scope = 'managed-windows-state-v8-strict-app-payload-manifest'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -1820,6 +1899,7 @@ jobs:
               software_bytes = $softwareBytes
               software_root_count = @($softwareRoots).Count
               software_app_delta_count = @($appDelta).Count
+              software_app_payload_evidence_count = @($appPayloadEvidence).Count
               software_service_delta_count = @($serviceDelta).Count
               uninstall_registry_count = @($uninstallRegistryManifest).Count
               backup_bytes = $backupBytes
@@ -1834,12 +1914,12 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V7_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V8_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
           $commandTitle = "Cloud Windows Command $env:MACHINE_ID"
-          for ($i = 0; $i -lt 1800; $i++) {
+          while ($true) {
             $issue = $null
             try {
               $raw = & gh api "/repos/$env:GITHUB_REPOSITORY/issues?state=open&per_page=100" 2>$null
@@ -1882,9 +1962,6 @@ jobs:
             if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
           }
 
-          Write-Host 'SESSION_TIMEOUT_AUTO_BACKUP'
-          Stage-ManagedBackup
-          'should_save=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Save Windows user backup to GitHub Actions Cache
         if: steps.session.outputs.should_save == 'true'
