@@ -561,13 +561,34 @@ jobs:
             Add-Type -TypeDefinition @'
           using System;
           using System.Collections.Generic;
+          using System.Diagnostics;
           using System.Runtime.InteropServices;
+          using System.Text;
           public static class ManagedRunnerConsole {
               private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
               [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
               [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
               [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+              [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
               [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+
+              private static string WindowClass(IntPtr hWnd) {
+                  var text = new StringBuilder(256);
+                  GetClassName(hWnd, text, text.Capacity);
+                  return text.ToString();
+              }
+              private static string WindowTitle(IntPtr hWnd) {
+                  var text = new StringBuilder(512);
+                  GetWindowText(hWnd, text, text.Capacity);
+                  return text.ToString();
+              }
+              private static bool IsConsoleHostClass(string value) {
+                  return string.Equals(value, "ConsoleWindowClass", StringComparison.OrdinalIgnoreCase)
+                      || string.Equals(value, "CASCADIA_HOSTING_WINDOW_CLASS", StringComparison.OrdinalIgnoreCase)
+                      || string.Equals(value, "PseudoConsoleWindow", StringComparison.OrdinalIgnoreCase);
+              }
               public static int HideWindowsForProcesses(int[] processIds) {
                   var allowed = new HashSet<int>(processIds ?? new int[0]);
                   int hidden = 0;
@@ -584,10 +605,48 @@ jobs:
                   if (ownConsole != IntPtr.Zero) { ShowWindowAsync(ownConsole, 0); hidden++; }
                   return hidden;
               }
+              public static int HidePreexistingConsoleWindows(int sessionId, long cutoffFileTimeUtc) {
+                  int hidden = 0;
+                  EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                      try {
+                          string cls = WindowClass(hWnd);
+                          if (!IsConsoleHostClass(cls)) return true;
+                          uint pid;
+                          GetWindowThreadProcessId(hWnd, out pid);
+                          var process = Process.GetProcessById((int)pid);
+                          if (process.SessionId != sessionId) return true;
+                          long started = process.StartTime.ToUniversalTime().ToFileTimeUtc();
+                          if (started > cutoffFileTimeUtc) return true;
+                          ShowWindowAsync(hWnd, 0);
+                          hidden++;
+                      } catch { }
+                      return true;
+                  }, IntPtr.Zero);
+                  return hidden;
+              }
+              public static string[] DescribePreexistingConsoleWindows(int sessionId, long cutoffFileTimeUtc) {
+                  var rows = new List<string>();
+                  EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+                      try {
+                          string cls = WindowClass(hWnd);
+                          if (!IsConsoleHostClass(cls)) return true;
+                          uint pid;
+                          GetWindowThreadProcessId(hWnd, out pid);
+                          var process = Process.GetProcessById((int)pid);
+                          if (process.SessionId != sessionId) return true;
+                          long started = process.StartTime.ToUniversalTime().ToFileTimeUtc();
+                          if (started > cutoffFileTimeUtc) return true;
+                          rows.Add("pid=" + pid + " process=" + process.ProcessName + " class=" + cls + " visible=" + IsWindowVisible(hWnd) + " title=" + WindowTitle(hWnd));
+                      } catch { }
+                      return true;
+                  }, IntPtr.Zero);
+                  return rows.ToArray();
+              }
           }
           '@
 
             $workflowSessionId = (Get-Process -Id $PID).SessionId
+            $consoleCutoffFileTimeUtc = [DateTime]::UtcNow.AddSeconds(1).ToFileTimeUtc()
             $preconnectConsolePids = [System.Collections.Generic.HashSet[int]]::new()
 
             function Add-PreConnectConsoleHosts {
@@ -623,18 +682,25 @@ jobs:
                   if ($managed.Contains([int]$proc.ParentProcessId) -and $managed.Add([int]$proc.ProcessId)) { $changed = $true }
                 }
               }
-              [void][ManagedRunnerConsole]::HideWindowsForProcesses([int[]]@($managed))
+              $treeHidden = [ManagedRunnerConsole]::HideWindowsForProcesses([int[]]@($managed))
+              $consoleHidden = [ManagedRunnerConsole]::HidePreexistingConsoleWindows([int]$workflowSessionId, [int64]$consoleCutoffFileTimeUtc)
+              return ($treeHidden + $consoleHidden)
             }
 
-            # Before the connection address is published, repeatedly collect every
-            # console host that belongs to the runner's interactive session. conhost /
-            # OpenConsole can be parented outside Runner.Worker, so process-tree-only
-            # hiding is insufficient. The set is frozen before users can connect.
+            # Capture and hide all console hosts that already exist before the
+            # address is published. Windows may re-show an existing console HWND
+            # when an RDP client attaches, so the same pre-connect windows are
+            # hidden again throughout the keepalive loop. Terminals started by the
+            # user after connection have a later process start time and are untouched.
+            $initialHidden = 0
             for ($hideAttempt = 0; $hideAttempt -lt 20; $hideAttempt++) {
               Add-PreConnectConsoleHosts
-              Hide-ManagedRunnerWindows
+              $initialHidden = Hide-ManagedRunnerWindows
               Start-Sleep -Milliseconds 200
             }
+            $consoleRows = @([ManagedRunnerConsole]::DescribePreexistingConsoleWindows([int]$workflowSessionId, [int64]$consoleCutoffFileTimeUtc))
+            Write-Host "MANAGED_RUNNER_CONSOLE_PRECONNECT hidden=$initialHidden trackedPids=$($preconnectConsolePids.Count) consoleWindows=$($consoleRows.Count)"
+            foreach ($row in $consoleRows) { Write-Host "MANAGED_RUNNER_CONSOLE_WINDOW $row" }
           } catch { Write-Host "RUNNER_CONSOLE_HIDE_SKIPPED=$($_.Exception.Message)" }
           Write-Host 'MANAGED_RUNNER_CONSOLE_HIDDEN'
 
