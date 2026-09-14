@@ -1047,6 +1047,10 @@ jobs:
                   public IntPtr Reserved;
               }
 
+              [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+              private static extern bool SetupDiGetINFClass(
+                  string InfName, out Guid ClassGuid, StringBuilder ClassName, uint ClassNameSize, IntPtr RequiredSize);
+
               [DllImport("setupapi.dll", SetLastError=true)]
               private static extern IntPtr SetupDiCreateDeviceInfoList(ref Guid ClassGuid, IntPtr hwndParent);
 
