@@ -1,0 +1,346 @@
+name: Managed Ubuntu Cloud PC
+run-name: ${{ inputs.machine_name || 'Managed Ubuntu' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'ubuntu-24.04' }} / ${{ inputs.mode || 'new' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Start fresh or restore the latest managed user-data backup
+        required: true
+        default: new
+        type: choice
+        options:
+          - new
+          - restore
+      machine_id:
+        description: Logical machine ID
+        required: true
+        default: '001'
+        type: string
+      machine_name:
+        description: Friendly machine name
+        required: false
+        default: 'UBUNTU-001'
+        type: string
+      runner_image:
+        description: Ubuntu GitHub-hosted runner image selected from the live actions/runner-images catalog
+        required: true
+        default: ubuntu-24.04
+        type: string
+      desktop_username:
+        description: Ubuntu local account used for SSH
+        required: true
+        default: clouduser
+        type: string
+      bootstrap_ticket:
+        description: Cloudflare bootstrap ticket
+        required: true
+        type: string
+      web_url:
+        description: Current Web URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: managed-ubuntu-${{ inputs.machine_id || '001' }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    runs-on: ${{ inputs.runner_image }}
+    timeout-minutes: 330
+    env:
+      MACHINE_ID: ${{ inputs.machine_id || '001' }}
+      MACHINE_NAME: ${{ inputs.machine_name || 'UBUNTU-001' }}
+      DESKTOP_USERNAME: ${{ inputs.desktop_username || 'clouduser' }}
+      RUNNER_IMAGE: ${{ inputs.runner_image }}
+      MACHINE_MODE: ${{ inputs.mode || 'new' }}
+      WEB_URL: ${{ inputs.web_url }}
+    steps:
+      - name: Bootstrap runtime from Cloudflare
+        env:
+          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${BOOTSTRAP_TICKET}"
+          INSTANCE_KEY="instance:ubuntu:${MACHINE_ID}"
+          BODY=$(printf '{"instanceKey":"%s","repository":"%s","runId":%s}' "$INSTANCE_KEY" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare control URL is invalid'; exit 1 ;; esac
+          curl -fsS --retry 3 -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/bootstrap" -o /tmp/cloud-bootstrap.json
+          TS_CLIENT_ID=$(jq -r '.tailscaleClientId // empty' /tmp/cloud-bootstrap.json)
+          TS_CLIENT_SECRET=$(jq -r '.tailscaleClientSecret // empty' /tmp/cloud-bootstrap.json)
+          CLOUD_PASSWORD=$(jq -r '.desktopPassword // empty' /tmp/cloud-bootstrap.json)
+          TUNNEL_MODE=$(jq -r '.tunnelMode // "tailscale"' /tmp/cloud-bootstrap.json)
+          TS_DNS_HOSTNAME=$(jq -r '.tailscaleHostname // empty' /tmp/cloud-bootstrap.json)
+          CF_TUNNEL_HOSTNAME=$(jq -r '.cloudflareHostname // empty' /tmp/cloud-bootstrap.json)
+          CF_TUNNEL_TOKEN=$(jq -r '.cloudflareTunnelToken // empty' /tmp/cloud-bootstrap.json)
+          [ -n "$TS_CLIENT_ID" ] && [ -n "$TS_CLIENT_SECRET" ] || { echo '::error::Cloudflare Tailscale configuration is incomplete'; exit 1; }
+          [ -n "$CLOUD_PASSWORD" ] || { echo '::error::Cloudflare desktop password is empty'; exit 1; }
+          if [ "$TUNNEL_MODE" = 'cloudflare' ] || [ "$TUNNEL_MODE" = 'dual' ]; then
+            [ -n "$CF_TUNNEL_HOSTNAME" ] && [ -n "$CF_TUNNEL_TOKEN" ] || { echo '::error::Cloudflare Tunnel bootstrap is incomplete'; exit 1; }
+          fi
+          for value in "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$CF_TUNNEL_TOKEN"; do [ -z "$value" ] || echo "::add-mask::$value"; done
+          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\n' \
+            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" >> "$GITHUB_ENV"
+          rm -f /tmp/cloud-bootstrap.json
+          echo 'CLOUDFLARE_BOOTSTRAP_OK'
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$MACHINE_ID" in ''|*[!0-9]*) echo '::error::machine_id must contain digits only'; exit 1 ;; esac
+          [[ "$DESKTOP_USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo '::error::desktop_username is invalid'; exit 1; }
+          printf '%s\n' "$RUNNER_IMAGE" | grep -Eq '^ubuntu-[0-9]{2}\.[0-9]{2}$' || { echo "::error::Unsupported Ubuntu runner image label: $RUNNER_IMAGE"; exit 1; }
+          case "$MACHINE_MODE" in new|restore) ;; *) echo "::error::Unsupported mode: $MACHINE_MODE"; exit 1 ;; esac
+          [ -n "${CLOUD_PASSWORD:-}" ] || { echo '::error::Desktop password secret is empty'; exit 1; }
+
+      - name: Prepare Tailscale hostname
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Network identity is independent from the display/business name.
+          # The same machine ID always reuses the same Tailscale/MagicDNS hostname.
+          ts_hostname="ubuntu-${MACHINE_ID}"
+          echo "ts_hostname=${ts_hostname}" >> "$GITHUB_OUTPUT"
+          echo "TAILSCALE_STABLE_HOSTNAME=${ts_hostname}"
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ env.TS_CLIENT_ID }}
+          oauth-secret: ${{ env.TS_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: ${{ steps.identity.outputs.ts_hostname }}
+          version: latest
+
+      - name: Report Tailscale presence to Cloudflare
+        env:
+          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${BOOTSTRAP_TICKET}"
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ] || { echo '::error::No Tailscale IPv4 address was assigned'; exit 1; }
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare Web URL is invalid'; exit 1 ;; esac
+          BODY=$(jq -nc --arg key "$INSTANCE_KEY" --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" --arg node "ubuntu-${MACHINE_ID}" --arg ts "${TS_IPV4}:22" --arg tsHost "${TS_DNS_HOSTNAME:-}" --arg cf "${CF_TUNNEL_HOSTNAME:-}" --arg mode "${TUNNEL_MODE:-tailscale}" '{instanceKey:$key,repository:$repo,runId:$run,nodeName:$node,address:$ts,tailscaleAddress:$ts,tailscaleHostname:$tsHost,cloudflareAddress:$cf,cloudflareHostname:$cf,tunnelMode:$mode,status:"network_ready"}')
+          curl -fsS --retry 3 -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-early-report.json
+          echo "TAILSCALE_EARLY_REPORT_OK=${TS_IPV4}:22"
+
+      - name: Restore latest Ubuntu user backup
+        if: ${{ inputs.mode == 'restore' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: /tmp/managed-desktop-backup
+          key: managed-desktop-ubuntu-${{ inputs.machine_id }}-restore-${{ github.run_id }}
+          restore-keys: |
+            managed-desktop-ubuntu-${{ inputs.machine_id }}-
+
+      - name: Enable private SSH session and restore data
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server rsync jq
+
+          if ! id "$DESKTOP_USERNAME" >/dev/null 2>&1; then
+            if getent group "$DESKTOP_USERNAME" >/dev/null 2>&1; then
+              # GitHub Ubuntu images already contain some system groups (notably "admin").
+              # Reuse an existing same-name group instead of asking useradd to create it again.
+              sudo useradd -m -s /bin/bash -g "$DESKTOP_USERNAME" "$DESKTOP_USERNAME"
+            else
+              sudo useradd -m -s /bin/bash "$DESKTOP_USERNAME"
+            fi
+          fi
+          printf '%s:%s\n' "$DESKTOP_USERNAME" "$CLOUD_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo "$DESKTOP_USERNAME"
+
+          if [ "$MACHINE_MODE" = 'restore' ]; then
+            [ -f /tmp/managed-desktop-backup/metadata.json ] || { echo '::error::Restore mode requested, but no managed Ubuntu backup was found.'; exit 1; }
+            [ -d /tmp/managed-desktop-backup/home ] || { echo '::error::Ubuntu backup home directory is missing.'; exit 1; }
+            sudo rsync -a /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
+            sudo chown -R "${DESKTOP_USERNAME}:${DESKTOP_USERNAME}" "/home/${DESKTOP_USERNAME}"
+            echo 'MANAGED_DESKTOP_RESTORE_APPLIED'
+          else
+            echo 'MANAGED_DESKTOP_FRESH_START'
+          fi
+
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ] || { echo '::error::No Tailscale IPv4 address was assigned'; exit 1; }
+
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          sudo install -d -m 0755 /run/sshd
+          sudo tee /etc/ssh/sshd_config.d/99-managed-cloud.conf >/dev/null <<EOF
+          ListenAddress ${TS_IPV4}
+          ListenAddress 127.0.0.1
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          AllowUsers ${DESKTOP_USERNAME}
+          EOF
+          sudo sshd -t
+          sudo systemctl restart ssh
+
+          echo 'MANAGED_UBUNTU_READY'
+          echo "TAILSCALE_SSH=${TS_IPV4}:22"
+          echo "SSH_USER=${DESKTOP_USERNAME}"
+          echo "UBUNTU_RUNNER_IMAGE=$RUNNER_IMAGE"
+          echo "MANAGED_DESKTOP_MODE=$MACHINE_MODE"
+
+      - name: Start Cloudflare SSH tunnel
+        if: ${{ env.TUNNEL_MODE == 'cloudflare' || env.TUNNEL_MODE == 'dual' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ -n "${CF_TUNNEL_HOSTNAME:-}" ] || { echo '::error::Cloudflare Tunnel bootstrap is incomplete'; exit 1; }
+          echo "::add-mask::${CF_TUNNEL_TOKEN}"
+          CLOUDFLARED=/tmp/cloudflared-managed
+          TOKEN_FILE=/tmp/cloudflared-managed-token
+          LOG_FILE=/tmp/cloudflared-managed.log
+          curl -fsSL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o "$CLOUDFLARED"
+          chmod +x "$CLOUDFLARED"
+          printf '%s' "$CF_TUNNEL_TOKEN" > "$TOKEN_FILE"
+          chmod 600 "$TOKEN_FILE"
+          : > "$LOG_FILE"
+          nohup "$CLOUDFLARED" tunnel --no-autoupdate --loglevel info --logfile "$LOG_FILE" run --token-file "$TOKEN_FILE" >/dev/null 2>&1 &
+          echo $! >/tmp/cloudflared-managed.pid
+          READY=0
+          for _ in $(seq 1 60); do
+            if grep -q 'Registered tunnel connection' "$LOG_FILE" 2>/dev/null; then READY=1; break; fi
+            kill -0 "$(cat /tmp/cloudflared-managed.pid)" 2>/dev/null || break
+            sleep 1
+          done
+          if [ "$READY" != '1' ]; then tail -n 80 "$LOG_FILE" || true; echo '::error::Cloudflare SSH tunnel did not connect'; exit 1; fi
+          echo "CLOUDFLARE_SSH_TUNNEL=${CF_TUNNEL_HOSTNAME}"
+
+      - name: Sync runtime state
+        env:
+          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${BOOTSTRAP_TICKET}"
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ] || { echo '::error::No Tailscale IPv4 address was assigned'; exit 1; }
+          INSTANCE_KEY="instance:ubuntu:${MACHINE_ID}"
+          BODY=$(jq -nc \
+            --arg key "$INSTANCE_KEY" --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
+            --arg node "ubuntu-${MACHINE_ID}" --arg ts "${TS_IPV4}:22" \
+            --arg tsHost "${TS_DNS_HOSTNAME:-}" --arg cf "${CF_TUNNEL_HOSTNAME:-}" --arg mode "${TUNNEL_MODE:-tailscale}" \
+            '{instanceKey:$key,repository:$repo,runId:$run,nodeName:$node,address:$ts,tailscaleAddress:$ts,tailscaleHostname:$tsHost,cloudflareAddress:$cf,cloudflareHostname:$cf,tunnelMode:$mode,status:"in_progress"}')
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare control URL is invalid'; exit 1 ;; esac
+          curl -fsS --retry 3 -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-report.json
+          echo "CLOUDFLARE_RUNNER_REPORT_OK=${TS_IPV4}:22"
+          jq -r 'select(.tailscaleDomain != null and .tailscaleDomain != "") | "TAILSCALE_FIXED_DOMAIN=" + .tailscaleDomain' /tmp/cloud-report.json || true
+          jq -r 'select(.cloudflareDomain != null and .cloudflareDomain != "") | "CLOUDFLARE_FIXED_DOMAIN=" + .cloudflareDomain' /tmp/cloud-report.json || true
+          rm -f /tmp/cloud-report.json
+
+      - name: Keep Ubuntu session alive and watch backup command
+        id: session
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          stage_backup() {
+            sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
+            sleep 2
+            rm -rf /tmp/managed-desktop-backup
+            mkdir -p /tmp/managed-desktop-backup/home
+            sudo rsync -a --delete --exclude='.cache/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
+            sudo chown -R "$USER:$USER" /tmp/managed-desktop-backup
+            python3 - <<'PY' >/tmp/managed-desktop-backup/metadata.json
+          import json, os
+          from datetime import datetime, timezone
+          print(json.dumps({
+              'version': 1,
+              'system_type': 'ubuntu',
+              'machine_id': os.environ['MACHINE_ID'],
+              'desktop_username': os.environ['DESKTOP_USERNAME'],
+              'runner_image': os.environ['RUNNER_IMAGE'],
+              'run_id': int(os.environ['GITHUB_RUN_ID']),
+              'created_at': datetime.now(timezone.utc).isoformat(),
+              'scope': 'managed-user-home-without-dot-cache',
+          }, separators=(',', ':')))
+          PY
+            echo 'MANAGED_DESKTOP_BACKUP_STAGED'
+          }
+
+          COMMAND_TITLE="Cloud Ubuntu Command ${MACHINE_ID}"
+          for _ in $(seq 1 1800); do
+            ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | .number" \
+              2>/dev/null | head -n1 || true)
+            if [ -n "$ISSUE_NO" ]; then
+              ISSUE_BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" --jq '.body // ""' 2>/dev/null || true)
+              CMD_JSON=$(printf '%s\n' "$ISSUE_BODY" | grep -m1 '^{' || true)
+              if [ -n "$CMD_JSON" ]; then
+                CMD=$(jq -r '.command // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_SYSTEM=$(jq -r '.system_type // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_RUN=$(jq -r '.run_id // 0' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_MACHINE=$(jq -r '.machine_id // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                if [ "$CMD" = 'backup' ] && [ "$TARGET_SYSTEM" = 'ubuntu' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_MACHINE" = "$MACHINE_ID" ]; then
+                  echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"
+                  printf '%s' "$ISSUE_NO" >/tmp/managed-backup-issue-number
+                  stage_backup
+                  echo 'should_save=true' >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              fi
+            fi
+            sleep 10
+            systemctl is-active --quiet ssh || sudo systemctl restart ssh
+          done
+
+          echo 'SESSION_TIMEOUT_AUTO_BACKUP'
+          stage_backup
+          echo 'should_save=true' >> "$GITHUB_OUTPUT"
+
+      - name: Save Ubuntu user backup to GitHub Actions Cache
+        if: steps.session.outputs.should_save == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: /tmp/managed-desktop-backup
+          key: managed-desktop-ubuntu-${{ inputs.machine_id }}-${{ github.run_id }}
+
+      - name: Close consumed Ubuntu backup command
+        if: steps.session.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s /tmp/managed-backup-issue-number ]; then
+            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)
+            gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" -f state=closed >/dev/null
+          fi
+          echo 'MANAGED_DESKTOP_BACKUP_SAVED'
+          echo 'MANAGED_UBUNTU_BACKUP_SAVED'
+
+      - name: Report Ubuntu workflow failure to Cloudflare
+        if: ${{ failure() }}
+        env:
+          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
+        shell: bash
+        run: |
+          set +e
+          echo "::add-mask::${BOOTSTRAP_TICKET}"
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) exit 0 ;; esac
+          TS_IPV4=$(tailscale ip -4 2>/dev/null | head -n1)
+          TS_ADDR=""
+          [ -z "$TS_IPV4" ] || TS_ADDR="${TS_IPV4}:22"
+          BODY=$(jq -nc --arg key "$INSTANCE_KEY" --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" --arg node "ubuntu-${MACHINE_ID}" --arg ts "$TS_ADDR" --arg tsHost "${TS_DNS_HOSTNAME:-}" --arg cf "${CF_TUNNEL_HOSTNAME:-}" --arg mode "${TUNNEL_MODE:-tailscale}" '{instanceKey:$key,repository:$repo,runId:$run,nodeName:$node,address:$ts,tailscaleAddress:$ts,tailscaleHostname:$tsHost,cloudflareAddress:$cf,cloudflareHostname:$cf,tunnelMode:$mode,status:"failure"}')
+          curl -fsS -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-failure-report.json || true
