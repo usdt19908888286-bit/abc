@@ -144,6 +144,29 @@ jobs:
           $baselineRoot = Join-Path $env:RUNNER_TEMP 'managed-software-baseline'
           New-Item -ItemType Directory -Path $baselineRoot -Force | Out-Null
 
+          function Get-InstalledAppInventory {
+            $items = [System.Collections.Generic.List[object]]::new()
+            foreach ($uninstallRoot in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            )) {
+              Get-ItemProperty $uninstallRoot -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+                $registryPath = ([string]$_.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::','')
+                [void]$items.Add([pscustomobject]@{
+                  registry_path = $registryPath
+                  name = [string]$_.DisplayName
+                  version = [string]$_.DisplayVersion
+                  publisher = [string]$_.Publisher
+                  install_location = [string]$_.InstallLocation
+                  display_icon = [string]$_.DisplayIcon
+                  uninstall = [string]$_.UninstallString
+                  quiet_uninstall = [string]$_.QuietUninstallString
+                })
+              }
+            }
+            return @($items | Sort-Object registry_path -Unique)
+          }
+
           if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
             try {
               $path = Join-Path $baselineRoot 'winget.json'
@@ -161,7 +184,21 @@ jobs:
           if (Get-Command scoop -ErrorAction SilentlyContinue) {
             try { & scoop export | Set-Content -LiteralPath (Join-Path $baselineRoot 'scoop.json') -Encoding UTF8 } catch { }
           }
-          Write-Host 'MANAGED_WINDOWS_SOFTWARE_BASELINE_READY'
+
+          $baselineApps = @(Get-InstalledAppInventory)
+          ConvertTo-Json -InputObject $baselineApps -Depth 6 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installed-apps.json') -Encoding UTF8
+
+          # Managed backup boundary:
+          # - portable/no-install files belong under the user profile and are preserved by the profile snapshot;
+          # - installed software is discovered only from explicit install evidence (uninstall registry,
+          #   package managers and service executable commands), never by broad disk scanning.
+          $baselineServices = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{ name=[string]$_.Name; path=[string]$_.PathName; start_mode=[string]$_.StartMode; start_name=[string]$_.StartName; display_name=[string]$_.DisplayName }
+          })
+          ConvertTo-Json -InputObject $baselineServices -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'services.json') -Encoding UTF8
+          @{ captured_at=[DateTime]::UtcNow.ToString('o'); installed_apps=@($baselineApps).Count; services=@($baselineServices).Count } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baselineRoot 'baseline.json') -Encoding UTF8
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_BASELINE_READY apps=$(@($baselineApps).Count) services=$(@($baselineServices).Count)"
 
       - name: Initialize RDP stack for single managed session
         shell: pwsh
@@ -244,6 +281,43 @@ jobs:
           key: managed-desktop-windows-${{ inputs.machine_id }}-restore-${{ github.run_id }}
           restore-keys: |
             managed-desktop-windows-${{ inputs.machine_id }}-
+
+      - name: Restore Windows software delta
+        if: ${{ inputs.mode == 'restore' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $restoreRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
+          $stateRoot = Join-Path $restoreRoot 'state'
+          $softwareRoot = Join-Path $restoreRoot 'software'
+          $manifestPath = Join-Path $stateRoot 'software-roots.json'
+          if (-not (Test-Path -LiteralPath $manifestPath) -or -not (Test-Path -LiteralPath $softwareRoot)) {
+            Write-Host 'MANAGED_WINDOWS_SOFTWARE_DELTA_LEGACY_BACKUP none'
+            exit 0
+          }
+
+          $restoredRoots = 0
+          $fixedVolumes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID } | ForEach-Object {
+            [void]$fixedVolumes.Add(([string]$_.DeviceID).ToUpperInvariant())
+          }
+          foreach ($entry in @(Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json)) {
+            $volume = ([string]$entry.volume).ToUpperInvariant()
+            $relative = ([string]$entry.relative).TrimStart('\')
+            if ($volume -notmatch '^[A-Z]:$' -or -not $fixedVolumes.Contains($volume)) { throw "Software restore volume is unavailable/unsafe: $volume" }
+            if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { throw "Unsafe software restore relative path: $relative" }
+            $volumeKey = $volume.TrimEnd(':')
+            $source = Join-Path (Join-Path $softwareRoot $volumeKey) $relative
+            if (-not (Test-Path -LiteralPath $source -PathType Container)) { Write-Warning "Software backup root missing: $volume/$relative"; continue }
+            $destination = Join-Path "$volume\" $relative
+            New-Item -ItemType Directory -Path $destination -Force | Out-Null
+            & robocopy.exe $source $destination /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /XJ /NFL /NDL /NP | Out-Host
+            $copyExit = $LASTEXITCODE
+            if ($copyExit -ge 8) { throw "Software restore failed exit=$copyExit root=$volume/$relative" }
+            $restoredRoots++
+            Write-Host "MANAGED_WINDOWS_SOFTWARE_ROOT_RESTORED volume=$volume relative=$relative exit=$copyExit"
+          }
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_FILES_RESTORED roots=$restoredRoots"
 
       - name: Bind managed desktop to runner session and restore profile data
         shell: pwsh
@@ -491,6 +565,19 @@ jobs:
           }
           Write-Host "MANAGED_WINDOWS_SOFTWARE_REHYDRATE packagesOk=$softwareOk packagesFailed=$softwareFailed"
 
+          $uninstallRegistryRestored = 0
+          $uninstallRegistryManifestPath = Join-Path $stateRoot 'uninstall-registry.json'
+          if (Test-Path -LiteralPath $uninstallRegistryManifestPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $uninstallRegistryManifestPath -Raw | ConvertFrom-Json)) {
+              $file = Join-Path (Join-Path $stateRoot 'uninstall-registry') ([string]$entry.file)
+              if (-not (Test-Path -LiteralPath $file)) { Write-Warning "Uninstall registry backup missing for $($entry.name)"; continue }
+              & reg.exe import $file | Out-Null
+              if ($LASTEXITCODE -eq 0) { $uninstallRegistryRestored++ }
+              else { Write-Warning "Uninstall registry restore failed for $($entry.name) exit=$LASTEXITCODE" }
+            }
+          }
+          Write-Host "MANAGED_WINDOWS_UNINSTALL_REGISTRY_RESTORED count=$uninstallRegistryRestored"
+
           function Restore-HiveSnapshot {
             param(
               [Parameter(Mandatory=$true)][string]$Snapshot,
@@ -572,8 +659,47 @@ jobs:
             }
           }
 
+
+          $serviceDeltaRestored = 0
+          $serviceDeltaPath = Join-Path $stateRoot 'services-delta.json'
+          if (Test-Path -LiteralPath $serviceDeltaPath) {
+            foreach ($saved in @(Get-Content -LiteralPath $serviceDeltaPath -Raw | ConvertFrom-Json)) {
+              $name = [string]$saved.name
+              if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace([string]$saved.path)) { continue }
+              try {
+                $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
+                if ($null -eq $existing) {
+                  $startValue = switch ([string]$saved.start_mode) {
+                    'Auto' { 'auto' }
+                    'Automatic' { 'auto' }
+                    'Disabled' { 'disabled' }
+                    default { 'demand' }
+                  }
+                  $createArgs = @('create', $name, "binPath= $([string]$saved.path)", "start= $startValue")
+                  if ($saved.display_name) { $createArgs += "DisplayName= $([string]$saved.display_name)" }
+                  $startName = [string]$saved.start_name
+                  if ($startName -and $startName -notin @('LocalSystem','NT AUTHORITY\LocalSystem')) {
+                    if ($startName -match '^(?i)NT AUTHORITY\\(LocalService|NetworkService)$' -or $startName -match '^(?i)NT SERVICE\\') {
+                      $createArgs += "obj= $startName"
+                    } else {
+                      Write-Warning "Service $name uses a credentialed account '$startName'; restoring as LocalSystem because no service password is stored."
+                    }
+                  }
+                  & sc.exe @createArgs | Out-Host
+                  if ($LASTEXITCODE -ne 0) { throw "sc create exited $LASTEXITCODE" }
+                  $existing = Get-Service -Name $name -ErrorAction Stop
+                  Write-Host "MANAGED_WINDOWS_SERVICE_CREATED name=$name start=$startValue"
+                }
+                if ([string]$saved.start_mode -in @('Auto','Automatic')) { Set-Service -Name $name -StartupType Automatic }
+                elseif ([string]$saved.start_mode -eq 'Disabled') { Set-Service -Name $name -StartupType Disabled }
+                else { Set-Service -Name $name -StartupType Manual }
+                if ([string]$saved.state -eq 'Running') { Start-Service -Name $name -ErrorAction SilentlyContinue }
+                $serviceDeltaRestored++
+              } catch { Write-Warning "service delta restore failed for ${name}: $($_.Exception.Message)" }
+            }
+          }
           Write-ManagedRdpProbe -Stage 'step11-end'
-          Write-Host "MANAGED_WINDOWS_STATE_V2_RESTORED registry=$registryRestored startup=$startupRestored tasks=$taskRestored services=$serviceRestored softwareFailed=$softwareFailed"
+          Write-Host "MANAGED_WINDOWS_STATE_V3_RESTORED registry=$registryRestored uninstallRegistry=$uninstallRegistryRestored startup=$startupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored softwarePackagesFailed=$softwareFailed"
 
       - name: Verify single managed Windows session
         shell: pwsh
@@ -919,6 +1045,189 @@ jobs:
             New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
             New-Item -ItemType Directory -Path $taskRoot -Force | Out-Null
 
+            # Windows state v3: preserve machine-level software installed after the pristine
+            # GitHub runner baseline. The user profile already covers Downloads/Desktop/AppData;
+            # this layer captures the missing Program Files / ProgramData application payloads.
+            $backupSoftware = Join-Path $backupRoot 'software'
+            $uninstallRegistryRoot = Join-Path $stateRoot 'uninstall-registry'
+            New-Item -ItemType Directory -Path $backupSoftware -Force | Out-Null
+            New-Item -ItemType Directory -Path $uninstallRegistryRoot -Force | Out-Null
+
+            function Get-InstalledAppInventory {
+              $items = [System.Collections.Generic.List[object]]::new()
+              foreach ($uninstallRoot in @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              )) {
+                Get-ItemProperty $uninstallRoot -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+                  $registryPath = ([string]$_.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::','')
+                  [void]$items.Add([pscustomobject]@{
+                    registry_path = $registryPath
+                    name = [string]$_.DisplayName
+                    version = [string]$_.DisplayVersion
+                    publisher = [string]$_.Publisher
+                    install_location = [string]$_.InstallLocation
+                    display_icon = [string]$_.DisplayIcon
+                    uninstall = [string]$_.UninstallString
+                    quiet_uninstall = [string]$_.QuietUninstallString
+                  })
+                }
+              }
+              return @($items | Sort-Object registry_path -Unique)
+            }
+
+            $apps = @(Get-InstalledAppInventory)
+            ConvertTo-Json -InputObject $apps -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'installed-apps.json') -Encoding UTF8
+
+            $baselineRoot = Join-Path $env:RUNNER_TEMP 'managed-software-baseline'
+            $baselineAppsByRegistry = @{}
+            $baselineAppsPath = Join-Path $baselineRoot 'installed-apps.json'
+            if (Test-Path -LiteralPath $baselineAppsPath) {
+              foreach ($baseApp in @(Get-Content -LiteralPath $baselineAppsPath -Raw | ConvertFrom-Json)) {
+                $baseKey = ([string]$baseApp.registry_path).ToLowerInvariant()
+                if ($baseKey) { $baselineAppsByRegistry[$baseKey] = $baseApp }
+              }
+            }
+            $appDelta = @($apps | Where-Object {
+              $key = ([string]$_.registry_path).ToLowerInvariant()
+              if (-not $key) { return $false }
+              if (-not $baselineAppsByRegistry.ContainsKey($key)) { return $true }
+              $before = $baselineAppsByRegistry[$key]
+              return (
+                [string]$before.version -ne [string]$_.version -or
+                [string]$before.install_location -ne [string]$_.install_location -or
+                [string]$before.display_icon -ne [string]$_.display_icon -or
+                [string]$before.uninstall -ne [string]$_.uninstall -or
+                [string]$before.quiet_uninstall -ne [string]$_.quiet_uninstall
+              )
+            })
+            ConvertTo-Json -InputObject $appDelta -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'installed-apps-delta.json') -Encoding UTF8
+
+            $fixedVolumes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID } | ForEach-Object {
+              [void]$fixedVolumes.Add(([string]$_.DeviceID).ToUpperInvariant())
+            }
+            $softwareCandidates = [System.Collections.Generic.List[object]]::new()
+            $softwareExcludePrefixes = [System.Collections.Generic.List[string]]::new()
+            foreach ($candidate in @(
+              [string]$env:SystemRoot,
+              [string]$profileRoot,
+              [string]$env:RUNNER_TEMP,
+              [string]$env:GITHUB_WORKSPACE,
+              [string]$env:RUNNER_TOOL_CACHE,
+              'D:\a',
+              'D:\hostedtoolcache',
+              'D:\actions-runner'
+            )) {
+              if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+              try { [void]$softwareExcludePrefixes.Add([IO.Path]::GetFullPath($candidate).TrimEnd('\')) } catch { }
+            }
+
+            function Test-ManagedSoftwareExcludedPath {
+              param([Parameter(Mandatory=$true)][string]$Path)
+              try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $true }
+              foreach ($prefix in $softwareExcludePrefixes) {
+                if ($full.Equals($prefix,[System.StringComparison]::OrdinalIgnoreCase) -or
+                    $full.StartsWith("$prefix\",[System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+              }
+              return $false
+            }
+
+            function Add-SoftwareRootCandidate {
+              param([string]$Path, [string]$Reason)
+              if ([string]::IsNullOrWhiteSpace($Path)) { return }
+              try {
+                $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+                if (-not [IO.Path]::IsPathRooted($expanded)) { return }
+                $full = [IO.Path]::GetFullPath($expanded).TrimEnd('\')
+                if (-not (Test-Path -LiteralPath $full -PathType Container)) { return }
+                if (Test-ManagedSoftwareExcludedPath -Path $full) { return }
+                $volumeRoot = [IO.Path]::GetPathRoot($full)
+                if ([string]::IsNullOrWhiteSpace($volumeRoot)) { return }
+                $volume = $volumeRoot.TrimEnd('\').ToUpperInvariant()
+                if (-not $fixedVolumes.Contains($volume)) { return }
+                $relative = $full.Substring($volumeRoot.Length).TrimStart('\')
+                if ([string]::IsNullOrWhiteSpace($relative)) { return }
+                [void]$softwareCandidates.Add([pscustomobject]@{ volume=$volume; relative=$relative; source=$full; reason=$Reason })
+              } catch { }
+            }
+
+            function Resolve-CommandExecutablePath {
+              param([string]$Value)
+              if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+              $text = [Environment]::ExpandEnvironmentVariables($Value.Trim())
+              if ($text -match '^"([A-Za-z]:\\[^\"]+?\.exe)"') { return $matches[1] }
+              if ($text -match '^([A-Za-z]:\\.*?\.exe)(?:\s|$)') { return $matches[1] }
+              return ''
+            }
+
+            foreach ($app in $appDelta) {
+              Add-SoftwareRootCandidate -Path ([string]$app.install_location) -Reason "install-location:$($app.name)"
+              $icon = ([string]$app.display_icon -replace ',\s*-?\d+\s*$','').Trim().Trim('"')
+              if ($icon -and [IO.Path]::IsPathRooted($icon)) {
+                try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($icon)) -Reason "display-icon:$($app.name)" } catch { }
+              }
+              foreach ($commandValue in @([string]$app.uninstall, [string]$app.quiet_uninstall)) {
+                $exe = Resolve-CommandExecutablePath -Value $commandValue
+                if ($exe) {
+                  try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($exe)) -Reason "uninstall-command:$($app.name)" } catch { }
+                }
+              }
+            }
+
+            $baselineServiceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineServicesPath = Join-Path $baselineRoot 'services.json'
+            if (Test-Path -LiteralPath $baselineServicesPath) {
+              foreach ($service in @(Get-Content -LiteralPath $baselineServicesPath -Raw | ConvertFrom-Json)) {
+                if ($service.name) { [void]$baselineServiceNames.Add([string]$service.name) }
+              }
+            }
+            $serviceDelta = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+              $_.Name -and -not $baselineServiceNames.Contains([string]$_.Name) -and $_.PathName -and $_.PathName -notmatch '(?i)\\Windows\\(System32|SysWOW64)'
+            } | ForEach-Object {
+              $exe = Resolve-CommandExecutablePath -Value ([string]$_.PathName)
+              if ($exe) {
+                try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($exe)) -Reason "service-command:$($_.Name)" } catch { }
+              }
+              [pscustomobject]@{ name=[string]$_.Name; display_name=[string]$_.DisplayName; path=[string]$_.PathName; start_mode=[string]$_.StartMode; start_name=[string]$_.StartName; state=[string]$_.State }
+            })
+            ConvertTo-Json -InputObject $serviceDelta -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'services-delta.json') -Encoding UTF8
+
+            # Collapse nested paths on the same volume. No broad filesystem scan is used:
+            # every retained path comes from explicit installation/service evidence above.
+            $softwareRoots = [System.Collections.Generic.List[object]]::new()
+            foreach ($candidate in @($softwareCandidates | Sort-Object volume,@{Expression={$_.relative.Length}},relative)) {
+              $nested = $false
+              foreach ($chosen in $softwareRoots) {
+                if (-not ([string]$chosen.volume).Equals([string]$candidate.volume,[System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                $chosenRel = ([string]$chosen.relative).TrimEnd('\')
+                $candidateRel = ([string]$candidate.relative).TrimEnd('\')
+                if ($candidateRel.Equals($chosenRel,[System.StringComparison]::OrdinalIgnoreCase) -or
+                    $candidateRel.StartsWith("$chosenRel\",[System.StringComparison]::OrdinalIgnoreCase)) { $nested = $true; break }
+              }
+              if (-not $nested) { [void]$softwareRoots.Add($candidate) }
+            }
+            ConvertTo-Json -InputObject @($softwareRoots) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'software-roots.json') -Encoding UTF8
+
+            # Preserve uninstall registration for apps that did not exist in the pristine runner.
+            $uninstallRegistryManifest = [System.Collections.Generic.List[object]]::new()
+            $uninstallIndex = 0
+            foreach ($app in $appDelta) {
+              $regPath = [string]$app.registry_path
+              if (-not $regPath -or -not $regPath.StartsWith('HKEY_LOCAL_MACHINE\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+              $uninstallIndex++
+              $file = ('uninstall-{0:D4}.reg' -f $uninstallIndex)
+              $destination = Join-Path $uninstallRegistryRoot $file
+              & reg.exe export $regPath $destination /y | Out-Null
+              if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $destination)) {
+                [void]$uninstallRegistryManifest.Add([pscustomobject]@{ registry_path=$regPath; file=$file; name=[string]$app.name; version=[string]$app.version })
+              } else {
+                Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+                Write-Warning "Uninstall registry export skipped for $($app.name): $regPath"
+              }
+            }
+            ConvertTo-Json -InputObject @($uninstallRegistryManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'uninstall-registry.json') -Encoding UTF8
+
             # Copy the live user profile through a VSS snapshot. The managed desktop
             # shares the runner's active Windows session, so files such as WebCache,
             # Search/StartMenu settings and notification databases can be locked while
@@ -987,6 +1296,7 @@ jobs:
               $robocopyExit = $LASTEXITCODE
               if ($robocopyExit -ge 8) { throw "robocopy VSS backup failed with exit code $robocopyExit" }
               Write-Host "MANAGED_WINDOWS_VSS_COPY_OK exit=$robocopyExit"
+
             } finally {
               if (Test-Path -LiteralPath $shadowLink) { & cmd.exe /d /c rmdir $shadowLink 2>$null | Out-Null }
               if (-not [string]::IsNullOrWhiteSpace($shadowId)) {
@@ -996,6 +1306,72 @@ jobs:
                 else { Write-Warning "VSS cleanup failed id=$shadowId exit=$deleteExit detail=$(($deleteOutput -join ' | '))" }
               }
             }
+
+            # Copy only software roots discovered from explicit installation/service evidence.
+            # Each fixed volume gets its own VSS snapshot; if VSS is unavailable for a volume,
+            # fall back to live copy and still fail on real robocopy errors.
+            $softwareCopiedRoots = 0
+            foreach ($volumeGroup in @($softwareRoots | Group-Object volume)) {
+              $softwareVolume = ([string]$volumeGroup.Name).ToUpperInvariant()
+              if ($softwareVolume -notmatch '^[A-Z]:$') { throw "Invalid software volume: $softwareVolume" }
+              $softwareVolumeRoot = "$softwareVolume\"
+              if (-not (Test-Path -LiteralPath $softwareVolumeRoot)) { throw "Software volume is unavailable: $softwareVolume" }
+              $softwareVolumeKey = $softwareVolume.TrimEnd(':')
+              $softwareShadowId = ''
+              $softwareShadowLink = Join-Path $env:RUNNER_TEMP "managed-software-vss-$env:GITHUB_RUN_ID-$softwareVolumeKey"
+              $softwareSnapshotReady = $false
+              try {
+                try {
+                  $softwareVssOutput = @(& vssadmin.exe create shadow "/for=$softwareVolume" 2>&1)
+                  $softwareVssExit = $LASTEXITCODE
+                  $softwareVssText = ($softwareVssOutput | ForEach-Object { [string]$_ }) -join "`n"
+                  if ($softwareVssExit -ne 0) { throw "vssadmin create exited $softwareVssExit" }
+                  $softwareIdMatch = [regex]::Match($softwareVssText, '(?im)^\s*Shadow Copy ID:\s*(\{[0-9A-Fa-f-]+\})\s*$')
+                  $softwareDeviceMatch = [regex]::Match($softwareVssText, '(?im)^\s*Shadow Copy Volume Name:\s*(.+?)\s*$')
+                  if (-not $softwareIdMatch.Success -or -not $softwareDeviceMatch.Success) { throw 'VSS output did not contain shadow identity/device' }
+                  $softwareShadowId = $softwareIdMatch.Groups[1].Value.Trim()
+                  $softwareSnapshotRoot = $softwareDeviceMatch.Groups[1].Value.Trim().TrimEnd('\')
+                  if (-not $softwareSnapshotRoot.StartsWith('\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy',[System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Unexpected VSS device path: $softwareSnapshotRoot"
+                  }
+                  if (Test-Path -LiteralPath $softwareShadowLink) { & cmd.exe /d /c rmdir $softwareShadowLink 2>$null | Out-Null }
+                  $softwareLinkOutput = @(& cmd.exe /d /c mklink /D $softwareShadowLink "$softwareSnapshotRoot\" 2>&1)
+                  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $softwareShadowLink)) {
+                    throw "VSS symlink create failed: $(($softwareLinkOutput -join ' | '))"
+                  }
+                  $softwareSnapshotReady = $true
+                  Write-Host "MANAGED_WINDOWS_SOFTWARE_VSS_READY volume=$softwareVolume id=$softwareShadowId"
+                } catch {
+                  Write-Warning "Software VSS unavailable for $softwareVolume; falling back to live copy: $($_.Exception.Message)"
+                }
+
+                foreach ($softwareRoot in @($volumeGroup.Group)) {
+                  $relative = ([string]$softwareRoot.relative).TrimStart('\')
+                  if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') {
+                    throw "Unsafe software backup relative path: $relative"
+                  }
+                  $liveSource = Join-Path $softwareVolumeRoot $relative
+                  if (-not (Test-Path -LiteralPath $liveSource -PathType Container)) { Write-Warning "Software root disappeared before backup: $liveSource"; continue }
+                  $copySource = if ($softwareSnapshotReady) { Join-Path $softwareShadowLink $relative } else { $liveSource }
+                  if (-not (Test-Path -LiteralPath $copySource -PathType Container)) { throw "Software backup source is unavailable: $copySource" }
+                  $softwareVolumeBackup = Join-Path $backupSoftware $softwareVolumeKey
+                  $softwareDestination = Join-Path $softwareVolumeBackup $relative
+                  New-Item -ItemType Directory -Path $softwareVolumeBackup -Force | Out-Null
+                  & robocopy.exe $copySource $softwareDestination /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /XJ /NFL /NDL /NP | Out-Host
+                  $softwareExit = $LASTEXITCODE
+                  if ($softwareExit -ge 8) { throw "Software backup failed exit=$softwareExit source=$liveSource" }
+                  $softwareCopiedRoots++
+                  Write-Host "MANAGED_WINDOWS_SOFTWARE_ROOT_BACKED_UP volume=$softwareVolume relative=$relative exit=$softwareExit reason=$($softwareRoot.reason)"
+                }
+              } finally {
+                if (Test-Path -LiteralPath $softwareShadowLink) { & cmd.exe /d /c rmdir $softwareShadowLink 2>$null | Out-Null }
+                if (-not [string]::IsNullOrWhiteSpace($softwareShadowId)) {
+                  $softwareDeleteOutput = @(& vssadmin.exe delete shadows "/shadow=$softwareShadowId" /quiet 2>&1)
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Software VSS cleanup failed volume=$softwareVolume detail=$(($softwareDeleteOutput -join ' | '))" }
+                }
+              }
+            }
+            Write-Host "MANAGED_WINDOWS_SOFTWARE_COPY_OK roots=$softwareCopiedRoots candidates=$(@($softwareRoots).Count)"
 
             function Save-HiveSnapshot {
               param(
@@ -1077,22 +1453,8 @@ jobs:
             })
             ConvertTo-Json -InputObject $autoServices -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'auto-services.json') -Encoding UTF8
 
-            # Inventory installed software for audit/fallback even when no package-manager ID exists.
-            $apps = @()
-            foreach ($uninstallRoot in @(
-              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-            )) {
-              $apps += @(Get-ItemProperty $uninstallRoot -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
-                [pscustomobject]@{
-                  name=[string]$_.DisplayName; version=[string]$_.DisplayVersion; publisher=[string]$_.Publisher;
-                  install_location=[string]$_.InstallLocation; uninstall=[string]$_.UninstallString; quiet_uninstall=[string]$_.QuietUninstallString
-                }
-              })
-            }
-            $apps = @($apps | Sort-Object name,version -Unique)
-            ConvertTo-Json -InputObject $apps -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'installed-apps.json') -Encoding UTF8
-
+            # installed-apps.json and installed-apps-delta.json were captured before VSS
+            # so their install roots could participate in the machine-level software snapshot.
             # Save only package-manager DELTAS relative to the pristine runner image.
             # This avoids reinstalling the large set of software that GitHub already preloads on every new runner.
             $baselineRoot = Join-Path $env:RUNNER_TEMP 'managed-software-baseline'
@@ -1188,10 +1550,13 @@ jobs:
             @{ file_count=$profileFiles; bytes=$profileBytes } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'profile-manifest.json') -Encoding UTF8
             $stateMeasure = Get-ChildItem -LiteralPath $stateRoot -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
             $stateBytes = if ($null -eq $stateMeasure.Sum) { [int64]0 } else { [int64]$stateMeasure.Sum }
-            $backupBytes = $profileBytes + $stateBytes
+            $softwareMeasure = Get-ChildItem -LiteralPath $backupSoftware -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+            $softwareBytes = if ($null -eq $softwareMeasure.Sum) { [int64]0 } else { [int64]$softwareMeasure.Sum }
+            $softwareFiles = [int64]$softwareMeasure.Count
+            $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 2
+              version = 3
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1199,10 +1564,16 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v2'
+              scope = 'managed-windows-state-v3'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
+              software_file_count = $softwareFiles
+              software_bytes = $softwareBytes
+              software_root_count = @($softwareRoots).Count
+              software_app_delta_count = @($appDelta).Count
+              software_service_delta_count = @($serviceDelta).Count
+              uninstall_registry_count = @($uninstallRegistryManifest).Count
               backup_bytes = $backupBytes
               registry_exports = $registryExports
               installed_app_count = @($apps).Count
@@ -1214,7 +1585,8 @@ jobs:
               scoop_delta_count = $scoopDeltaCount
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V2_STAGED files=$profileFiles bytes=$backupBytes gib=$gib apps=$(@($apps).Count) registry=$registryExports tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
+            Write-Host "MANAGED_WINDOWS_BACKUP_V3_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
