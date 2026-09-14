@@ -1145,7 +1145,8 @@ jobs:
                     $inf = Get-ChildItem -LiteralPath $packageDir -Filter $originalInf -Recurse -File -ErrorAction Stop | Select-Object -First 1
                     if ($null -eq $inf) { throw "Restored INF payload is missing: $originalInf" }
                     $description = if ([string]::IsNullOrWhiteSpace([string]$device.description)) { $hardwareId } else { [string]$device.description }
-                    $deviceName = if ([string]::IsNullOrWhiteSpace([string]$device.class_name)) { ($hardwareId -replace '^.*\\','') } else { [string]$device.class_name }
+                    $instanceParts = ([string]$device.instance_id) -split '\\'
+                    $deviceName = if ($instanceParts.Count -ge 3 -and $instanceParts[0] -eq 'ROOT') { $instanceParts[1] } elseif ([string]::IsNullOrWhiteSpace([string]$device.class_name)) { ($hardwareId -replace '^.*\\','') } else { [string]$device.class_name }
                     $reboot = [ManagedRootPnpInstaller]::Install($hardwareId,$deviceName,$description,$classGuid,$inf.FullName)
                     Write-Host "MANAGED_WINDOWS_PNP_ROOT_CREATED hardware=$hardwareId inf=$originalInf reboot=$reboot"
                     $updateReboot = $false
