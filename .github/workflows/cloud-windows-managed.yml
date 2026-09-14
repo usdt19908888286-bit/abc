@@ -148,7 +148,9 @@ jobs:
             $items = [System.Collections.Generic.List[object]]::new()
             foreach ($uninstallRoot in @(
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
             )) {
               Get-ItemProperty $uninstallRoot -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
                 $registryPath = ([string]$_.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::','')
@@ -218,13 +220,13 @@ jobs:
           Set-ItemProperty -Path $rdpTcp -Name PortNumber -Value 3389 -Force
           Set-ItemProperty -Path $rdpTcp -Name LanAdapter -Value 0 -Force
           Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
-          Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 0 -Force
+          Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 1 -Force
           $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $rdpPolicy -Force | Out-Null
           New-ItemProperty -Path $rdpPolicy -Name fSingleSessionPerUser -PropertyType DWord -Value 1 -Force | Out-Null
           New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 0 -Force | Out-Null
-          Write-Host 'MANAGED_RDP_REDIRECTION_POLICY=clipboard-and-drives-enabled'
+          New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 1 -Force | Out-Null
+          Write-Host 'MANAGED_RDP_REDIRECTION_POLICY=clipboard-only-drives-disabled'
 
           try {
             $tsSetting = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
@@ -744,12 +746,12 @@ jobs:
             Set-ItemProperty -Path $rdpTcp -Name fEnableWinStation -Value 1 -Force
             Set-ItemProperty -Path $rdpTcp -Name PortNumber -Value 3389 -Force
             Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
-            Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 0 -Force
+            Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 1 -Force
             $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
             New-Item -Path $rdpPolicy -Force | Out-Null
             New-ItemProperty -Path $rdpPolicy -Name fSingleSessionPerUser -PropertyType DWord -Value 1 -Force | Out-Null
             New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
-            New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 1 -Force | Out-Null
             try {
               $tsSetting = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
               Write-Host "RDP_WMI_REBIND_BEFORE AllowTSConnections=$($tsSetting.AllowTSConnections) PolicySource=$($tsSetting.PolicySourceAllowTSConnections)"
@@ -792,13 +794,13 @@ jobs:
           $userRdpPolicy = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $rdpPolicy -Force | Out-Null
           New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
-          New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 0 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 1 -Force | Out-Null
           foreach ($policyPath in @($rdpPolicy, $userRdpPolicy)) {
             Remove-ItemProperty -Path $policyPath -Name CSClipLevel -ErrorAction SilentlyContinue
             Remove-ItemProperty -Path $policyPath -Name SCClipLevel -ErrorAction SilentlyContinue
           }
           Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
-          Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 0 -Force
+          Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 1 -Force
           $rdpClip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $workflowSessionId } | Select-Object -First 1
           if ($null -eq $rdpClip) {
             try {
@@ -1068,14 +1070,14 @@ jobs:
               $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
               New-Item -Path $rdpPolicy -Force | Out-Null
               New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
-              New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 0 -Force | Out-Null
+              New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 1 -Force | Out-Null
               foreach ($policyPath in @($rdpPolicy, $userRdpPolicy)) {
                 Remove-ItemProperty -Path $policyPath -Name CSClipLevel -ErrorAction SilentlyContinue
                 Remove-ItemProperty -Path $policyPath -Name SCClipLevel -ErrorAction SilentlyContinue
               }
               if (Test-Path -LiteralPath $rdpTcp) {
                 Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
-                Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 0 -Force
+                Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 1 -Force
               }
               $sessionId = (Get-Process -Id $PID).SessionId
               $clip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sessionId } | Select-Object -First 1
@@ -1137,7 +1139,9 @@ jobs:
               $items = [System.Collections.Generic.List[object]]::new()
               foreach ($uninstallRoot in @(
                 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
               )) {
                 Get-ItemProperty $uninstallRoot -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
                   $registryPath = ([string]$_.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::','')
@@ -1294,7 +1298,7 @@ jobs:
             $uninstallIndex = 0
             foreach ($app in $appDelta) {
               $regPath = [string]$app.registry_path
-              if (-not $regPath -or -not $regPath.StartsWith('HKEY_LOCAL_MACHINE\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+              if (-not $regPath -or (-not $regPath.StartsWith('HKEY_LOCAL_MACHINE\', [System.StringComparison]::OrdinalIgnoreCase) -and -not $regPath.StartsWith('HKEY_CURRENT_USER\', [System.StringComparison]::OrdinalIgnoreCase))) { continue }
               $uninstallIndex++
               $file = ('uninstall-{0:D4}.reg' -f $uninstallIndex)
               $destination = Join-Path $uninstallRegistryRoot $file
@@ -1502,7 +1506,9 @@ jobs:
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
-              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
             )) {
               if (-not (Test-Path $path)) { continue }
               $key = Get-Item $path
@@ -1642,7 +1648,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 4
+              version = 5
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1650,7 +1656,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v4-clean-shell'
+              scope = 'managed-windows-state-v5-user-software-registry'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -1672,7 +1678,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V4_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V5_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
