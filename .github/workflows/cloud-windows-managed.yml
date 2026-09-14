@@ -716,6 +716,66 @@ jobs:
           Write-ManagedRdpProbe -Stage 'step11-end'
           Write-Host "MANAGED_WINDOWS_STATE_V3_RESTORED registry=$registryRestored uninstallRegistry=$uninstallRegistryRestored startup=$startupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored softwarePackagesFailed=$softwareFailed"
 
+      - name: Verify restored Windows application delta
+        if: ${{ inputs.mode == 'restore' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stateRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup\state'
+          $deltaPath = Join-Path $stateRoot 'installed-apps-delta.json'
+          if (-not (Test-Path -LiteralPath $deltaPath)) {
+            Write-Host 'MANAGED_WINDOWS_APP_RESTORE_VERIFY none'
+            exit 0
+          }
+
+          function Resolve-CommandExecutablePath {
+            param([string]$Value)
+            if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+            $text = [Environment]::ExpandEnvironmentVariables($Value.Trim())
+            if ($text -match '^"([A-Za-z]:\\[^\"]+?\.exe)"') { return $matches[1] }
+            if ($text -match '^([A-Za-z]:\\.*?\.exe)(?:\s|$)') { return $matches[1] }
+            return ''
+          }
+
+          $apps = @(Get-Content -LiteralPath $deltaPath -Raw | ConvertFrom-Json)
+          $verified = 0
+          foreach ($app in $apps) {
+            $name = ([string]$app.name -replace '[\r\n]+',' ').Trim()
+            $regPath = [string]$app.registry_path
+            if ([string]::IsNullOrWhiteSpace($regPath)) { throw "Restored app has no registry path: $name" }
+            $providerPath = "Registry::$regPath"
+            if (-not (Test-Path -LiteralPath $providerPath)) {
+              throw "Restored app uninstall registry is missing: $name path=$regPath"
+            }
+
+            $declaredEvidence = 0
+            $existingEvidence = [System.Collections.Generic.List[string]]::new()
+            $installLocation = [Environment]::ExpandEnvironmentVariables(([string]$app.install_location).Trim().Trim('"'))
+            if ($installLocation -and [IO.Path]::IsPathRooted($installLocation)) {
+              $declaredEvidence++
+              if (Test-Path -LiteralPath $installLocation) { [void]$existingEvidence.Add("install:$installLocation") }
+            }
+            $icon = ([string]$app.display_icon -replace ',\s*-?\d+\s*$','').Trim().Trim('"')
+            $icon = [Environment]::ExpandEnvironmentVariables($icon)
+            if ($icon -and [IO.Path]::IsPathRooted($icon)) {
+              $declaredEvidence++
+              if (Test-Path -LiteralPath $icon) { [void]$existingEvidence.Add("icon:$icon") }
+            }
+            foreach ($commandValue in @([string]$app.uninstall, [string]$app.quiet_uninstall)) {
+              $exe = Resolve-CommandExecutablePath -Value $commandValue
+              if (-not $exe) { continue }
+              $declaredEvidence++
+              if (Test-Path -LiteralPath $exe) { [void]$existingEvidence.Add("command:$exe") }
+            }
+            if ($declaredEvidence -gt 0 -and $existingEvidence.Count -eq 0) {
+              throw "Restored app payload is missing: $name registry=$regPath"
+            }
+            $verified++
+            $evidenceText = if ($existingEvidence.Count) { $existingEvidence -join ';' } else { 'registry-only' }
+            Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_OK name=$name registry=$regPath evidence=$evidenceText"
+          }
+          Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_COMPLETE count=$verified"
+
       - name: Verify single managed Windows session
         shell: pwsh
         run: |
@@ -1186,6 +1246,13 @@ jobs:
               )
             })
             ConvertTo-Json -InputObject $appDelta -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'installed-apps-delta.json') -Encoding UTF8
+            foreach ($deltaApp in $appDelta) {
+              $deltaName = ([string]$deltaApp.name -replace '[\r\n]+',' ').Trim()
+              $deltaVersion = ([string]$deltaApp.version -replace '[\r\n]+',' ').Trim()
+              $deltaRegistry = ([string]$deltaApp.registry_path -replace '[\r\n]+',' ').Trim()
+              $deltaInstall = ([string]$deltaApp.install_location -replace '[\r\n]+',' ').Trim()
+              Write-Host "MANAGED_WINDOWS_APP_DELTA name=$deltaName version=$deltaVersion registry=$deltaRegistry install=$deltaInstall"
+            }
 
             $fixedVolumes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID } | ForEach-Object {
