@@ -1128,6 +1128,141 @@ jobs:
           }
           Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_COMPLETE count=$verified version=$backupVersion"
 
+      - name: Replay restored Windows startup state
+        if: ${{ inputs.mode == 'restore' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $backupRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
+          $stateRoot = Join-Path $backupRoot 'state'
+          $metadataPath = Join-Path $backupRoot 'metadata.json'
+          if (-not (Test-Path -LiteralPath $metadataPath)) {
+            Write-Host 'MANAGED_WINDOWS_STARTUP_REPLAY legacy-no-metadata'
+            exit 0
+          }
+          $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+          $backupVersion = if ($null -eq $metadata.version) { 1 } else { [int]$metadata.version }
+          if ($backupVersion -lt 9) {
+            Write-Host "MANAGED_WINDOWS_STARTUP_REPLAY legacy-version=$backupVersion"
+            exit 0
+          }
+
+          $approvalState = @{}
+          $approvedManifestPath = Join-Path $stateRoot 'startup-approved.json'
+          if (Test-Path -LiteralPath $approvedManifestPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $approvedManifestPath -Raw | ConvertFrom-Json)) {
+              if (-not $entry.name -or -not $entry.value_b64) { continue }
+              try {
+                $bytes = [Convert]::FromBase64String([string]$entry.value_b64)
+                if ($bytes.Length -gt 0) {
+                  # StartupApproved uses 0x02 for enabled. If Windows recorded any other
+                  # state, preserve it and do not force-launch the item during restore.
+                  $approvalState[([string]$entry.name).ToLowerInvariant()] = ([int]$bytes[0] -eq 2)
+                }
+              } catch { }
+            }
+          }
+
+          function Test-StartupReplayEnabled {
+            param([string]$Name)
+            if ([string]::IsNullOrWhiteSpace($Name)) { return $true }
+            $key = $Name.ToLowerInvariant()
+            if (-not $approvalState.ContainsKey($key)) { return $true }
+            return [bool]$approvalState[$key]
+          }
+
+          function Resolve-StartupCommand {
+            param([string]$Value)
+            if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+            $text = [Environment]::ExpandEnvironmentVariables($Value.Trim())
+            $exe = ''
+            $args = ''
+            if ($text -match '^"([^\"]+?\.exe)"(?:\s+(.*))?$') {
+              $exe = $matches[1]
+              if ($matches.Count -gt 2) { $args = [string]$matches[2] }
+            } elseif ($text -match '^([A-Za-z]:\\.*?\.exe)(?:\s+(.*))?$') {
+              $exe = $matches[1]
+              if ($matches.Count -gt 2) { $args = [string]$matches[2] }
+            } elseif ($text -match '^([^\s]+\.exe)(?:\s+(.*))?$') {
+              $exe = $matches[1]
+              if ($matches.Count -gt 2) { $args = [string]$matches[2] }
+            }
+            if (-not $exe) { return $null }
+            $resolvedExe = $exe
+            if (-not [IO.Path]::IsPathRooted($resolvedExe)) {
+              $command = Get-Command $resolvedExe -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($null -ne $command -and $command.Source) { $resolvedExe = [string]$command.Source }
+            }
+            if (-not (Test-Path -LiteralPath $resolvedExe -PathType Leaf)) { return $null }
+            return [pscustomobject]@{ exe=$resolvedExe; args=$args }
+          }
+
+          $replayed = 0
+          $alreadyRunning = 0
+          $disabled = 0
+          $failed = 0
+          $startupManifestPath = Join-Path $stateRoot 'machine-startup.json'
+          if (Test-Path -LiteralPath $startupManifestPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $startupManifestPath -Raw | ConvertFrom-Json)) {
+              $name = [string]$entry.name
+              if (-not (Test-StartupReplayEnabled -Name $name)) {
+                $disabled++
+                Write-Host "MANAGED_WINDOWS_STARTUP_REPLAY_SKIPPED_DISABLED name=$name"
+                continue
+              }
+              try {
+                $resolved = Resolve-StartupCommand -Value ([string]$entry.value)
+                if ($null -eq $resolved) { throw "startup executable could not be resolved" }
+                $processName = [IO.Path]::GetFileNameWithoutExtension([string]$resolved.exe)
+                if (Get-Process -Name $processName -ErrorAction SilentlyContinue | Select-Object -First 1) {
+                  $alreadyRunning++
+                  Write-Host "MANAGED_WINDOWS_STARTUP_REPLAY_ALREADY_RUNNING name=$name exe=$($resolved.exe)"
+                } else {
+                  if ([string]::IsNullOrWhiteSpace([string]$resolved.args)) {
+                    Start-Process -FilePath ([string]$resolved.exe) | Out-Null
+                  } else {
+                    Start-Process -FilePath ([string]$resolved.exe) -ArgumentList ([string]$resolved.args) | Out-Null
+                  }
+                  $replayed++
+                  Write-Host "MANAGED_WINDOWS_STARTUP_REPLAY_OK name=$name exe=$($resolved.exe)"
+                }
+                if (([string]$entry.path).EndsWith('\\RunOnce',[System.StringComparison]::OrdinalIgnoreCase)) {
+                  Remove-ItemProperty -LiteralPath ([string]$entry.path) -Name $name -ErrorAction SilentlyContinue
+                }
+              } catch {
+                $failed++
+                Write-Warning "startup replay failed name=${name}: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          $commonStartupManifestPath = Join-Path $stateRoot 'common-startup.json'
+          $commonStartup = [Environment]::GetFolderPath('CommonStartup')
+          if ($commonStartup -and (Test-Path -LiteralPath $commonStartupManifestPath)) {
+            foreach ($entry in @(Get-Content -LiteralPath $commonStartupManifestPath -Raw | ConvertFrom-Json)) {
+              $relative = ([string]$entry.relative).TrimStart('\\')
+              if (-not $relative) { continue }
+              $name = [IO.Path]::GetFileName($relative)
+              if (-not (Test-StartupReplayEnabled -Name $name)) {
+                $disabled++
+                Write-Host "MANAGED_WINDOWS_COMMON_STARTUP_REPLAY_SKIPPED_DISABLED relative=$relative"
+                continue
+              }
+              try {
+                $target = Join-Path $commonStartup $relative
+                if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Startup file is missing" }
+                Start-Process -FilePath $target | Out-Null
+                $replayed++
+                Write-Host "MANAGED_WINDOWS_COMMON_STARTUP_REPLAY_OK relative=$relative"
+              } catch {
+                $failed++
+                Write-Warning "common startup replay failed relative=${relative}: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          if ($failed -gt 0) { throw "V9 startup replay incomplete failed=$failed replayed=$replayed alreadyRunning=$alreadyRunning disabled=$disabled" }
+          Write-Host "MANAGED_WINDOWS_STARTUP_REPLAY_COMPLETE replayed=$replayed alreadyRunning=$alreadyRunning disabled=$disabled failed=$failed"
       - name: Verify single managed Windows session
         shell: pwsh
         run: |
