@@ -745,7 +745,7 @@ jobs:
           if (Test-Path -LiteralPath $metadataPath) {
             try {
               $backupMetadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-              $allowLegacyMissingPayload = ([int]$backupMetadata.version -le 5 -and [int]$backupMetadata.software_app_delta_count -gt 0 -and [int]$backupMetadata.software_root_count -eq 0)
+              $allowLegacyMissingPayload = ([int]$backupMetadata.version -le 6 -and [int]$backupMetadata.software_app_delta_count -gt 0 -and [int]$backupMetadata.software_root_count -eq 0)
             } catch { }
           }
           if (-not (Test-Path -LiteralPath $deltaPath)) {
@@ -1342,6 +1342,24 @@ jobs:
               return ''
             }
 
+            function Normalize-AppIdentityToken {
+              param([string]$Value)
+              if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+              return (($Value.ToLowerInvariant()) -replace '[^\p{L}\p{Nd}]','')
+            }
+
+            # Build a bounded application-directory inventory for identity matching.
+            # Only Program Files roots, to depth 3, are considered; no whole-disk scan occurs.
+            $programDirectoryInventory = [System.Collections.Generic.List[string]]::new()
+            foreach ($programRoot in @([string]$env:ProgramFiles, [string]${env:ProgramFiles(x86)})) {
+              if ([string]::IsNullOrWhiteSpace($programRoot) -or -not (Test-Path -LiteralPath $programRoot -PathType Container)) { continue }
+              Get-ChildItem -LiteralPath $programRoot -Directory -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try { [void]$programDirectoryInventory.Add([IO.Path]::GetFullPath($_.FullName).TrimEnd('\')) } catch { }
+              }
+            }
+            $programDirectoryInventory = @($programDirectoryInventory | Sort-Object -Unique)
+            $appPayloadEvidence = [System.Collections.Generic.List[object]]::new()
+
             # Fallback for installers that register an app but omit usable install paths.
             # Compare shallow Program Files topology against the pristine runner baseline;
             # this catches new vendor/app directories such as Program Files\Netease\GameViewer
@@ -1383,6 +1401,18 @@ jobs:
                   try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($exe)) -Reason "uninstall-command:$($app.name)" } catch { }
                 }
               }
+              $registryLeaf = (([string]$app.registry_path -split '\\') | Select-Object -Last 1)
+              $registryToken = Normalize-AppIdentityToken -Value $registryLeaf
+              if ($registryToken.Length -ge 4) {
+                foreach ($programDir in $programDirectoryInventory) {
+                  $leafToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileName($programDir))
+                  if ($leafToken -eq $registryToken) {
+                    Add-SoftwareRootCandidate -Path $programDir -Reason "registry-identity:$($app.name)"
+                    Write-Host "MANAGED_WINDOWS_APP_DIRECTORY_MATCH app=$($app.name) registryLeaf=$registryLeaf path=$programDir"
+                    break
+                  }
+                }
+              }
             }
 
             $baselineServiceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1403,8 +1433,8 @@ jobs:
             })
             ConvertTo-Json -InputObject $serviceDelta -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'services-delta.json') -Encoding UTF8
 
-            # Collapse nested paths on the same volume. No broad filesystem scan is used:
-            # every retained path comes from explicit installation/service evidence above.
+            # Collapse nested paths on the same volume. Discovery is bounded to explicit
+            # install/service evidence plus shallow Program Files deltas and registry-identity matches.
             $softwareRoots = [System.Collections.Generic.List[object]]::new()
             foreach ($candidate in @($softwareCandidates | Sort-Object volume,@{Expression={$_.relative.Length}},relative)) {
               $nested = $false
@@ -1774,7 +1804,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 6
+              version = 7
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1782,7 +1812,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v6-program-directory-delta'
+              scope = 'managed-windows-state-v7-registry-identity-program-roots'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -1804,7 +1834,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V6_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V7_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
