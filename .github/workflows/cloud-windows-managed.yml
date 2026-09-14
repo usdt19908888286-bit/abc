@@ -1071,6 +1071,12 @@ jobs:
             foreach ($entry in $profileEvidence) {
               $relative = ([string]$entry.relative).TrimStart('\')
               if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { throw "Unsafe V9 app profile evidence path: $relative" }
+              $volatileProfilePrefix = 'AppData\Local\Temp'
+              if ($relative.Equals($volatileProfilePrefix,[System.StringComparison]::OrdinalIgnoreCase) -or
+                  $relative.StartsWith("$volatileProfilePrefix\",[System.StringComparison]::OrdinalIgnoreCase)) {
+                Write-Host "MANAGED_WINDOWS_APP_PROFILE_RESTORE_VOLATILE_SKIPPED relative=$relative"
+                continue
+              }
               $target = Join-Path $profileRoot $relative
               if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw "V9 app profile/cache directory is missing: $relative" }
               $actualMeasure = Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object
@@ -2002,6 +2008,12 @@ jobs:
                   if (-not $currentDir.StartsWith($profileRoot.TrimEnd('\') + '\',[System.StringComparison]::OrdinalIgnoreCase)) { return }
                   $relative = $currentDir.Substring($profileRoot.TrimEnd('\').Length).TrimStart('\')
                   if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Split('\') -contains '..') { return }
+                  $volatileProfilePrefix = 'AppData\Local\Temp'
+                  if ($relative.Equals($volatileProfilePrefix,[System.StringComparison]::OrdinalIgnoreCase) -or
+                      $relative.StartsWith("$volatileProfilePrefix\",[System.StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Host "MANAGED_WINDOWS_APP_PROFILE_VOLATILE_SKIPPED relative=$relative"
+                    return
+                  }
                   $measure = Get-ChildItem -LiteralPath $currentDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                   $dirBytes = if ($null -eq $measure.Sum) { [int64]0 } else { [int64]$measure.Sum }
                   [void]$appProfileEvidence.Add([pscustomobject]@{ relative=$relative; file_count=[int64]$measure.Count; bytes=$dirBytes })
