@@ -217,9 +217,12 @@ jobs:
           Set-ItemProperty -Path $rdpTcp -Name fEnableWinStation -Value 1 -Force
           Set-ItemProperty -Path $rdpTcp -Name PortNumber -Value 3389 -Force
           Set-ItemProperty -Path $rdpTcp -Name LanAdapter -Value 0 -Force
+          Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
           $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $rdpPolicy -Force | Out-Null
           New-ItemProperty -Path $rdpPolicy -Name fSingleSessionPerUser -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
+          Write-Host 'MANAGED_RDP_CLIPBOARD_POLICY=enabled'
 
           try {
             $tsSetting = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
@@ -730,9 +733,11 @@ jobs:
             Set-ItemProperty -Path $terminalServer -Name fSingleSessionPerUser -Value 1 -Force
             Set-ItemProperty -Path $rdpTcp -Name fEnableWinStation -Value 1 -Force
             Set-ItemProperty -Path $rdpTcp -Name PortNumber -Value 3389 -Force
+            Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
             $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
             New-Item -Path $rdpPolicy -Force | Out-Null
             New-ItemProperty -Path $rdpPolicy -Name fSingleSessionPerUser -PropertyType DWord -Value 1 -Force | Out-Null
+            New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
             try {
               $tsSetting = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
               Write-Host "RDP_WMI_REBIND_BEFORE AllowTSConnections=$($tsSetting.AllowTSConnections) PolicySource=$($tsSetting.PolicySourceAllowTSConnections)"
@@ -771,6 +776,22 @@ jobs:
           }
 
           $workflowSessionId = (Get-Process -Id $PID).SessionId
+          $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $rdpPolicy -Force | Out-Null
+          New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
+          Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
+          $rdpClip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $workflowSessionId } | Select-Object -First 1
+          if ($null -eq $rdpClip) {
+            try {
+              Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\rdpclip.exe') -WindowStyle Hidden
+              Start-Sleep -Milliseconds 500
+              $rdpClip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $workflowSessionId } | Select-Object -First 1
+            } catch { Write-Warning "rdpclip start failed: $($_.Exception.Message)" }
+          }
+          $policyDisableClip = (Get-ItemProperty -Path $rdpPolicy -Name fDisableClip -ErrorAction SilentlyContinue).fDisableClip
+          $rdpTcpDisableClip = (Get-ItemProperty -Path $rdpTcp -Name fDisableClip -ErrorAction SilentlyContinue).fDisableClip
+          $rdpClipPid = if ($null -eq $rdpClip) { 0 } else { [int]$rdpClip.Id }
+          Write-Host "MANAGED_RDP_CLIPBOARD_READY policyDisable=$policyDisableClip rdpTcpDisable=$rdpTcpDisableClip session=$workflowSessionId rdpclipPid=$rdpClipPid"
           Write-Host "MANAGED_WINDOWS_INTERACTIVE_SESSION_ID=$workflowSessionId"
           & qwinsta.exe 2>&1 | Out-Host
 
@@ -1011,6 +1032,28 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = "C:\Users\$username" }
             return [Environment]::ExpandEnvironmentVariables($profileRoot)
           }
+
+          function Ensure-ManagedRdpClipboard {
+            try {
+              $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+              $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+              New-Item -Path $rdpPolicy -Force | Out-Null
+              New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
+              if (Test-Path -LiteralPath $rdpTcp) { Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force }
+              $sessionId = (Get-Process -Id $PID).SessionId
+              $clip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sessionId } | Select-Object -First 1
+              if ($null -eq $clip) {
+                Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\rdpclip.exe') -WindowStyle Hidden
+                Start-Sleep -Milliseconds 300
+                $clip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sessionId } | Select-Object -First 1
+              }
+              if ($null -ne $clip) { return [int]$clip.Id }
+            } catch { Write-Warning "RDP clipboard self-heal skipped: $($_.Exception.Message)" }
+            return 0
+          }
+
+          $initialRdpClipPid = Ensure-ManagedRdpClipboard
+          Write-Host "MANAGED_RDP_CLIPBOARD_KEEPALIVE_READY pid=$initialRdpClipPid"
 
           function Stop-ManagedUserSessions {
             # Close interactive RDP/console sessions before the final snapshot, but never
@@ -1629,6 +1672,7 @@ jobs:
             }
 
             Hide-ManagedRunnerWindows
+            [void](Ensure-ManagedRdpClipboard)
             Start-Sleep -Seconds 10
             if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
           }
