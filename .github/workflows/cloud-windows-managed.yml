@@ -983,12 +983,21 @@ jobs:
               $volumeRootForAcl = "$volume\"
               $aclFile = Join-Path (Join-Path $stateRoot 'software-acl') ([string]$entry.file)
               if (-not (Test-Path -LiteralPath $aclFile -PathType Leaf)) { throw "Software ACL payload missing: $($entry.file)" }
-              $args = @($volumeRootForAcl,'/restore',$aclFile,'/c','/q')
+              $aclTarget = Join-Path $volumeRootForAcl $relative
+              if (-not (Test-Path -LiteralPath $aclTarget)) { throw "Software ACL target is missing: $aclTarget" }
+              $relativeParent = [IO.Path]::GetDirectoryName($relative)
+              $aclBase = if ([string]::IsNullOrWhiteSpace($relativeParent)) { $volumeRootForAcl } else { Join-Path $volumeRootForAcl $relativeParent }
+              if (-not (Test-Path -LiteralPath $aclBase -PathType Container)) { throw "Software ACL restore base is missing: $aclBase" }
+              $args = @($aclBase,'/restore',$aclFile,'/c','/q')
               if ($metadata.source_sid -and -not ([string]$metadata.source_sid).Equals($sid,[System.StringComparison]::OrdinalIgnoreCase)) {
                 $args += @('/substitute',[string]$metadata.source_sid,$sid)
               }
-              & icacls.exe @args | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "icacls restore failed exit=$LASTEXITCODE volume=$volume" }
+              $aclOutput = @(& icacls.exe @args 2>&1)
+              $aclExit = $LASTEXITCODE
+              $aclOutput | Out-Host
+              if ($aclExit -ne 0) { throw "icacls restore failed exit=$aclExit base=$aclBase target=$aclTarget" }
+              $failedAclLine = $aclOutput | Where-Object { [string]$_ -match '(?i)Failed processing\s+[1-9][0-9]*\s+files?' } | Select-Object -First 1
+              if ($failedAclLine) { throw "icacls restore reported failed files base=$aclBase detail=$failedAclLine" }
               $softwareAclRestored++
             }
           }
@@ -1058,10 +1067,6 @@ jobs:
               [DllImport("setupapi.dll", SetLastError=true)]
               private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
 
-              [DllImport("newdev.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-              private static extern bool UpdateDriverForPlugAndPlayDevices(
-                  IntPtr hwndParent, string HardwareId, string FullInfPath, uint InstallFlags, out bool RebootRequired);
-
               private static void ThrowLast(string stage) {
                   throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), stage);
               }
@@ -1083,12 +1088,7 @@ jobs:
                       const uint DIF_REGISTERDEVICE = 0x00000019;
                       if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, ref data))
                           ThrowLast("SetupDiCallClassInstaller(DIF_REGISTERDEVICE)");
-                      bool reboot;
-                      const uint INSTALLFLAG_FORCE = 0x00000001;
-                      const uint INSTALLFLAG_NONINTERACTIVE = 0x00000004;
-                      if (!UpdateDriverForPlugAndPlayDevices(IntPtr.Zero, hardwareId, infPath, INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, out reboot))
-                          ThrowLast("UpdateDriverForPlugAndPlayDevices");
-                      return reboot;
+                      return false;
                   } finally {
                       SetupDiDestroyDeviceInfoList(set);
                   }
@@ -1138,7 +1138,11 @@ jobs:
                     $deviceName = if ([string]::IsNullOrWhiteSpace([string]$device.class_name)) { ($hardwareId -replace '^.*\\','') } else { [string]$device.class_name }
                     $reboot = [ManagedRootPnpInstaller]::Install($hardwareId,$deviceName,$description,$classGuid,$inf.FullName)
                     Write-Host "MANAGED_WINDOWS_PNP_ROOT_CREATED hardware=$hardwareId inf=$originalInf reboot=$reboot"
+                    & pnputil.exe /add-driver $inf.FullName /install | Out-Host
+                    if ($LASTEXITCODE -ne 0) { throw "PnP bind after root-device creation failed exit=$LASTEXITCODE inf=$originalInf" }
                     & pnputil.exe /scan-devices | Out-Host
+                    if ($LASTEXITCODE -ne 0) { throw "PnP scan after root-device creation failed exit=$LASTEXITCODE" }
+                    Start-Sleep -Milliseconds 750
                   } else {
                     [void]$pnpPending.Add($device)
                     Write-Host "MANAGED_WINDOWS_PNP_DEFERRED hardware=$hardwareId strategy=$($device.restore_strategy)"
@@ -1285,7 +1289,7 @@ jobs:
 
           $servicesPath = Join-Path $stateRoot 'auto-services.json'
           $serviceRestored = 0
-          if (Test-Path -LiteralPath $servicesPath) {
+          if ($version -lt 11 -and (Test-Path -LiteralPath $servicesPath)) {
             $services = @(Get-Content -LiteralPath $servicesPath -Raw | ConvertFrom-Json)
             foreach ($saved in $services) {
               try {
@@ -1318,10 +1322,10 @@ jobs:
                 else { $safeObjectName = 'LocalSystem'; Write-Warning "Service $name uses credentialed account '$startName'; no password is stored, restoring service account as LocalSystem." }
 
                 if (-not $exists) {
-                  $createArgs = @('create', $name, "binPath= $([string]$saved.path)", "start= $startValue", "type= $typeValue", "error= $errorValue")
-                  if ($saved.display_name) { $createArgs += "DisplayName= $([string]$saved.display_name)" }
-                  if ($safeObjectName) { $createArgs += "obj= $safeObjectName" }
-                  if (@($saved.depend_on_service).Count) { $createArgs += "depend= $(@($saved.depend_on_service) -join '/')" }
+                  $createArgs = @('create', $name, 'binPath=', [string]$saved.path, 'start=', $startValue, 'type=', $typeValue, 'error=', $errorValue)
+                  if ($saved.display_name) { $createArgs += @('DisplayName=', [string]$saved.display_name) }
+                  if ($safeObjectName) { $createArgs += @('obj=', $safeObjectName) }
+                  if (@($saved.depend_on_service).Count) { $createArgs += @('depend=', (@($saved.depend_on_service) -join '/')) }
                   & sc.exe @createArgs | Out-Host
                   if ($LASTEXITCODE -ne 0) { throw "sc create exited $LASTEXITCODE" }
                   Write-Host "MANAGED_WINDOWS_SERVICE_CREATED name=$name start=$startValue type=$typeValue"
@@ -1337,10 +1341,10 @@ jobs:
                 }
 
                 # Explicit sc config keeps SCM's live configuration synchronized with imported registry data.
-                $configArgs = @('config', $name, "binPath= $([string]$saved.path)", "start= $startValue", "type= $typeValue", "error= $errorValue")
-                if ($saved.display_name) { $configArgs += "DisplayName= $([string]$saved.display_name)" }
-                if ($safeObjectName) { $configArgs += "obj= $safeObjectName" }
-                if (@($saved.depend_on_service).Count) { $configArgs += "depend= $(@($saved.depend_on_service) -join '/')" }
+                $configArgs = @('config', $name, 'binPath=', [string]$saved.path, 'start=', $startValue, 'type=', $typeValue, 'error=', $errorValue)
+                if ($saved.display_name) { $configArgs += @('DisplayName=', [string]$saved.display_name) }
+                if ($safeObjectName) { $configArgs += @('obj=', $safeObjectName) }
+                if (@($saved.depend_on_service).Count) { $configArgs += @('depend=', (@($saved.depend_on_service) -join '/')) }
                 & sc.exe @configArgs | Out-Null
                 if ($LASTEXITCODE -ne 0) { throw "sc config exited $LASTEXITCODE" }
 
