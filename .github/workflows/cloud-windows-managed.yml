@@ -721,18 +721,29 @@ jobs:
             # without logging the user off or weakening backup fidelity.
             $volumeRoot = [IO.Path]::GetPathRoot($profileRoot)
             if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Could not resolve profile volume: $profileRoot" }
-            $shadow = $null
+            $shadowId = ''
             try {
-              $create = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume=$volumeRoot; Context='ClientAccessible' } -ErrorAction Stop
-              if ([int]$create.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$create.ShadowID)) {
-                throw "VSS snapshot create failed return=$($create.ReturnValue)"
+              $volumeSpec = $volumeRoot.TrimEnd('\')
+              $vssOutput = @(& vssadmin.exe create shadow "/for=$volumeSpec" 2>&1)
+              $vssExit = $LASTEXITCODE
+              $vssText = ($vssOutput | ForEach-Object { [string]$_ }) -join "`n"
+              if ($vssExit -ne 0) {
+                $detail = ($vssText -replace '\r?\n',' | ').Trim()
+                throw "vssadmin create failed exit=$vssExit detail=$detail"
               }
-              $shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($create.ShadowID)'" -ErrorAction Stop | Select-Object -First 1
-              if ($null -eq $shadow -or [string]::IsNullOrWhiteSpace([string]$shadow.DeviceObject)) { throw 'VSS snapshot device was not found' }
+              $idMatch = [regex]::Match($vssText, '(?im)^\s*Shadow Copy ID:\s*(\{[0-9A-Fa-f-]+\})\s*$')
+              $deviceMatch = [regex]::Match($vssText, '(?im)^\s*Shadow Copy Volume Name:\s*(.+?)\s*$')
+              if (-not $idMatch.Success -or -not $deviceMatch.Success) {
+                throw "vssadmin output did not contain shadow identity/device: $($vssText -replace '\r?\n',' | ')"
+              }
+              $shadowId = $idMatch.Groups[1].Value.Trim()
+              $snapshotRoot = $deviceMatch.Groups[1].Value.Trim().TrimEnd('\')
+              if (-not $snapshotRoot.StartsWith('\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Unexpected VSS device path: $snapshotRoot"
+              }
               $relativeProfile = $profileRoot.Substring($volumeRoot.Length).TrimStart('\')
-              $snapshotRoot = ([string]$shadow.DeviceObject).TrimEnd('\')
               $profileSource = "$snapshotRoot\$relativeProfile"
-              Write-Host "MANAGED_WINDOWS_VSS_READY id=$($create.ShadowID) source=$profileSource"
+              Write-Host "MANAGED_WINDOWS_VSS_READY id=$shadowId source=$profileSource"
 
               $args = @(
                 $profileSource, $backupProfile,
@@ -752,9 +763,11 @@ jobs:
               if ($robocopyExit -ge 8) { throw "robocopy VSS backup failed with exit code $robocopyExit" }
               Write-Host "MANAGED_WINDOWS_VSS_COPY_OK exit=$robocopyExit"
             } finally {
-              if ($null -ne $shadow) {
-                try { Remove-CimInstance -InputObject $shadow -ErrorAction SilentlyContinue } catch { }
-                Write-Host 'MANAGED_WINDOWS_VSS_RELEASED'
+              if (-not [string]::IsNullOrWhiteSpace($shadowId)) {
+                $deleteOutput = @(& vssadmin.exe delete shadows "/shadow=$shadowId" /quiet 2>&1)
+                $deleteExit = $LASTEXITCODE
+                if ($deleteExit -eq 0) { Write-Host "MANAGED_WINDOWS_VSS_RELEASED id=$shadowId" }
+                else { Write-Warning "VSS cleanup failed id=$shadowId exit=$deleteExit detail=$(($deleteOutput -join ' | '))" }
               }
             }
 
