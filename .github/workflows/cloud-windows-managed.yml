@@ -180,7 +180,7 @@ jobs:
           }
           Write-Host 'MANAGED_WINDOWS_SOFTWARE_BASELINE_READY'
 
-      - name: Initialize RDP stack
+      - name: Initialize RDP stack for single managed session
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -190,12 +190,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $rdpTcp)) { throw 'RDP-Tcp WinStation registry key is missing' }
 
           $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-          Write-Host "RDP_INITIAL_IDENTITY=$($identity.Name) sid=$($identity.User.Value)"
+          Write-Host "RDP_PRE_RENAME_IDENTITY=$($identity.Name) sid=$($identity.User.Value)"
 
           Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0 -Force
-          # Keep each Windows account on a single interactive session. The GitHub runner
-          # keeps its own console identity, while the managed desktop account gets its own
-          # independent profile/session for RDP and user-installed remote-control software.
           Set-ItemProperty -Path $terminalServer -Name fSingleSessionPerUser -Value 1 -Force
           Set-ItemProperty -Path $rdpTcp -Name fEnableWinStation -Value 1 -Force
           Set-ItemProperty -Path $rdpTcp -Name PortNumber -Value 3389 -Force
@@ -206,15 +203,15 @@ jobs:
 
           try {
             $tsSetting = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
-            Write-Host "RDP_WMI_BEFORE AllowTSConnections=$($tsSetting.AllowTSConnections) PolicySource=$($tsSetting.PolicySourceAllowTSConnections)"
+            Write-Host "RDP_WMI_PRE_RENAME_BEFORE AllowTSConnections=$($tsSetting.AllowTSConnections) PolicySource=$($tsSetting.PolicySourceAllowTSConnections)"
             $allowResult = Invoke-CimMethod -InputObject $tsSetting -MethodName SetAllowTSConnections -Arguments @{ AllowTSConnections = [uint32]1; ModifyFirewallException = [uint32]0 } -ErrorAction Stop
-            Write-Host "RDP_WMI_RETURN=$($allowResult.ReturnValue)"
+            Write-Host "RDP_WMI_PRE_RENAME_RETURN=$($allowResult.ReturnValue)"
           } catch {
-            Write-Warning "Terminal Services WMI enable failed: $($_.Exception.Message)"
+            Write-Warning "Terminal Services WMI pre-rename enable failed: $($_.Exception.Message)"
           }
 
-          # Configure RDP/firewall in the untouched GitHub runner context before the
-          # independent desktop account is used interactively.
+          # Configure firewall while the current logon name still matches its security token.
+          # This avoids Windows account-name/SID mapping failures after Rename-LocalUser.
           & netsh.exe advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Host
           Get-NetFirewallRule -DisplayName 'Managed Cloudflare RDP Loopback' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
           & netsh.exe advfirewall firewall add rule name="Managed Cloudflare RDP Loopback" dir=in action=allow protocol=TCP localport=3389 remoteip=127.0.0.1 | Out-Host
@@ -223,7 +220,7 @@ jobs:
             try {
               Set-Service -Name $serviceName -StartupType Manual -ErrorAction Stop
               Start-Service -Name $serviceName -ErrorAction SilentlyContinue
-            } catch { Write-Warning "$serviceName initialization failed: $($_.Exception.Message)" }
+            } catch { Write-Warning "$serviceName pre-rename initialization failed: $($_.Exception.Message)" }
           }
           Set-Service -Name TermService -StartupType Automatic
           if ((Get-Service TermService).Status -eq 'Running') { Restart-Service TermService -Force } else { Start-Service TermService }
@@ -238,10 +235,10 @@ jobs:
             Start-Sleep -Seconds 1
           }
           if (-not $listenerReady) {
-            Write-Host '===== RDP INITIALIZATION DIAGNOSTICS ====='
+            Write-Host '===== PRE-RENAME RDP DIAGNOSTICS ====='
             try {
               $tsAfter = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
-              Write-Host "RDP_WMI_AFTER AllowTSConnections=$($tsAfter.AllowTSConnections) PolicySource=$($tsAfter.PolicySourceAllowTSConnections)"
+              Write-Host "RDP_WMI_PRE_RENAME_AFTER AllowTSConnections=$($tsAfter.AllowTSConnections) PolicySource=$($tsAfter.PolicySourceAllowTSConnections)"
             } catch { Write-Warning "RDP WMI read failed: $($_.Exception.Message)" }
             Get-ItemProperty -Path $rdpTcp -ErrorAction SilentlyContinue | Select-Object fEnableWinStation,PortNumber,LanAdapter,UserAuthentication,SecurityLayer,MinEncryptionLevel | Format-List
             Get-Service TermService,SessionEnv,UmRdpService -ErrorAction SilentlyContinue | Format-Table Name,Status,StartType -AutoSize
@@ -252,9 +249,9 @@ jobs:
               Write-Host "--- $logName ---"
               Get-WinEvent -FilterHashtable @{ LogName = $logName; StartTime = $rdpStartedAt.AddSeconds(-5) } -MaxEvents 30 -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,LevelDisplayName,Message
             }
-            throw 'RDP TCP/3389 listener did not become ready'
+            throw 'RDP TCP/3389 listener did not become ready before account rename'
           }
-          Write-Host 'RDP_READY=3389'
+          Write-Host 'RDP_PRE_RENAME_READY=3389'
 
       - name: Restore latest Windows user backup
         if: ${{ inputs.mode == 'restore' }}
@@ -265,45 +262,40 @@ jobs:
           restore-keys: |
             managed-desktop-windows-${{ inputs.machine_id }}-
 
-      - name: Prepare independent desktop account and restore profile data
+      - name: Bind managed desktop to runner session and restore profile data
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $username = $env:DESKTOP_USERNAME
           $secure = ConvertTo-SecureString $env:CLOUD_PASSWORD -AsPlainText -Force
-          $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
-          # Keep the GitHub Hosted Runner identity untouched. The managed desktop gets
-          # its own local SID/profile so RDP and user-installed remote-control software
-          # never land on the HostedComputeAgent / Runner.Listener desktop.
-          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-          if ($null -eq $user) {
-            New-LocalUser -Name $username -Password $secure -PasswordNeverExpires -AccountNeverExpires -Description 'Managed cloud desktop user' | Out-Null
-          } else {
-            if ($user.SID.Value -eq $runnerSid) { throw "desktop_username '$username' still resolves to the GitHub Runner SID" }
-            Set-LocalUser -Name $username -Password $secure -PasswordNeverExpires $true
-            Enable-LocalUser -Name $username
+          # Use the GitHub runner's existing local SID/profile/session as the managed desktop.
+          # Renaming the account keeps UU/console, RDP and the workflow on one Windows session.
+          $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $runnerUser = Get-LocalUser | Where-Object { $_.SID.Value -eq $currentSid } | Select-Object -First 1
+          if ($null -eq $runnerUser) { throw "Current runner identity is not a local Windows account: $currentSid" }
+          $existingTarget = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($null -ne $existingTarget -and $existingTarget.SID.Value -ne $currentSid) {
+            throw "desktop_username '$username' is already used by another local SID"
           }
+          $originalName = [string]$runnerUser.Name
+          if ($originalName -ne $username) {
+            Rename-LocalUser -Name $originalName -NewName $username
+          }
+          Set-LocalUser -Name $username -Password $secure -PasswordNeverExpires $true
+          Enable-LocalUser -Name $username
           foreach ($group in @('Administrators','Remote Desktop Users')) {
             try { Add-LocalGroupMember -Group $group -Member $username -ErrorAction Stop } catch { }
           }
 
-          # Force Windows to materialize this user's own ProfileList entry and profile
-          # directory before restore. The helper runs hidden and exits immediately.
-          $credential = [pscredential]::new("$env:COMPUTERNAME\$username", $secure)
-          $windowsPowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-          $bootstrap = Start-Process -FilePath $windowsPowerShell -Credential $credential -LoadUserProfile -ArgumentList '-NoLogo -NoProfile -NonInteractive -Command "exit 0"' -Wait -PassThru -WindowStyle Hidden
-          if ($bootstrap.ExitCode -ne 0) { throw "$username profile bootstrap failed: $($bootstrap.ExitCode)" }
-
           $sid = (Get-LocalUser -Name $username -ErrorAction Stop).SID.Value
-          if ($sid -eq $runnerSid) { throw 'Managed desktop SID must be independent from the GitHub Runner SID' }
+          if ($sid -ne $currentSid) { throw 'Managed desktop SID changed unexpectedly' }
           $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
           $profileRoot = (Get-ItemProperty -Path $profileKey -ErrorAction SilentlyContinue).ProfileImagePath
-          if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = "C:\Users\$username" }
+          if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = $env:USERPROFILE }
           $profileRoot = [Environment]::ExpandEnvironmentVariables($profileRoot)
-          New-Item -ItemType Directory -Path $profileRoot -Force | Out-Null
-          Write-Host "MANAGED_WINDOWS_RUNNER_SID=$runnerSid"
-          Write-Host "MANAGED_WINDOWS_DESKTOP_SID=$sid profile=$profileRoot"
+          if (-not (Test-Path -LiteralPath $profileRoot)) { throw "Runner profile not found: $profileRoot" }
+          Write-Host "MANAGED_WINDOWS_BASE_IDENTITY=$originalName->$username sid=$sid profile=$profileRoot"
 
           if ($env:MACHINE_MODE -eq 'restore') {
             $restoreRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
@@ -359,7 +351,7 @@ jobs:
           $sid = (Get-LocalUser -Name $username -ErrorAction Stop).SID.Value
           $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
           $profileRoot = (Get-ItemProperty -Path $profileKey -ErrorAction SilentlyContinue).ProfileImagePath
-          if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = "C:\Users\$username" }
+          if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = $env:USERPROFILE }
           $profileRoot = [Environment]::ExpandEnvironmentVariables($profileRoot)
 
           # Reinstall package-managed applications first so restored AppData/registry overlays their fresh defaults.
@@ -402,43 +394,37 @@ jobs:
           function Restore-HiveSnapshot {
             param(
               [Parameter(Mandatory=$true)][string]$Snapshot,
-              [Parameter(Mandatory=$true)][string]$TargetRoot,
-              [Parameter(Mandatory=$true)][string]$TargetFile
+              [Parameter(Mandatory=$true)][string]$TargetRoot
             )
             if (-not (Test-Path -LiteralPath $Snapshot)) { return $false }
-
-            # The managed desktop is a separate account and is not interactively logged
-            # on yet. If its hive is still loaded from profile bootstrap, unload it first,
-            # then restore the saved hive directly into that user's profile files.
             $targetProvider = "Registry::HKEY_USERS\$TargetRoot"
-            if (Test-Path $targetProvider) {
+            if (-not (Test-Path $targetProvider)) { throw "Live registry target is not loaded: $TargetRoot" }
+
+            # The managed desktop is the runner's live SID, so never unload/replace its Hive.
+            # Mount the saved Hive temporarily and merge it into the already-loaded target SID.
+            $mountName = "ManagedRestore_$([guid]::NewGuid().ToString('N'))"
+            try {
+              & reg.exe load "HKU\$mountName" $Snapshot | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "reg load failed for $Snapshot" }
+              & reg.exe copy "HKU\$mountName" "HKU\$TargetRoot" /s /f | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "reg copy failed for $TargetRoot" }
+            } finally {
               [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-              & reg.exe unload "HKU\$TargetRoot" 2>$null | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "reg unload failed for $TargetRoot" }
-              Start-Sleep -Milliseconds 300
+              & reg.exe unload "HKU\$mountName" 2>$null | Out-Null
             }
-            $parent = Split-Path -Parent $TargetFile
-            New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            Copy-Item -LiteralPath $Snapshot -Destination $TargetFile -Force
-            & icacls.exe $TargetFile /inheritance:e /grant:r "${username}:(F)" 'SYSTEM:(F)' 'Administrators:(F)' /C | Out-Null
             return $true
           }
 
           $registryRestored = 0
           $ntSnapshot = Join-Path $stateRoot 'ntuser.hiv'
-          $ntUser = Join-Path $profileRoot 'NTUSER.DAT'
-          if (Restore-HiveSnapshot -Snapshot $ntSnapshot -TargetRoot $sid -TargetFile $ntUser) { $registryRestored++ }
+          if (Restore-HiveSnapshot -Snapshot $ntSnapshot -TargetRoot $sid) { $registryRestored++ }
           $usrSnapshot = Join-Path $stateRoot 'usrclass.hiv'
-          $usrClass = Join-Path $profileRoot 'AppData\Local\Microsoft\Windows\UsrClass.dat'
-          if (Restore-HiveSnapshot -Snapshot $usrSnapshot -TargetRoot "${sid}_Classes" -TargetFile $usrClass) { $registryRestored++ }
+          if (Restore-HiveSnapshot -Snapshot $usrSnapshot -TargetRoot "${sid}_Classes") { $registryRestored++ }
 
-          # Compatibility with the first v2 draft. A failed legacy text import is a warning,
-          # not a restore blocker; new backups always use binary Hive snapshots above.
           if ($registryRestored -eq 0 -and ((Test-Path (Join-Path $stateRoot 'hkcu.reg')) -or (Test-Path (Join-Path $stateRoot 'usrclass.reg')))) {
             Write-Warning 'Legacy v2 registry text export detected; profile files were restored but registry Hive state cannot be guaranteed.'
           }
 
-          # Restore machine-level Run/RunOnce entries captured from the old runner.
           $startupPath = Join-Path $stateRoot 'machine-startup.json'
           $startupRestored = 0
           if (Test-Path -LiteralPath $startupPath) {
@@ -454,7 +440,6 @@ jobs:
             }
           }
 
-          # Re-register non-Microsoft scheduled tasks, rewriting the previous user SID when needed.
           $taskManifestPath = Join-Path $stateRoot 'scheduled-tasks.json'
           $taskRestored = 0
           if (Test-Path -LiteralPath $taskManifestPath) {
@@ -471,7 +456,6 @@ jobs:
             }
           }
 
-          # Services themselves are re-created by installers; restore auto-start only for services that now exist.
           $servicesPath = Join-Path $stateRoot 'auto-services.json'
           $serviceRestored = 0
           if (Test-Path -LiteralPath $servicesPath) {
@@ -488,30 +472,32 @@ jobs:
 
           Write-Host "MANAGED_WINDOWS_STATE_V2_RESTORED registry=$registryRestored startup=$startupRestored tasks=$taskRestored services=$serviceRestored softwareFailed=$softwareFailed"
 
-      - name: Verify independent managed RDP desktop
+      - name: Verify single managed Windows session
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           $managedUser = Get-LocalUser -Name $env:DESKTOP_USERNAME -ErrorAction Stop
-          $managedSid = $managedUser.SID.Value
-          if ($managedSid -eq $runnerSid) { throw 'Managed RDP account must not reuse the GitHub Runner SID' }
+          if ($managedUser.SID.Value -ne $currentSid) { throw 'Managed RDP user no longer matches the runner SID' }
           if (-not $managedUser.Enabled) { throw 'Managed RDP account is disabled' }
 
-          # RDP stays machine-wide, but interactive logon uses the independent managed
-          # account. GitHub Actions remains isolated in its original runner session.
+          # RDP was initialized before Rename-LocalUser while Windows could still resolve
+          # the live logon name. Do not restart TermService or rewrite firewall state here.
           if (-not (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)) {
-            Write-Host '===== MANAGED RDP DIAGNOSTICS ====='
+            Write-Host '===== POST-RENAME RDP DIAGNOSTICS ====='
             Get-Service TermService,SessionEnv,UmRdpService -ErrorAction SilentlyContinue | Format-Table Name,Status,StartType -AutoSize
             & qwinsta.exe 2>&1 | Out-Host
             & sc.exe query termdd 2>&1 | Out-Host
-            throw 'RDP TCP/3389 listener is not ready'
+            throw 'RDP TCP/3389 listener was lost after account rename'
           }
+
+          $workflowSessionId = (Get-Process -Id $PID).SessionId
+          Write-Host "MANAGED_WINDOWS_INTERACTIVE_SESSION_ID=$workflowSessionId"
+          & qwinsta.exe 2>&1 | Out-Host
 
           $ip = (& tailscale ip -4 | Select-Object -First 1).Trim()
           if (-not $ip) { throw 'No Tailscale IPv4 address was assigned' }
-          Write-Host "MANAGED_WINDOWS_RUNNER_SID=$runnerSid"
-          Write-Host "MANAGED_WINDOWS_DESKTOP_SID=$managedSid"
+          Write-Host "MANAGED_WINDOWS_SAME_SID=$currentSid"
           Write-Host 'MANAGED_WINDOWS_READY'
           Write-Host "TAILSCALE_RDP=$ip`:3389"
           Write-Host "RDP_USER=.\$env:DESKTOP_USERNAME"
@@ -544,50 +530,12 @@ jobs:
           }
           Write-Host "CLOUDFLARE_RDP_TUNNEL=$env:CF_TUNNEL_HOSTNAME"
 
-      - name: Report Windows connection to Cloudflare
-        env:
-          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "::add-mask::$env:BOOTSTRAP_TICKET"
-          $ip = (& tailscale ip -4 | Select-Object -First 1).Trim()
-          if (-not $ip) { throw 'No Tailscale IPv4 address was assigned' }
-          $payload = @{
-            instanceKey = "instance:windows:$env:MACHINE_ID"
-            repository = $env:GITHUB_REPOSITORY
-            runId = [int64]$env:GITHUB_RUN_ID
-            nodeName = "win-$env:MACHINE_ID"
-            address = "$ip`:3389"
-            tailscaleAddress = "$ip`:3389"
-            tailscaleHostname = $env:TS_DNS_HOSTNAME
-            cloudflareAddress = $env:CF_TUNNEL_HOSTNAME
-            cloudflareHostname = $env:CF_TUNNEL_HOSTNAME
-            tunnelMode = $env:TUNNEL_MODE
-            status = 'in_progress'
-          } | ConvertTo-Json -Compress
-          $controlUrl = ([string]$env:WEB_URL).TrimEnd('/')
-          if (-not $controlUrl.StartsWith('https://')) { throw 'Cloudflare control URL is invalid' }
-          $reported = $null
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            try {
-              $reported = Invoke-RestMethod -Method Post -Uri "$controlUrl/api/runner/report" -Headers @{ 'X-Bootstrap-Ticket' = $env:BOOTSTRAP_TICKET } -ContentType 'application/json' -Body $payload
-              break
-            } catch {
-              if ($attempt -ge 3) { throw }
-              Write-Warning "Runner report attempt $attempt failed; retrying."
-              Start-Sleep -Seconds (2 * $attempt)
-            }
-          }
-          if ($null -eq $reported) { throw 'Cloudflare runner report did not return a response' }
-          Write-Host "CLOUDFLARE_RUNNER_REPORT_OK=$ip`:3389"
-          if ($reported.tailscaleDomain) { Write-Host "TAILSCALE_FIXED_DOMAIN=$($reported.tailscaleDomain)" }
-          if ($reported.cloudflareDomain) { Write-Host "CLOUDFLARE_FIXED_DOMAIN=$($reported.cloudflareDomain)" }
 
       - name: Keep Windows session alive and watch backup command
         id: session
         env:
           GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
@@ -669,6 +617,40 @@ jobs:
             }
           } catch { Write-Host "RUNNER_CONSOLE_HIDE_SKIPPED=$($_.Exception.Message)" }
           Write-Host 'MANAGED_RUNNER_CONSOLE_HIDDEN'
+
+          # Do not publish the connection until the Runner console is already hidden.
+          Write-Host "::add-mask::$env:BOOTSTRAP_TICKET"
+          $ip = (& tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw 'No Tailscale IPv4 address was assigned' }
+          $payload = @{
+            instanceKey = "instance:windows:$env:MACHINE_ID"
+            repository = $env:GITHUB_REPOSITORY
+            runId = [int64]$env:GITHUB_RUN_ID
+            nodeName = "win-$env:MACHINE_ID"
+            address = "$ip`:3389"
+            tailscaleAddress = "$ip`:3389"
+            tailscaleHostname = $env:TS_DNS_HOSTNAME
+            cloudflareAddress = $env:CF_TUNNEL_HOSTNAME
+            cloudflareHostname = $env:CF_TUNNEL_HOSTNAME
+            tunnelMode = $env:TUNNEL_MODE
+            status = 'in_progress'
+          } | ConvertTo-Json -Compress
+          $controlUrl = ([string]$env:WEB_URL).TrimEnd('/')
+          if (-not $controlUrl.StartsWith('https://')) { throw 'Cloudflare control URL is invalid' }
+          $reported = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              $reported = Invoke-RestMethod -Method Post -Uri "$controlUrl/api/runner/report" -Headers @{ 'X-Bootstrap-Ticket' = $env:BOOTSTRAP_TICKET } -ContentType 'application/json' -Body $payload
+              break
+            } catch {
+              if ($attempt -ge 3) { throw }
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
+          if ($null -eq $reported) { throw 'Cloudflare runner report did not return a response' }
+          Write-Host "CLOUDFLARE_RUNNER_REPORT_OK=$ip`:3389"
+          if ($reported.tailscaleDomain) { Write-Host "TAILSCALE_FIXED_DOMAIN=$($reported.tailscaleDomain)" }
+          if ($reported.cloudflareDomain) { Write-Host "CLOUDFLARE_FIXED_DOMAIN=$($reported.cloudflareDomain)" }
 
           function Get-ManagedUserProfilePath {
             $username = $env:DESKTOP_USERNAME
