@@ -1800,7 +1800,9 @@ jobs:
           $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
           $rdpVerifyStartedAt = Get-Date
           function Test-RdpListener {
-            return [bool](Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)
+            if ([bool](Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)) { return $true }
+            $netstatListener = @(& netstat.exe -ano -p tcp 2>$null | Select-String -Pattern ':3389\s+.*LISTENING')
+            return [bool]$netstatListener.Count
           }
           $initialTcp = Test-RdpListener
           $initialNetstat = @(& netstat.exe -ano -p tcp 2>$null | Select-String -Pattern ':3389\s+.*LISTENING' | ForEach-Object { $_.Line.Trim() }) -join ';'
