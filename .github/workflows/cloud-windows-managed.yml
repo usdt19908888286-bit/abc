@@ -303,13 +303,19 @@ jobs:
               'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\TempState'
             )
             $volatileFiles = @(
-              'AppData\Local\Microsoft\Windows\WebCacheLock.dat',
-              'AppData\Local\Microsoft\Windows\Explorer\iconcache_*.db',
-              'AppData\Local\Microsoft\Windows\Explorer\thumbcache_*.db',
               'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat',
-              'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat.LOG*',
-              'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat',
-              'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat.LOG*'
+              'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat'
+            )
+            # Keep verification aligned with robocopy /XF. These are transactional/
+            # runtime files that are intentionally not overlaid onto the live runner profile.
+            $volatileLeafFiles = @(
+              'WebCacheLock.dat',
+              'iconcache_*.db',
+              'thumbcache_*.db',
+              'settings.dat.LOG*',
+              'WPNPRMRY.tmp',
+              'wpndatabase.db-shm',
+              'wpndatabase.db-wal'
             )
             function Test-ManagedVolatilePath {
               param([Parameter(Mandatory=$true)][string]$Relative)
@@ -320,6 +326,10 @@ jobs:
               }
               foreach ($pattern in $volatileFiles) {
                 if ($normalized -like $pattern) { return $true }
+              }
+              $leaf = [IO.Path]::GetFileName($normalized)
+              foreach ($pattern in $volatileLeafFiles) {
+                if ($leaf -like $pattern) { return $true }
               }
               return $false
             }
@@ -350,14 +360,28 @@ jobs:
             $skippedVolatile = 0
             $missing = 0
             $mismatch = 0
+            $missingDetails = [System.Collections.Generic.List[string]]::new()
+            $mismatchDetails = [System.Collections.Generic.List[string]]::new()
             Get-ChildItem -LiteralPath $restoreProfile -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
               $relative = $_.FullName.Substring($restoreProfile.Length).TrimStart('\')
               if (Test-ManagedVolatilePath -Relative $relative) { $skippedVolatile++; return }
               $target = Join-Path $profileRoot $relative
               $checked++
-              if (-not (Test-Path -LiteralPath $target)) { $missing++; return }
-              if ((Get-Item -LiteralPath $target -Force).Length -ne $_.Length) { $mismatch++ }
+              if (-not (Test-Path -LiteralPath $target)) {
+                $missing++
+                if ($missingDetails.Count -lt 20) { [void]$missingDetails.Add($relative) }
+                return
+              }
+              $targetLength = (Get-Item -LiteralPath $target -Force).Length
+              if ($targetLength -ne $_.Length) {
+                $mismatch++
+                if ($mismatchDetails.Count -lt 20) {
+                  [void]$mismatchDetails.Add("$relative sourceBytes=$($_.Length) targetBytes=$targetLength")
+                }
+              }
             }
+            foreach ($detail in $missingDetails) { Write-Warning "MANAGED_WINDOWS_PROFILE_VERIFY_MISSING $detail" }
+            foreach ($detail in $mismatchDetails) { Write-Warning "MANAGED_WINDOWS_PROFILE_VERIFY_MISMATCH $detail" }
             if ($missing -gt 0 -or $mismatch -gt 0) {
               throw "Windows profile restore verification failed: checked=$checked skippedVolatile=$skippedVolatile missing=$missing sizeMismatch=$mismatch"
             }
