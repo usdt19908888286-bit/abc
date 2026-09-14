@@ -206,17 +206,93 @@ jobs:
           $baselineProgramDirs = @($baselineProgramDirs | Sort-Object -Unique)
           ConvertTo-Json -InputObject @($baselineProgramDirs) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'program-dirs.json') -Encoding UTF8
 
+          # V9 also snapshots ProgramData topology because desktop/remote-control apps often keep
+          # machine-scoped runtime state outside Program Files.
+          $programDataRoot = [Environment]::GetFolderPath('CommonApplicationData')
+          $baselineProgramDataDirs = [System.Collections.Generic.List[string]]::new()
+          if ($programDataRoot -and (Test-Path -LiteralPath $programDataRoot -PathType Container)) {
+            Get-ChildItem -LiteralPath $programDataRoot -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              try { [void]$baselineProgramDataDirs.Add([IO.Path]::GetFullPath($_.FullName).TrimEnd('\')) } catch { }
+            }
+          }
+          $baselineProgramDataDirs = @($baselineProgramDataDirs | Sort-Object -Unique)
+          ConvertTo-Json -InputObject @($baselineProgramDataDirs) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'programdata-dirs.json') -Encoding UTF8
+
+          # Snapshot shallow user-application topology. The profile itself is copied by VSS;
+          # this baseline is only for identifying which AppData directories belong to apps
+          # installed after the pristine runner started.
+          $baselineAppDataDirs = [System.Collections.Generic.List[string]]::new()
+          foreach ($appDataRoot in @([Environment]::GetFolderPath('ApplicationData'), [Environment]::GetFolderPath('LocalApplicationData'))) {
+            if ([string]::IsNullOrWhiteSpace($appDataRoot) -or -not (Test-Path -LiteralPath $appDataRoot -PathType Container)) { continue }
+            Get-ChildItem -LiteralPath $appDataRoot -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              try { [void]$baselineAppDataDirs.Add([IO.Path]::GetFullPath($_.FullName).TrimEnd('\')) } catch { }
+            }
+          }
+          ConvertTo-Json -InputObject @($baselineAppDataDirs | Sort-Object -Unique) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'appdata-dirs.json') -Encoding UTF8
+
+          # Snapshot shallow application registry topology. We never restore the whole HKCU hive;
+          # only new app/vendor subtrees created after this baseline are exported later.
+          $baselineAppRegistryKeys = [System.Collections.Generic.List[string]]::new()
+          foreach ($registryRoot in @('HKCU:\SOFTWARE','HKLM:\SOFTWARE','HKLM:\SOFTWARE\WOW6432Node')) {
+            if (-not (Test-Path -LiteralPath $registryRoot)) { continue }
+            Get-ChildItem -LiteralPath $registryRoot -Recurse -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object {
+              try { [void]$baselineAppRegistryKeys.Add([string]$_.Name) } catch { }
+            }
+          }
+          ConvertTo-Json -InputObject @($baselineAppRegistryKeys | Sort-Object -Unique) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'app-registry-keys.json') -Encoding UTF8
+
+          function Get-StartupEntryInventory {
+            $entries = [System.Collections.Generic.List[object]]::new()
+            foreach ($path in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+            )) {
+              if (-not (Test-Path -LiteralPath $path)) { continue }
+              $key = Get-Item -LiteralPath $path
+              foreach ($name in $key.GetValueNames()) {
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                $kind = $key.GetValueKind($name).ToString()
+                if ($kind -notin @('String','ExpandString')) { continue }
+                $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                [void]$entries.Add([pscustomobject]@{ path=$path; name=$name; value=[string]$value; kind=$kind })
+              }
+            }
+            return @($entries)
+          }
+          ConvertTo-Json -InputObject @(Get-StartupEntryInventory) -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'startup-entries.json') -Encoding UTF8
+
+          $commonStartup = [Environment]::GetFolderPath('CommonStartup')
+          $baselineCommonStartup = @()
+          if ($commonStartup -and (Test-Path -LiteralPath $commonStartup)) {
+            $baselineCommonStartup = @(Get-ChildItem -LiteralPath $commonStartup -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName.Substring($commonStartup.Length).TrimStart('\') })
+          }
+          ConvertTo-Json -InputObject @($baselineCommonStartup | Sort-Object -Unique) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'common-startup-files.json') -Encoding UTF8
+
           # Managed backup boundary:
           # - portable/no-install files belong under the user profile and are preserved by the profile snapshot;
-          # - installed software is discovered only from explicit install evidence (uninstall registry,
-          #   package managers and service executable commands), never by broad disk scanning.
+          # - installed software is discovered only from explicit install evidence and baseline deltas.
           $baselineServices = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
             [pscustomobject]@{ name=[string]$_.Name; path=[string]$_.PathName; start_mode=[string]$_.StartMode; start_name=[string]$_.StartName; display_name=[string]$_.DisplayName }
           })
           ConvertTo-Json -InputObject $baselineServices -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'services.json') -Encoding UTF8
-          @{ captured_at=[DateTime]::UtcNow.ToString('o'); installed_apps=@($baselineApps).Count; services=@($baselineServices).Count } |
+
+          $baselineDrivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{ name=[string]$_.Name; display_name=[string]$_.DisplayName; path=[string]$_.PathName; start_mode=[string]$_.StartMode; state=[string]$_.State }
+          })
+          ConvertTo-Json -InputObject $baselineDrivers -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'drivers.json') -Encoding UTF8
+          try {
+            $pnputilBaseline = (& pnputil.exe /enum-drivers 2>$null) -join "`n"
+            $baselineOemInf = @([regex]::Matches($pnputilBaseline, '(?im)^\s*Published Name\s*:\s*(oem\d+\.inf)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Sort-Object -Unique)
+            $baselineOemInf | Set-Content -LiteralPath (Join-Path $baselineRoot 'driver-packages.txt') -Encoding UTF8
+          } catch { }
+
+          @{ captured_at=[DateTime]::UtcNow.ToString('o'); installed_apps=@($baselineApps).Count; services=@($baselineServices).Count; drivers=@($baselineDrivers).Count } |
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baselineRoot 'baseline.json') -Encoding UTF8
-          Write-Host "MANAGED_WINDOWS_SOFTWARE_BASELINE_READY apps=$(@($baselineApps).Count) services=$(@($baselineServices).Count)"
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_BASELINE_READY apps=$(@($baselineApps).Count) services=$(@($baselineServices).Count) drivers=$(@($baselineDrivers).Count)"
 
       - name: Initialize RDP stack for single managed session
         shell: pwsh
@@ -320,11 +396,17 @@ jobs:
           }
 
           $restoredRoots = 0
+          $manifestEntries = @(Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json)
+          $backupVersion = 1
+          $metadataPath = Join-Path $restoreRoot 'metadata.json'
+          if (Test-Path -LiteralPath $metadataPath) {
+            try { $backupVersion = [int](Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json).version } catch { }
+          }
           $fixedVolumes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
           Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID } | ForEach-Object {
             [void]$fixedVolumes.Add(([string]$_.DeviceID).ToUpperInvariant())
           }
-          foreach ($entry in @(Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json)) {
+          foreach ($entry in $manifestEntries) {
             $volume = ([string]$entry.volume).ToUpperInvariant()
             $relative = ([string]$entry.relative).TrimStart('\')
             if ($volume -notmatch '^[A-Z]:$' -or -not $fixedVolumes.Contains($volume)) { throw "Software restore volume is unavailable/unsafe: $volume" }
@@ -339,6 +421,9 @@ jobs:
             if ($copyExit -ge 8) { throw "Software restore failed exit=$copyExit root=$volume/$relative" }
             $restoredRoots++
             Write-Host "MANAGED_WINDOWS_SOFTWARE_ROOT_RESTORED volume=$volume relative=$relative exit=$copyExit"
+          }
+          if ($backupVersion -ge 9 -and $restoredRoots -lt @($manifestEntries).Count) {
+            throw "V9 software-root restore incomplete expected=$(@($manifestEntries).Count) actual=$restoredRoots"
           }
           Write-Host "MANAGED_WINDOWS_SOFTWARE_FILES_RESTORED roots=$restoredRoots"
           # Robocopy uses exit codes 1-7 for successful copies. GitHub's pwsh wrapper
@@ -616,6 +701,72 @@ jobs:
           }
           Write-Host "MANAGED_WINDOWS_UNINSTALL_REGISTRY_RESTORED count=$uninstallRegistryRestored"
 
+          $appRegistryRestored = 0
+          $appRegistryManifestPath = Join-Path $stateRoot 'app-registry.json'
+          if (Test-Path -LiteralPath $appRegistryManifestPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $appRegistryManifestPath -Raw | ConvertFrom-Json)) {
+              $file = Join-Path (Join-Path $stateRoot 'app-registry') ([string]$entry.file)
+              if (-not (Test-Path -LiteralPath $file)) { Write-Warning "Application registry backup missing: $($entry.registry_path)"; continue }
+              & reg.exe import $file | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                $appRegistryRestored++
+                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_RESTORED path=$($entry.registry_path)"
+              } else { Write-Warning "Application registry restore failed: $($entry.registry_path) exit=$LASTEXITCODE" }
+            }
+          }
+
+          # Reinstall exported PnP driver packages before restoring explicit driver service
+          # registrations. pnputil may assign a different oem*.inf name on the new runner;
+          # that is expected and does not affect the original INF payload.
+          $driverPackagesRestored = 0
+          $driverPackagesFailed = 0
+          $driverPackageManifestPath = Join-Path $stateRoot 'driver-packages.json'
+          if (Test-Path -LiteralPath $driverPackageManifestPath) {
+            foreach ($package in @(Get-Content -LiteralPath $driverPackageManifestPath -Raw | ConvertFrom-Json)) {
+              $packageDir = Join-Path (Join-Path $stateRoot 'drivers\packages') ([string]$package.directory)
+              $infFiles = @(Get-ChildItem -LiteralPath $packageDir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+              if (-not $infFiles.Count) { $driverPackagesFailed++; Write-Warning "Driver package backup has no INF: $($package.published_name)"; continue }
+              $packageOk = $true
+              foreach ($inf in $infFiles) {
+                & pnputil.exe /add-driver $inf.FullName /install | Out-Host
+                if ($LASTEXITCODE -ne 0) { $packageOk = $false }
+              }
+              if ($packageOk) { $driverPackagesRestored++; Write-Host "MANAGED_WINDOWS_DRIVER_PACKAGE_RESTORED source=$($package.published_name)" }
+              else { $driverPackagesFailed++; Write-Warning "Driver package restore failed: $($package.published_name)" }
+            }
+          }
+
+          $driversRestored = 0
+          $driversFailed = 0
+          $driverManifestPath = Join-Path $stateRoot 'drivers.json'
+          if (Test-Path -LiteralPath $driverManifestPath) {
+            foreach ($driver in @(Get-Content -LiteralPath $driverManifestPath -Raw | ConvertFrom-Json)) {
+              try {
+                if ($driver.binary_file -and $driver.binary_path) {
+                  $sourceFile = Join-Path (Join-Path $stateRoot 'drivers\files') ([string]$driver.binary_file)
+                  if (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
+                    $targetFile = [string]$driver.binary_path
+                    New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($targetFile)) -Force | Out-Null
+                    Copy-Item -LiteralPath $sourceFile -Destination $targetFile -Force
+                  }
+                }
+                if ($driver.registry_file) {
+                  $regFile = Join-Path (Join-Path $stateRoot 'drivers') ([string]$driver.registry_file)
+                  if (Test-Path -LiteralPath $regFile) {
+                    & reg.exe import $regFile | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "driver registry import exited $LASTEXITCODE" }
+                  }
+                }
+                if ([string]$driver.state -eq 'Running') { & sc.exe start ([string]$driver.name) 2>$null | Out-Null }
+                $driversRestored++
+                Write-Host "MANAGED_WINDOWS_DRIVER_RESTORED name=$($driver.name) path=$($driver.binary_path)"
+              } catch {
+                $driversFailed++
+                Write-Warning "driver restore failed for $($driver.name): $($_.Exception.Message)"
+              }
+            }
+          }
+
           function Restore-HiveSnapshot {
             param(
               [Parameter(Mandatory=$true)][string]$Snapshot,
@@ -660,6 +811,38 @@ jobs:
                 New-ItemProperty -Path ([string]$entry.path) -Name ([string]$entry.name) -Value ([string]$entry.value) -PropertyType $type -Force | Out-Null
                 $startupRestored++
               } catch { Write-Warning "startup restore failed: $($_.Exception.Message)" }
+            }
+          }
+
+          $startupApprovedRestored = 0
+          $startupApprovedPath = Join-Path $stateRoot 'startup-approved.json'
+          if (Test-Path -LiteralPath $startupApprovedPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $startupApprovedPath -Raw | ConvertFrom-Json)) {
+              try {
+                if (-not $entry.path -or -not $entry.name -or -not $entry.value_b64) { continue }
+                New-Item -Path ([string]$entry.path) -Force | Out-Null
+                $bytes = [Convert]::FromBase64String([string]$entry.value_b64)
+                New-ItemProperty -Path ([string]$entry.path) -Name ([string]$entry.name) -Value $bytes -PropertyType Binary -Force | Out-Null
+                $startupApprovedRestored++
+              } catch { Write-Warning "StartupApproved restore failed: $($_.Exception.Message)" }
+            }
+          }
+
+          $commonStartupRestored = 0
+          $commonStartupManifestPath = Join-Path $stateRoot 'common-startup.json'
+          $commonStartup = [Environment]::GetFolderPath('CommonStartup')
+          if ($commonStartup -and (Test-Path -LiteralPath $commonStartupManifestPath)) {
+            foreach ($entry in @(Get-Content -LiteralPath $commonStartupManifestPath -Raw | ConvertFrom-Json)) {
+              try {
+                $relative = ([string]$entry.relative).TrimStart('\')
+                if (-not $relative -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { continue }
+                $source = Join-Path (Join-Path $stateRoot 'common-startup') $relative
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+                $destination = Join-Path $commonStartup $relative
+                New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+                Copy-Item -LiteralPath $source -Destination $destination -Force
+                $commonStartupRestored++
+              } catch { Write-Warning "common startup restore failed: $($_.Exception.Message)" }
             }
           }
 
@@ -732,8 +915,22 @@ jobs:
               } catch { Write-Warning "service delta restore failed for ${name}: $($_.Exception.Message)" }
             }
           }
+          if ($version -ge 9) {
+            $expectedAppRegistry = if ($null -eq $metadata.app_registry_count) { 0 } else { [int]$metadata.app_registry_count }
+            $expectedStartup = if ($null -eq $metadata.machine_startup_count) { 0 } else { [int]$metadata.machine_startup_count }
+            $expectedStartupApproved = if ($null -eq $metadata.startup_approved_count) { 0 } else { [int]$metadata.startup_approved_count }
+            $expectedCommonStartup = if ($null -eq $metadata.common_startup_count) { 0 } else { [int]$metadata.common_startup_count }
+            $expectedDrivers = if ($null -eq $metadata.driver_delta_count) { 0 } else { [int]$metadata.driver_delta_count }
+            $expectedDriverPackages = if ($null -eq $metadata.driver_package_delta_count) { 0 } else { [int]$metadata.driver_package_delta_count }
+            if ($appRegistryRestored -lt $expectedAppRegistry) { throw "V9 app registry restore incomplete expected=$expectedAppRegistry actual=$appRegistryRestored" }
+            if ($startupRestored -lt $expectedStartup) { throw "V9 startup restore incomplete expected=$expectedStartup actual=$startupRestored" }
+            if ($startupApprovedRestored -lt $expectedStartupApproved) { throw "V9 StartupApproved restore incomplete expected=$expectedStartupApproved actual=$startupApprovedRestored" }
+            if ($commonStartupRestored -lt $expectedCommonStartup) { throw "V9 common Startup restore incomplete expected=$expectedCommonStartup actual=$commonStartupRestored" }
+            if ($driversRestored -lt $expectedDrivers -or $driversFailed -gt 0) { throw "V9 driver restore incomplete expected=$expectedDrivers actual=$driversRestored failed=$driversFailed" }
+            if ($driverPackagesRestored -lt $expectedDriverPackages -or $driverPackagesFailed -gt 0) { throw "V9 driver package restore incomplete expected=$expectedDriverPackages actual=$driverPackagesRestored failed=$driverPackagesFailed" }
+          }
           Write-ManagedRdpProbe -Stage 'step11-end'
-          Write-Host "MANAGED_WINDOWS_STATE_V3_RESTORED registry=$registryRestored uninstallRegistry=$uninstallRegistryRestored startup=$startupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored softwarePackagesFailed=$softwareFailed"
+          Write-Host "MANAGED_WINDOWS_STATE_V9_RESTORED registry=$registryRestored appRegistry=$appRegistryRestored uninstallRegistry=$uninstallRegistryRestored startup=$startupRestored startupApproved=$startupApprovedRestored commonStartup=$commonStartupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored drivers=$driversRestored driverFailed=$driversFailed driverPackages=$driverPackagesRestored driverPackageFailed=$driverPackagesFailed softwarePackagesFailed=$softwareFailed"
 
       - name: Verify restored Windows application delta
         if: ${{ inputs.mode == 'restore' }}
@@ -835,7 +1032,78 @@ jobs:
             $evidenceText = if ($existingEvidence.Count) { $existingEvidence -join ';' } else { 'registry-only' }
             Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_OK name=$name registry=$regPath evidence=$evidenceText"
           }
-          Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_COMPLETE count=$verified"
+
+          if ($backupVersion -ge 9) {
+            $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$currentSid"
+            $profileRoot = (Get-ItemProperty -Path $profileKey -ErrorAction SilentlyContinue).ProfileImagePath
+            if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = $env:USERPROFILE }
+            $profileRoot = [Environment]::ExpandEnvironmentVariables($profileRoot)
+
+            $profileEvidencePath = Join-Path $stateRoot 'app-profile-evidence.json'
+            $profileEvidence = @()
+            if (Test-Path -LiteralPath $profileEvidencePath) { $profileEvidence = @(Get-Content -LiteralPath $profileEvidencePath -Raw | ConvertFrom-Json) }
+            $expectedProfileEvidence = if ($null -eq $backupMetadata.app_profile_evidence_count) { @($profileEvidence).Count } else { [int]$backupMetadata.app_profile_evidence_count }
+            if (@($profileEvidence).Count -lt $expectedProfileEvidence) { throw "V9 app profile manifest incomplete expected=$expectedProfileEvidence actual=$(@($profileEvidence).Count)" }
+            foreach ($entry in $profileEvidence) {
+              $relative = ([string]$entry.relative).TrimStart('\')
+              if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { throw "Unsafe V9 app profile evidence path: $relative" }
+              $target = Join-Path $profileRoot $relative
+              if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw "V9 app profile/cache directory is missing: $relative" }
+              $actualMeasure = Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object
+              $expectedFiles = if ($null -eq $entry.file_count) { 0 } else { [int64]$entry.file_count }
+              if ([int64]$actualMeasure.Count -lt $expectedFiles) { throw "V9 app profile/cache file count is incomplete path=$relative expected=$expectedFiles actual=$([int64]$actualMeasure.Count)" }
+              Write-Host "MANAGED_WINDOWS_APP_PROFILE_RESTORE_OK relative=$relative files=$([int64]$actualMeasure.Count)"
+            }
+
+            $protectedStatePath = Join-Path $stateRoot 'protected-user-state.json'
+            $protectedState = @()
+            if (Test-Path -LiteralPath $protectedStatePath) { $protectedState = @(Get-Content -LiteralPath $protectedStatePath -Raw | ConvertFrom-Json) }
+            foreach ($entry in $protectedState) {
+              $relative = ([string]$entry.relative).TrimStart('\')
+              if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { throw "Unsafe protected-user-state path: $relative" }
+              $target = Join-Path $profileRoot $relative
+              if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw "Protected user state directory is missing: $relative" }
+              $actualCount = [int64]@(Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+              $expectedCount = if ($null -eq $entry.file_count) { 0 } else { [int64]$entry.file_count }
+              if ($actualCount -lt $expectedCount) { throw "Protected user state files are incomplete path=$relative expected=$expectedCount actual=$actualCount" }
+              Write-Host "MANAGED_WINDOWS_PROTECTED_USER_STATE_RESTORED relative=$relative files=$actualCount portability=encrypted-data-only"
+            }
+
+            $startupManifestPath = Join-Path $stateRoot 'machine-startup.json'
+            if (Test-Path -LiteralPath $startupManifestPath) {
+              foreach ($entry in @(Get-Content -LiteralPath $startupManifestPath -Raw | ConvertFrom-Json)) {
+                if (-not $entry.path -or -not $entry.name) { continue }
+                $item = Get-Item -LiteralPath ([string]$entry.path) -ErrorAction Stop
+                $actualValue = $item.GetValue([string]$entry.name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ([string]$actualValue -ne [string]$entry.value) { throw "V9 startup entry mismatch path=$($entry.path) name=$($entry.name)" }
+                Write-Host "MANAGED_WINDOWS_STARTUP_RESTORE_OK path=$($entry.path) name=$($entry.name)"
+              }
+            }
+
+            $approvedManifestPath = Join-Path $stateRoot 'startup-approved.json'
+            if (Test-Path -LiteralPath $approvedManifestPath) {
+              foreach ($entry in @(Get-Content -LiteralPath $approvedManifestPath -Raw | ConvertFrom-Json)) {
+                if (-not $entry.path -or -not $entry.name -or -not $entry.value_b64) { continue }
+                $item = Get-Item -LiteralPath ([string]$entry.path) -ErrorAction Stop
+                $actualBytes = $item.GetValue([string]$entry.name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if (-not ($actualBytes -is [byte[]]) -or [Convert]::ToBase64String($actualBytes) -ne [string]$entry.value_b64) { throw "V9 StartupApproved mismatch path=$($entry.path) name=$($entry.name)" }
+                Write-Host "MANAGED_WINDOWS_STARTUP_APPROVED_RESTORE_OK path=$($entry.path) name=$($entry.name)"
+              }
+            }
+
+            $commonStartupManifestPath = Join-Path $stateRoot 'common-startup.json'
+            if (Test-Path -LiteralPath $commonStartupManifestPath) {
+              $commonStartup = [Environment]::GetFolderPath('CommonStartup')
+              foreach ($entry in @(Get-Content -LiteralPath $commonStartupManifestPath -Raw | ConvertFrom-Json)) {
+                $relative = ([string]$entry.relative).TrimStart('\')
+                if (-not $relative) { continue }
+                if (-not (Test-Path -LiteralPath (Join-Path $commonStartup $relative) -PathType Leaf)) { throw "V9 common Startup file is missing: $relative" }
+                Write-Host "MANAGED_WINDOWS_COMMON_STARTUP_RESTORE_OK relative=$relative"
+              }
+            }
+          }
+          Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_COMPLETE count=$verified version=$backupVersion"
 
       - name: Verify single managed Windows session
         shell: pwsh
@@ -1253,8 +1521,17 @@ jobs:
             # this layer captures the missing Program Files / ProgramData application payloads.
             $backupSoftware = Join-Path $backupRoot 'software'
             $uninstallRegistryRoot = Join-Path $stateRoot 'uninstall-registry'
+            $appRegistryRoot = Join-Path $stateRoot 'app-registry'
+            $driverStateRoot = Join-Path $stateRoot 'drivers'
+            $driverPackageRoot = Join-Path $driverStateRoot 'packages'
+            $driverFileRoot = Join-Path $driverStateRoot 'files'
+            $commonStartupBackupRoot = Join-Path $stateRoot 'common-startup'
             New-Item -ItemType Directory -Path $backupSoftware -Force | Out-Null
             New-Item -ItemType Directory -Path $uninstallRegistryRoot -Force | Out-Null
+            New-Item -ItemType Directory -Path $appRegistryRoot -Force | Out-Null
+            New-Item -ItemType Directory -Path $driverPackageRoot -Force | Out-Null
+            New-Item -ItemType Directory -Path $driverFileRoot -Force | Out-Null
+            New-Item -ItemType Directory -Path $commonStartupBackupRoot -Force | Out-Null
 
             function Get-InstalledAppInventory {
               $items = [System.Collections.Generic.List[object]]::new()
@@ -1406,6 +1683,25 @@ jobs:
               return (($Value.ToLowerInvariant()) -replace '[^\p{L}\p{Nd}]','')
             }
 
+            $appIdentityTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($app in $appDelta) {
+              $registryLeaf = (([string]$app.registry_path -split '\\') | Select-Object -Last 1)
+              foreach ($identityValue in @([string]$app.name, [string]$app.publisher, [string]$registryLeaf)) {
+                $token = Normalize-AppIdentityToken -Value $identityValue
+                if ($token.Length -ge 4) { [void]$appIdentityTokens.Add($token) }
+              }
+            }
+            function Test-AppIdentityTokenMatch {
+              param([string]$Token)
+              if ([string]::IsNullOrWhiteSpace($Token) -or $Token.Length -lt 4) { return $false }
+              foreach ($known in $appIdentityTokens) {
+                if ($Token.Equals($known,[System.StringComparison]::OrdinalIgnoreCase) -or
+                    $Token.IndexOf($known,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                    $known.IndexOf($Token,[System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+              }
+              return $false
+            }
+
             # Build a bounded application-directory inventory for identity matching.
             # Only Program Files roots, to depth 3, are considered; no whole-disk scan occurs.
             $programDirectoryInventory = [System.Collections.Generic.List[string]]::new()
@@ -1473,6 +1769,10 @@ jobs:
                     $payloadVolumeRoot = [IO.Path]::GetPathRoot($payloadPath)
                     $payloadVolume = $payloadVolumeRoot.TrimEnd('\').ToUpperInvariant()
                     $payloadRelative = $payloadPath.Substring($payloadVolumeRoot.Length).TrimStart('\')
+                    foreach ($identityPart in @([IO.Path]::GetFileName($payloadPath), [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($payloadPath)))) {
+                      $identityToken = Normalize-AppIdentityToken -Value ([string]$identityPart)
+                      if ($identityToken.Length -ge 4) { [void]$appIdentityTokens.Add($identityToken) }
+                    }
                     Add-SoftwareRootCandidate -Path $payloadPath -Reason "registry-identity:$($app.name)"
                     if (-not ($softwareCandidates | Where-Object { ([string]$_.source).Equals($payloadPath,[System.StringComparison]::OrdinalIgnoreCase) })) {
                       [void]$softwareCandidates.Add([pscustomobject]@{ volume=$payloadVolume; relative=$payloadRelative; source=$payloadPath; reason="registry-identity-direct:$($app.name)" })
@@ -1492,6 +1792,67 @@ jobs:
                 }
               }
             }
+
+            # Capture machine-scoped application state under ProgramData. Only directories
+            # created after the pristine baseline and matching an app/vendor identity token
+            # are admitted, so Windows/runner-owned ProgramData is never swept wholesale.
+            $programDataRoot = [Environment]::GetFolderPath('CommonApplicationData')
+            $baselineProgramDataSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineProgramDataPath = Join-Path $baselineRoot 'programdata-dirs.json'
+            if (Test-Path -LiteralPath $baselineProgramDataPath) {
+              foreach ($savedDir in @(Get-Content -LiteralPath $baselineProgramDataPath -Raw | ConvertFrom-Json)) {
+                if ([string]::IsNullOrWhiteSpace([string]$savedDir)) { continue }
+                try { [void]$baselineProgramDataSet.Add([IO.Path]::GetFullPath([string]$savedDir).TrimEnd('\')) } catch { }
+              }
+            }
+            if (@($appDelta).Count -gt 0 -and $programDataRoot -and (Test-Path -LiteralPath $programDataRoot -PathType Container)) {
+              Get-ChildItem -LiteralPath $programDataRoot -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                  $currentDir = [IO.Path]::GetFullPath($_.FullName).TrimEnd('\')
+                  if ($baselineProgramDataSet.Contains($currentDir)) { return }
+                  $leafToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileName($currentDir))
+                  $parentToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($currentDir)))
+                  if ((Test-AppIdentityTokenMatch -Token $leafToken) -or (Test-AppIdentityTokenMatch -Token $parentToken)) {
+                    Add-SoftwareRootCandidate -Path $currentDir -Reason 'programdata-app-delta'
+                    Write-Host "MANAGED_WINDOWS_PROGRAMDATA_MATCH path=$currentDir"
+                  }
+                } catch { }
+              }
+            }
+
+            # Record app-owned user-profile state used for login/session/config/cache. These
+            # paths are already included in the VSS profile copy; the manifest makes their
+            # restoration explicit and verifiable without inspecting credential/token contents.
+            $baselineAppDataSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineAppDataPath = Join-Path $baselineRoot 'appdata-dirs.json'
+            if (Test-Path -LiteralPath $baselineAppDataPath) {
+              foreach ($savedDir in @(Get-Content -LiteralPath $baselineAppDataPath -Raw | ConvertFrom-Json)) {
+                if ([string]::IsNullOrWhiteSpace([string]$savedDir)) { continue }
+                try { [void]$baselineAppDataSet.Add([IO.Path]::GetFullPath([string]$savedDir).TrimEnd('\')) } catch { }
+              }
+            }
+            $appProfileEvidence = [System.Collections.Generic.List[object]]::new()
+            foreach ($appDataRoot in @([Environment]::GetFolderPath('ApplicationData'), [Environment]::GetFolderPath('LocalApplicationData'))) {
+              if ([string]::IsNullOrWhiteSpace($appDataRoot) -or -not (Test-Path -LiteralPath $appDataRoot -PathType Container)) { continue }
+              Get-ChildItem -LiteralPath $appDataRoot -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                  $currentDir = [IO.Path]::GetFullPath($_.FullName).TrimEnd('\')
+                  if ($baselineAppDataSet.Contains($currentDir)) { return }
+                  $leafToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileName($currentDir))
+                  $parentToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($currentDir)))
+                  if (-not ((Test-AppIdentityTokenMatch -Token $leafToken) -or (Test-AppIdentityTokenMatch -Token $parentToken))) { return }
+                  if (-not $currentDir.StartsWith($profileRoot.TrimEnd('\') + '\',[System.StringComparison]::OrdinalIgnoreCase)) { return }
+                  $relative = $currentDir.Substring($profileRoot.TrimEnd('\').Length).TrimStart('\')
+                  if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Split('\') -contains '..') { return }
+                  $measure = Get-ChildItem -LiteralPath $currentDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                  $dirBytes = if ($null -eq $measure.Sum) { [int64]0 } else { [int64]$measure.Sum }
+                  [void]$appProfileEvidence.Add([pscustomobject]@{ relative=$relative; file_count=[int64]$measure.Count; bytes=$dirBytes })
+                  Write-Host "MANAGED_WINDOWS_APP_PROFILE_MATCH relative=$relative files=$([int64]$measure.Count) bytes=$dirBytes"
+                } catch { }
+              }
+            }
+            ConvertTo-Json -InputObject @($appProfileEvidence | Sort-Object relative -Unique) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-profile-evidence.json') -Encoding UTF8
+
             ConvertTo-Json -InputObject @($appPayloadEvidence) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-payload-evidence.json') -Encoding UTF8
 
             $baselineServiceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1546,6 +1907,56 @@ jobs:
               }
             }
             ConvertTo-Json -InputObject @($uninstallRegistryManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'uninstall-registry.json') -Encoding UTF8
+
+            # Export application/vendor registry subtrees created after the pristine runner
+            # baseline. Matching is bounded by app identity tokens, so we do not merge an
+            # entire old user hive or unrelated Windows registry state.
+            $baselineAppRegistrySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineAppRegistryPath = Join-Path $baselineRoot 'app-registry-keys.json'
+            if (Test-Path -LiteralPath $baselineAppRegistryPath) {
+              foreach ($savedKey in @(Get-Content -LiteralPath $baselineAppRegistryPath -Raw | ConvertFrom-Json)) {
+                if ($savedKey) { [void]$baselineAppRegistrySet.Add([string]$savedKey) }
+              }
+            }
+            $appRegistryCandidates = [System.Collections.Generic.List[string]]::new()
+            foreach ($registryRoot in @('HKCU:\SOFTWARE','HKLM:\SOFTWARE','HKLM:\SOFTWARE\WOW6432Node')) {
+              if (-not (Test-Path -LiteralPath $registryRoot)) { continue }
+              Get-ChildItem -LiteralPath $registryRoot -Recurse -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                  $regName = [string]$_.Name
+                  if (-not $regName -or $baselineAppRegistrySet.Contains($regName)) { return }
+                  $matched = $false
+                  foreach ($segment in @($regName -split '\\')) {
+                    $segmentToken = Normalize-AppIdentityToken -Value ([string]$segment)
+                    if (Test-AppIdentityTokenMatch -Token $segmentToken) { $matched = $true; break }
+                  }
+                  if ($matched) { [void]$appRegistryCandidates.Add($regName) }
+                } catch { }
+              }
+            }
+            $appRegistryRoots = [System.Collections.Generic.List[string]]::new()
+            foreach ($candidate in @($appRegistryCandidates | Sort-Object Length,@{Expression={$_}} -Unique)) {
+              $nested = $false
+              foreach ($chosen in $appRegistryRoots) {
+                if ($candidate.Equals($chosen,[System.StringComparison]::OrdinalIgnoreCase) -or $candidate.StartsWith("$chosen\",[System.StringComparison]::OrdinalIgnoreCase)) { $nested = $true; break }
+              }
+              if (-not $nested) { [void]$appRegistryRoots.Add($candidate) }
+            }
+            $appRegistryManifest = [System.Collections.Generic.List[object]]::new()
+            $appRegistryIndex = 0
+            foreach ($regPath in $appRegistryRoots) {
+              $appRegistryIndex++
+              $file = ('app-registry-{0:D4}.reg' -f $appRegistryIndex)
+              $destination = Join-Path $appRegistryRoot $file
+              & reg.exe export $regPath $destination /y | Out-Null
+              if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $destination)) {
+                [void]$appRegistryManifest.Add([pscustomobject]@{ registry_path=$regPath; file=$file })
+                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_BACKED_UP path=$regPath"
+              } else {
+                Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+              }
+            }
+            ConvertTo-Json -InputObject @($appRegistryManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-registry.json') -Encoding UTF8
 
             # Copy the live user profile through a VSS snapshot. The managed desktop
             # shares the runner's active Windows session, so files such as WebCache,
@@ -1699,6 +2110,9 @@ jobs:
                 }
               }
             }
+            if ($softwareCopiedRoots -lt @($softwareRoots).Count) {
+              throw "Strict V9 software-root backup incomplete expected=$(@($softwareRoots).Count) actual=$softwareCopiedRoots"
+            }
             Write-Host "MANAGED_WINDOWS_SOFTWARE_COPY_OK roots=$softwareCopiedRoots candidates=$(@($softwareRoots).Count)"
 
             function Save-HiveSnapshot {
@@ -1735,27 +2149,94 @@ jobs:
             $registryExports = 0
             Write-Host 'MANAGED_WINDOWS_USER_HIVE_BACKUP_SKIPPED policy=clean-shell-v4'
 
-            # Preserve machine Run / RunOnce entries separately; complete HKCU hives are intentionally not portable.
+            # Preserve only Run/RunOnce DELTAS relative to the pristine runner. Also retain
+            # StartupApproved binary state so an app that was enabled for startup remains enabled.
+            function Get-CurrentStartupEntries {
+              $entries = [System.Collections.Generic.List[object]]::new()
+              foreach ($path in @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+              )) {
+                if (-not (Test-Path -LiteralPath $path)) { continue }
+                $key = Get-Item -LiteralPath $path
+                foreach ($name in $key.GetValueNames()) {
+                  if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                  $kind = $key.GetValueKind($name).ToString()
+                  if ($kind -notin @('String','ExpandString')) { continue }
+                  $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                  [void]$entries.Add([pscustomobject]@{ path=$path; name=$name; value=[string]$value; kind=$kind })
+                }
+              }
+              return @($entries)
+            }
+            $baselineStartup = @{}
+            $baselineStartupPath = Join-Path $baselineRoot 'startup-entries.json'
+            if (Test-Path -LiteralPath $baselineStartupPath) {
+              foreach ($entry in @(Get-Content -LiteralPath $baselineStartupPath -Raw | ConvertFrom-Json)) {
+                $key = "$( [string]$entry.path )|$( [string]$entry.name )".ToLowerInvariant()
+                $baselineStartup[$key] = $entry
+              }
+            }
             $startupEntries = @()
-            foreach ($path in @(
-              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
-              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
-              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
-              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
-              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
-              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
-            )) {
-              if (-not (Test-Path $path)) { continue }
-              $key = Get-Item $path
-              foreach ($name in $key.GetValueNames()) {
-                if ([string]::IsNullOrWhiteSpace($name)) { continue }
-                $kind = $key.GetValueKind($name).ToString()
-                if ($kind -notin @('String','ExpandString')) { continue }
-                $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-                $startupEntries += [pscustomobject]@{ path=$path; name=$name; value=[string]$value; kind=$kind }
+            foreach ($entry in @(Get-CurrentStartupEntries)) {
+              $key = "$( [string]$entry.path )|$( [string]$entry.name )".ToLowerInvariant()
+              $before = if ($baselineStartup.ContainsKey($key)) { $baselineStartup[$key] } else { $null }
+              if ($null -eq $before -or [string]$before.value -ne [string]$entry.value -or [string]$before.kind -ne [string]$entry.kind) {
+                $startupEntries += $entry
               }
             }
             ConvertTo-Json -InputObject @($startupEntries) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'machine-startup.json') -Encoding UTF8
+
+            $startupNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $startupEntries) { if ($entry.name) { [void]$startupNames.Add([string]$entry.name) } }
+            $startupApproved = [System.Collections.Generic.List[object]]::new()
+            foreach ($approvedPath in @(
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+            )) {
+              if (-not (Test-Path -LiteralPath $approvedPath)) { continue }
+              $key = Get-Item -LiteralPath $approvedPath
+              foreach ($name in $key.GetValueNames()) {
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                $nameToken = Normalize-AppIdentityToken -Value ([string]$name)
+                if (-not $startupNames.Contains([string]$name) -and -not (Test-AppIdentityTokenMatch -Token $nameToken)) { continue }
+                try {
+                  $raw = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                  if ($raw -is [byte[]]) {
+                    [void]$startupApproved.Add([pscustomobject]@{ path=$approvedPath; name=$name; value_b64=[Convert]::ToBase64String($raw) })
+                  }
+                } catch { }
+              }
+            }
+            ConvertTo-Json -InputObject @($startupApproved) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'startup-approved.json') -Encoding UTF8
+
+            $commonStartup = [Environment]::GetFolderPath('CommonStartup')
+            $baselineCommonStartupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineCommonStartupPath = Join-Path $baselineRoot 'common-startup-files.json'
+            if (Test-Path -LiteralPath $baselineCommonStartupPath) {
+              foreach ($saved in @(Get-Content -LiteralPath $baselineCommonStartupPath -Raw | ConvertFrom-Json)) { if ($saved) { [void]$baselineCommonStartupSet.Add([string]$saved) } }
+            }
+            $commonStartupManifest = [System.Collections.Generic.List[object]]::new()
+            if ($commonStartup -and (Test-Path -LiteralPath $commonStartup)) {
+              foreach ($fileInfo in @(Get-ChildItem -LiteralPath $commonStartup -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+                $relative = $fileInfo.FullName.Substring($commonStartup.Length).TrimStart('\')
+                $fileToken = Normalize-AppIdentityToken -Value ([IO.Path]::GetFileNameWithoutExtension($fileInfo.Name))
+                if ($baselineCommonStartupSet.Contains($relative) -and -not (Test-AppIdentityTokenMatch -Token $fileToken)) { continue }
+                $dest = Join-Path $commonStartupBackupRoot $relative
+                New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($dest)) -Force | Out-Null
+                Copy-Item -LiteralPath $fileInfo.FullName -Destination $dest -Force
+                [void]$commonStartupManifest.Add([pscustomobject]@{ relative=$relative })
+              }
+            }
+            ConvertTo-Json -InputObject @($commonStartupManifest) -Depth 4 | Set-Content -LiteralPath (Join-Path $stateRoot 'common-startup.json') -Encoding UTF8
 
             # Non-Microsoft scheduled tasks are portable enough to re-register after applications are installed.
             $taskManifest = @()
@@ -1779,6 +2260,75 @@ jobs:
               [pscustomobject]@{ name=$_.Name; display_name=$_.DisplayName; path=[string]$_.PathName; state=[string]$_.State }
             })
             ConvertTo-Json -InputObject $autoServices -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'auto-services.json') -Encoding UTF8
+
+            # Capture kernel/system-driver deltas. Remote-control software frequently installs
+            # display/input/capture drivers that do not appear in Win32_Service.
+            $baselineDriverNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineDriversPath = Join-Path $baselineRoot 'drivers.json'
+            if (Test-Path -LiteralPath $baselineDriversPath) {
+              foreach ($driver in @(Get-Content -LiteralPath $baselineDriversPath -Raw | ConvertFrom-Json)) { if ($driver.name) { [void]$baselineDriverNames.Add([string]$driver.name) } }
+            }
+            function Resolve-DriverBinaryPath {
+              param([string]$Value)
+              if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+              $path = [Environment]::ExpandEnvironmentVariables($Value.Trim().Trim('"'))
+              if ($path -match '^(?i)\\SystemRoot\\(.+)$') { $path = Join-Path $env:SystemRoot $matches[1] }
+              if ($path -match '^(?i)System32\\(.+)$') { $path = Join-Path $env:SystemRoot $path }
+              try {
+                if ([IO.Path]::IsPathRooted($path)) { return [IO.Path]::GetFullPath($path) }
+              } catch { }
+              return ''
+            }
+            $driverManifest = [System.Collections.Generic.List[object]]::new()
+            $driverIndex = 0
+            $driverDelta = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object { $_.Name -and -not $baselineDriverNames.Contains([string]$_.Name) })
+            foreach ($driver in $driverDelta) {
+              $driverIndex++
+              $safeName = ([string]$driver.Name -replace '[^A-Za-z0-9._-]','_')
+              $regFile = ('driver-{0:D4}.reg' -f $driverIndex)
+              $regPath = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$([string]$driver.Name)"
+              $regDestination = Join-Path $driverStateRoot $regFile
+              & reg.exe export $regPath $regDestination /y | Out-Null
+              if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $regDestination -Force -ErrorAction SilentlyContinue; $regFile = '' }
+              $binaryPath = Resolve-DriverBinaryPath -Value ([string]$driver.PathName)
+              $binaryFile = ''
+              if ($binaryPath -and (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+                $extension = [IO.Path]::GetExtension($binaryPath)
+                $binaryFile = "$safeName$extension"
+                Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $driverFileRoot $binaryFile) -Force
+              }
+              [void]$driverManifest.Add([pscustomobject]@{
+                name=[string]$driver.Name; display_name=[string]$driver.DisplayName; path=[string]$driver.PathName;
+                start_mode=[string]$driver.StartMode; state=[string]$driver.State; registry_file=$regFile;
+                binary_path=$binaryPath; binary_file=$binaryFile
+              })
+              Write-Host "MANAGED_WINDOWS_DRIVER_DELTA name=$($driver.Name) path=$binaryPath registry=$regFile file=$binaryFile"
+            }
+            ConvertTo-Json -InputObject @($driverManifest) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'drivers.json') -Encoding UTF8
+
+            $baselineDriverPackages = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineDriverPackagesPath = Join-Path $baselineRoot 'driver-packages.txt'
+            if (Test-Path -LiteralPath $baselineDriverPackagesPath) {
+              foreach ($line in Get-Content -LiteralPath $baselineDriverPackagesPath) { if ($line.Trim()) { [void]$baselineDriverPackages.Add($line.Trim()) } }
+            }
+            $driverPackageManifest = [System.Collections.Generic.List[object]]::new()
+            try {
+              $pnputilCurrent = (& pnputil.exe /enum-drivers 2>$null) -join "`n"
+              $currentOemInf = @([regex]::Matches($pnputilCurrent, '(?im)^\s*Published Name\s*:\s*(oem\d+\.inf)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Sort-Object -Unique)
+              foreach ($publishedName in $currentOemInf) {
+                if ($baselineDriverPackages.Contains($publishedName)) { continue }
+                $packageDir = Join-Path $driverPackageRoot ([IO.Path]::GetFileNameWithoutExtension($publishedName))
+                New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+                & pnputil.exe /export-driver $publishedName $packageDir | Out-Host
+                if ($LASTEXITCODE -eq 0 -and (Get-ChildItem -LiteralPath $packageDir -Filter '*.inf' -Recurse -ErrorAction SilentlyContinue)) {
+                  [void]$driverPackageManifest.Add([pscustomobject]@{ published_name=$publishedName; directory=[IO.Path]::GetFileName($packageDir) })
+                  Write-Host "MANAGED_WINDOWS_DRIVER_PACKAGE_BACKED_UP published=$publishedName"
+                } else {
+                  Remove-Item -LiteralPath $packageDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+              }
+            } catch { Write-Warning "driver package delta export skipped: $($_.Exception.Message)" }
+            ConvertTo-Json -InputObject @($driverPackageManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'driver-packages.json') -Encoding UTF8
 
             # installed-apps.json and installed-apps-delta.json were captured before VSS
             # so their install roots could participate in the machine-level software snapshot.
@@ -1871,6 +2421,25 @@ jobs:
               } catch { Write-Warning "scoop delta export skipped: $($_.Exception.Message)" }
             }
 
+            # Track protected user credential/session stores by count only. Their encrypted
+            # contents are already carried inside the VSS profile snapshot; values are never
+            # printed or decoded here. Cross-runner DPAPI decryptability is deliberately not
+            # assumed because machine-bound secrets are not portable in a generic backup.
+            $protectedUserState = [System.Collections.Generic.List[object]]::new()
+            foreach ($relative in @(
+              'AppData\Roaming\Microsoft\Protect',
+              'AppData\Roaming\Microsoft\Credentials',
+              'AppData\Local\Microsoft\Credentials',
+              'AppData\Local\Microsoft\Vault'
+            )) {
+              $source = Join-Path $profileRoot $relative
+              if (-not (Test-Path -LiteralPath $source -PathType Container)) { continue }
+              $measure = Get-ChildItem -LiteralPath $source -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+              $bytes = if ($null -eq $measure.Sum) { [int64]0 } else { [int64]$measure.Sum }
+              [void]$protectedUserState.Add([pscustomobject]@{ relative=$relative; file_count=[int64]$measure.Count; bytes=$bytes })
+            }
+            ConvertTo-Json -InputObject @($protectedUserState) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'protected-user-state.json') -Encoding UTF8
+
             $profileMeasure = Get-ChildItem -LiteralPath $backupProfile -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
             $profileBytes = if ($null -eq $profileMeasure.Sum) { [int64]0 } else { [int64]$profileMeasure.Sum }
             $profileFiles = [int64]$profileMeasure.Count
@@ -1886,7 +2455,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 8
+              version = 9
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1894,7 +2463,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v8-strict-app-payload-manifest'
+              scope = 'managed-windows-state-v9-runtime-startup-registry-drivers'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -1905,6 +2474,13 @@ jobs:
               software_app_payload_evidence_count = @($appPayloadEvidence).Count
               software_service_delta_count = @($serviceDelta).Count
               uninstall_registry_count = @($uninstallRegistryManifest).Count
+              app_registry_count = @($appRegistryManifest).Count
+              driver_delta_count = @($driverManifest).Count
+              driver_package_delta_count = @($driverPackageManifest).Count
+              startup_approved_count = @($startupApproved).Count
+              common_startup_count = @($commonStartupManifest).Count
+              app_profile_evidence_count = @($appProfileEvidence).Count
+              protected_user_state_count = @($protectedUserState).Count
               backup_bytes = $backupBytes
               registry_exports = $registryExports
               installed_app_count = @($apps).Count
@@ -1917,7 +2493,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V8_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V9_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
