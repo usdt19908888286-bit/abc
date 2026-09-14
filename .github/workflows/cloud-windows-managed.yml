@@ -722,6 +722,7 @@ jobs:
             $volumeRoot = [IO.Path]::GetPathRoot($profileRoot)
             if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Could not resolve profile volume: $profileRoot" }
             $shadowId = ''
+            $shadowLink = Join-Path $env:RUNNER_TEMP "managed-vss-$env:GITHUB_RUN_ID"
             try {
               $volumeSpec = $volumeRoot.TrimEnd('\')
               $vssOutput = @(& vssadmin.exe create shadow "/for=$volumeSpec" 2>&1)
@@ -741,8 +742,20 @@ jobs:
               if (-not $snapshotRoot.StartsWith('\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy', [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "Unexpected VSS device path: $snapshotRoot"
               }
+
+              # robocopy does not accept the GLOBALROOT device path directly. Expose
+              # the snapshot through a temporary local directory symlink, then copy
+              # through that ordinary filesystem path.
+              if (Test-Path -LiteralPath $shadowLink) { & cmd.exe /d /c rmdir $shadowLink 2>$null | Out-Null }
+              $linkTarget = "$snapshotRoot\"
+              $linkOutput = @(& cmd.exe /d /c mklink /D $shadowLink $linkTarget 2>&1)
+              $linkExit = $LASTEXITCODE
+              if ($linkExit -ne 0 -or -not (Test-Path -LiteralPath $shadowLink)) {
+                throw "VSS symlink create failed exit=$linkExit detail=$(($linkOutput -join ' | '))"
+              }
+
               $relativeProfile = $profileRoot.Substring($volumeRoot.Length).TrimStart('\')
-              $profileSource = "$snapshotRoot\$relativeProfile"
+              $profileSource = Join-Path $shadowLink $relativeProfile
               Write-Host "MANAGED_WINDOWS_VSS_READY id=$shadowId source=$profileSource"
 
               $args = @(
@@ -750,19 +763,20 @@ jobs:
                 '/E','/COPY:DAT','/DCOPY:DAT','/R:1','/W:1','/XJ','/NFL','/NDL','/NP',
                 '/XF','NTUSER.DAT','NTUSER.DAT.LOG*','ntuser.ini','UsrClass.dat','UsrClass.dat.LOG*',
                 '/XD',
-                "$profileSource\AppData\Local\Temp",
-                "$profileSource\AppData\Local\Microsoft\Windows\INetCache",
-                "$profileSource\AppData\Local\CrashDumps",
-                "$profileSource\AppData\Local\Google\Chrome\User Data\Default\Cache",
-                "$profileSource\AppData\Local\Google\Chrome\User Data\Default\Code Cache",
-                "$profileSource\AppData\Local\Microsoft\Edge\User Data\Default\Cache",
-                "$profileSource\AppData\Local\Microsoft\Edge\User Data\Default\Code Cache"
+                (Join-Path $profileSource 'AppData\Local\Temp'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\INetCache'),
+                (Join-Path $profileSource 'AppData\Local\CrashDumps'),
+                (Join-Path $profileSource 'AppData\Local\Google\Chrome\User Data\Default\Cache'),
+                (Join-Path $profileSource 'AppData\Local\Google\Chrome\User Data\Default\Code Cache'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\Edge\User Data\Default\Cache'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\Edge\User Data\Default\Code Cache')
               )
               & robocopy.exe @args | Out-Host
               $robocopyExit = $LASTEXITCODE
               if ($robocopyExit -ge 8) { throw "robocopy VSS backup failed with exit code $robocopyExit" }
               Write-Host "MANAGED_WINDOWS_VSS_COPY_OK exit=$robocopyExit"
             } finally {
+              if (Test-Path -LiteralPath $shadowLink) { & cmd.exe /d /c rmdir $shadowLink 2>$null | Out-Null }
               if (-not [string]::IsNullOrWhiteSpace($shadowId)) {
                 $deleteOutput = @(& vssadmin.exe delete shadows "/shadow=$shadowId" /quiet 2>&1)
                 $deleteExit = $LASTEXITCODE
