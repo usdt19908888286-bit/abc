@@ -781,9 +781,14 @@ jobs:
 
           $workflowSessionId = (Get-Process -Id $PID).SessionId
           $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          $userRdpPolicy = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $rdpPolicy -Force | Out-Null
           New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
           New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 0 -Force | Out-Null
+          foreach ($policyPath in @($rdpPolicy, $userRdpPolicy)) {
+            Remove-ItemProperty -Path $policyPath -Name CSClipLevel -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $policyPath -Name SCClipLevel -ErrorAction SilentlyContinue
+          }
           Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
           Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 0 -Force
           $rdpClip = Get-Process -Name rdpclip -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $workflowSessionId } | Select-Object -First 1
@@ -798,8 +803,15 @@ jobs:
           $policyDisableCdm = (Get-ItemProperty -Path $rdpPolicy -Name fDisableCdm -ErrorAction SilentlyContinue).fDisableCdm
           $rdpTcpDisableClip = (Get-ItemProperty -Path $rdpTcp -Name fDisableClip -ErrorAction SilentlyContinue).fDisableClip
           $rdpTcpDisableCdm = (Get-ItemProperty -Path $rdpTcp -Name fDisableCdm -ErrorAction SilentlyContinue).fDisableCdm
+          $machineCSClipLevel = (Get-ItemProperty -Path $rdpPolicy -Name CSClipLevel -ErrorAction SilentlyContinue).CSClipLevel
+          $machineSCClipLevel = (Get-ItemProperty -Path $rdpPolicy -Name SCClipLevel -ErrorAction SilentlyContinue).SCClipLevel
+          $userCSClipLevel = (Get-ItemProperty -Path $userRdpPolicy -Name CSClipLevel -ErrorAction SilentlyContinue).CSClipLevel
+          $userSCClipLevel = (Get-ItemProperty -Path $userRdpPolicy -Name SCClipLevel -ErrorAction SilentlyContinue).SCClipLevel
+          if ($null -ne $machineCSClipLevel -or $null -ne $machineSCClipLevel -or $null -ne $userCSClipLevel -or $null -ne $userSCClipLevel) {
+            throw 'Directional RDP clipboard restriction remained after cleanup'
+          }
           $rdpClipPid = if ($null -eq $rdpClip) { 0 } else { [int]$rdpClip.Id }
-          Write-Host "MANAGED_RDP_REDIRECTION_READY policyDisableClip=$policyDisableClip policyDisableCdm=$policyDisableCdm rdpTcpDisableClip=$rdpTcpDisableClip rdpTcpDisableCdm=$rdpTcpDisableCdm session=$workflowSessionId rdpclipPid=$rdpClipPid"
+          Write-Host "MANAGED_RDP_REDIRECTION_READY policyDisableClip=$policyDisableClip policyDisableCdm=$policyDisableCdm rdpTcpDisableClip=$rdpTcpDisableClip rdpTcpDisableCdm=$rdpTcpDisableCdm csClipLevel=absent scClipLevel=absent session=$workflowSessionId rdpclipPid=$rdpClipPid"
           Write-Host "MANAGED_WINDOWS_INTERACTIVE_SESSION_ID=$workflowSessionId"
           & qwinsta.exe 2>&1 | Out-Host
 
@@ -1044,10 +1056,15 @@ jobs:
           function Ensure-ManagedRdpClipboard {
             try {
               $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+              $userRdpPolicy = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
               $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
               New-Item -Path $rdpPolicy -Force | Out-Null
               New-ItemProperty -Path $rdpPolicy -Name fDisableClip -PropertyType DWord -Value 0 -Force | Out-Null
               New-ItemProperty -Path $rdpPolicy -Name fDisableCdm -PropertyType DWord -Value 0 -Force | Out-Null
+              foreach ($policyPath in @($rdpPolicy, $userRdpPolicy)) {
+                Remove-ItemProperty -Path $policyPath -Name CSClipLevel -ErrorAction SilentlyContinue
+                Remove-ItemProperty -Path $policyPath -Name SCClipLevel -ErrorAction SilentlyContinue
+              }
               if (Test-Path -LiteralPath $rdpTcp) {
                 Set-ItemProperty -Path $rdpTcp -Name fDisableClip -Value 0 -Force
                 Set-ItemProperty -Path $rdpTcp -Name fDisableCdm -Value 0 -Force
