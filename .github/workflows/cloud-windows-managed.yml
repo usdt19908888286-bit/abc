@@ -127,32 +127,15 @@ jobs:
           hostname: ${{ steps.identity.outputs.ts_hostname }}
           version: latest
 
-      - name: Report Tailscale presence to Cloudflare
-        env:
-          BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
+      - name: Verify Tailscale presence
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "::add-mask::$env:BOOTSTRAP_TICKET"
           $ip = (& tailscale ip -4 | Select-Object -First 1).Trim()
           if (-not $ip) { throw 'No Tailscale IPv4 address was assigned' }
-          $webUrl = ([string]$env:WEB_URL).TrimEnd('/')
-          if (-not $webUrl.StartsWith('https://')) { throw 'Cloudflare Web URL is invalid' }
-          $payload = @{
-            instanceKey = $env:INSTANCE_KEY
-            repository = $env:GITHUB_REPOSITORY
-            runId = [int64]$env:GITHUB_RUN_ID
-            nodeName = "win-$env:MACHINE_ID"
-            address = "$ip`:3389"
-            tailscaleAddress = "$ip`:3389"
-            tailscaleHostname = $env:TS_DNS_HOSTNAME
-            cloudflareAddress = $env:CF_TUNNEL_HOSTNAME
-            cloudflareHostname = $env:CF_TUNNEL_HOSTNAME
-            tunnelMode = $env:TUNNEL_MODE
-            status = 'network_ready'
-          } | ConvertTo-Json -Compress
-          Invoke-RestMethod -Method Post -Uri "$webUrl/api/runner/report" -Headers @{ 'X-Bootstrap-Ticket' = $env:BOOTSTRAP_TICKET } -ContentType 'application/json' -Body $payload | Out-Null
-          Write-Host "TAILSCALE_EARLY_REPORT_OK=$ip`:3389"
+          # Do not publish RDP connectivity yet. The control plane must only expose
+          # a connectable address after RDP is ready and the Runner consoles are hidden.
+          Write-Host "TAILSCALE_NETWORK_JOINED=$ip"
 
       - name: Capture runner software baseline
         shell: pwsh
@@ -481,14 +464,45 @@ jobs:
           if ($managedUser.SID.Value -ne $currentSid) { throw 'Managed RDP user no longer matches the runner SID' }
           if (-not $managedUser.Enabled) { throw 'Managed RDP account is disabled' }
 
-          # RDP was initialized before Rename-LocalUser while Windows could still resolve
-          # the live logon name. Do not restart TermService or rewrite firewall state here.
-          if (-not (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)) {
+          $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $rdpTcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          function Test-RdpListener {
+            return [bool](Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)
+          }
+
+          # Rename-LocalUser can make TermService drop its listener while the current
+          # logon token keeps the old display name. Rebind RDP after the rename; the
+          # account SID and interactive session remain unchanged.
+          if (-not (Test-RdpListener)) {
+            Write-Host 'RDP_REBIND_AFTER_ACCOUNT_RENAME'
+            Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0 -Force
+            Set-ItemProperty -Path $terminalServer -Name fSingleSessionPerUser -Value 1 -Force
+            Set-ItemProperty -Path $rdpTcp -Name fEnableWinStation -Value 1 -Force
+            Set-ItemProperty -Path $rdpTcp -Name PortNumber -Value 3389 -Force
+            $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+            New-Item -Path $rdpPolicy -Force | Out-Null
+            New-ItemProperty -Path $rdpPolicy -Name fSingleSessionPerUser -PropertyType DWord -Value 1 -Force | Out-Null
+            try {
+              $tsSetting = Get-CimInstance -Namespace 'root/cimv2/terminalservices' -ClassName Win32_TerminalServiceSetting -ErrorAction Stop
+              Invoke-CimMethod -InputObject $tsSetting -MethodName SetAllowTSConnections -Arguments @{ AllowTSConnections = [uint32]1; ModifyFirewallException = [uint32]0 } -ErrorAction Stop | Out-Null
+            } catch { Write-Warning "RDP WMI rebind failed: $($_.Exception.Message)" }
+            foreach ($serviceName in @('SessionEnv','UmRdpService')) {
+              try { Start-Service -Name $serviceName -ErrorAction SilentlyContinue } catch { }
+            }
+            Set-Service -Name TermService -StartupType Automatic
+            Restart-Service TermService -Force
+            for ($i = 0; $i -lt 60 -and -not (Test-RdpListener); $i++) {
+              Start-Sleep -Seconds 1
+              if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService -ErrorAction SilentlyContinue }
+            }
+          }
+
+          if (-not (Test-RdpListener)) {
             Write-Host '===== POST-RENAME RDP DIAGNOSTICS ====='
             Get-Service TermService,SessionEnv,UmRdpService -ErrorAction SilentlyContinue | Format-Table Name,Status,StartType -AutoSize
             & qwinsta.exe 2>&1 | Out-Host
-            & sc.exe query termdd 2>&1 | Out-Host
-            throw 'RDP TCP/3389 listener was lost after account rename'
+            Get-ItemProperty -Path $rdpTcp -ErrorAction SilentlyContinue | Select-Object fEnableWinStation,PortNumber,UserAuthentication,SecurityLayer | Format-List
+            throw 'RDP TCP/3389 listener did not recover after account rename'
           }
 
           $workflowSessionId = (Get-Process -Id $PID).SessionId
@@ -498,12 +512,12 @@ jobs:
           $ip = (& tailscale ip -4 | Select-Object -First 1).Trim()
           if (-not $ip) { throw 'No Tailscale IPv4 address was assigned' }
           Write-Host "MANAGED_WINDOWS_SAME_SID=$currentSid"
+          Write-Host 'MANAGED_WINDOWS_SINGLE_SESSION_READY'
           Write-Host 'MANAGED_WINDOWS_READY'
           Write-Host "TAILSCALE_RDP=$ip`:3389"
           Write-Host "RDP_USER=.\$env:DESKTOP_USERNAME"
           Write-Host "WINDOWS_RUNNER_IMAGE=$env:RUNNER_IMAGE"
           Write-Host "MANAGED_DESKTOP_MODE=$env:MACHINE_MODE"
-
       - name: Start Cloudflare RDP tunnel
         if: ${{ env.TUNNEL_MODE == 'cloudflare' || env.TUNNEL_MODE == 'dual' }}
         shell: pwsh
@@ -574,16 +588,18 @@ jobs:
           '@
 
             $workflowSessionId = (Get-Process -Id $PID).SessionId
-            $initialProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-            # Capture console-host processes that already exist before the user connects.
-            # These belong to the GitHub runner shell. Terminals opened later by the user
-            # are not added to this frozen baseline and therefore remain visible.
-            $baselineRunnerConsolePids = @(
-              $initialProcesses | Where-Object {
-                [int]$_.SessionId -eq [int]$workflowSessionId -and
-                [string]$_.Name -match '^(conhost|cmd|powershell|pwsh|Runner\.(Worker|Listener))\.exe$'
-              } | ForEach-Object { [int]$_.ProcessId }
-            )
+            $preconnectConsolePids = [System.Collections.Generic.HashSet[int]]::new()
+
+            function Add-PreConnectConsoleHosts {
+              $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+              foreach ($proc in $all) {
+                if ([int]$proc.SessionId -ne [int]$workflowSessionId) { continue }
+                $name = [string]$proc.Name
+                if ($name -match '^(conhost|OpenConsole|cmd|powershell|pwsh|WindowsTerminal|Runner\.(Worker|Listener))\.exe$') {
+                  [void]$preconnectConsolePids.Add([int]$proc.ProcessId)
+                }
+              }
+            }
 
             function Hide-ManagedRunnerWindows {
               $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
@@ -599,7 +615,7 @@ jobs:
               }
               $managed = [System.Collections.Generic.HashSet[int]]::new()
               [void]$managed.Add($rootPid)
-              foreach ($pidValue in $baselineRunnerConsolePids) { [void]$managed.Add([int]$pidValue) }
+              foreach ($pidValue in $preconnectConsolePids) { [void]$managed.Add([int]$pidValue) }
               $changed = $true
               while ($changed) {
                 $changed = $false
@@ -610,8 +626,12 @@ jobs:
               [void][ManagedRunnerConsole]::HideWindowsForProcesses([int[]]@($managed))
             }
 
-            # Retry briefly because conhost may be created a fraction later than pwsh.
-            for ($hideAttempt = 0; $hideAttempt -lt 10; $hideAttempt++) {
+            # Before the connection address is published, repeatedly collect every
+            # console host that belongs to the runner's interactive session. conhost /
+            # OpenConsole can be parented outside Runner.Worker, so process-tree-only
+            # hiding is insufficient. The set is frozen before users can connect.
+            for ($hideAttempt = 0; $hideAttempt -lt 20; $hideAttempt++) {
+              Add-PreConnectConsoleHosts
               Hide-ManagedRunnerWindows
               Start-Sleep -Milliseconds 200
             }
