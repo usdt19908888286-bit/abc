@@ -379,12 +379,23 @@ jobs:
             # Windows shell/cache databases is therefore legitimately locked on the
             # destination even before RDP is published. They are volatile runtime cache,
             # not durable user state; registry state is restored separately below.
+            # Keep machine-bound Windows shell/runtime state from the fresh runner.
+            # Only portable user/application data is overlaid from the previous VM.
             $volatileDirs = @(
-              'AppData\Local\Microsoft\Windows\Caches',
-              'AppData\Local\Microsoft\Windows\WebCache',
-              'AppData\Local\Microsoft\Windows\Notifications',
-              'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\TempState',
-              'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\TempState'
+              'AppData\Local\Temp',
+              'AppData\Local\Microsoft\Windows',
+              'AppData\Local\Microsoft\TokenBroker',
+              'AppData\Local\Microsoft\IdentityCache',
+              'AppData\Local\Microsoft\OneAuth',
+              'AppData\Local\ConnectedDevicesPlatform',
+              'AppData\Local\D3DSCache',
+              'AppData\Local\CrashDumps',
+              'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy',
+              'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy',
+              'AppData\Local\Packages\Microsoft.Windows.ShellExperienceHost_cw5n1h2txyewy',
+              'AppData\Local\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy',
+              'AppData\Local\Packages\Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy',
+              'AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy'
             )
             $volatileFiles = @(
               'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat',
@@ -393,6 +404,9 @@ jobs:
             # Keep verification aligned with robocopy /XF. These are transactional/
             # runtime files that are intentionally not overlaid onto the live runner profile.
             $volatileLeafFiles = @(
+              'NTUSER.DAT*',
+              'ntuser.ini',
+              'UsrClass.dat*',
               'WebCacheLock.dat',
               'iconcache_*.db',
               'thumbcache_*.db',
@@ -422,16 +436,14 @@ jobs:
             $restoreArgs = @(
               $restoreProfile, $profileRoot,
               '/E','/COPY:DAT','/DCOPY:DAT','/R:1','/W:1','/XJ','/NFL','/NDL','/NP',
-              '/XF','WebCacheLock.dat','iconcache_*.db','thumbcache_*.db','settings.dat.LOG*','WPNPRMRY.tmp','wpndatabase.db-shm','wpndatabase.db-wal','StartupProfileData-*',
-              (Join-Path $restoreProfile 'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat'),
-              (Join-Path $restoreProfile 'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat'),
-              '/XD',
-              (Join-Path $restoreProfile 'AppData\Local\Microsoft\Windows\Caches'),
-              (Join-Path $restoreProfile 'AppData\Local\Microsoft\Windows\WebCache'),
-              (Join-Path $restoreProfile 'AppData\Local\Microsoft\Windows\Notifications'),
-              (Join-Path $restoreProfile 'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\TempState'),
-              (Join-Path $restoreProfile 'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\TempState')
+              '/XF',
+              'NTUSER.DAT*','ntuser.ini','UsrClass.dat*',
+              'WebCacheLock.dat','iconcache_*.db','thumbcache_*.db','settings.dat.LOG*','WPNPRMRY.tmp','wpndatabase.db-shm','wpndatabase.db-wal','StartupProfileData-*'
             )
+            $restoreArgs += '/XD'
+            foreach ($dir in $volatileDirs) {
+              $restoreArgs += (Join-Path $restoreProfile $dir)
+            }
             & robocopy.exe @restoreArgs | Out-Host
             $restoreExit = $LASTEXITCODE
             if ($restoreExit -ge 8) {
@@ -607,17 +619,13 @@ jobs:
             return $true
           }
 
+          # Keep the fresh runner's HKCU / UsrClass shell state. Importing a previous
+          # machine's complete user hives can break Explorer, Start/Search, common file
+          # dialogs and RDP clipboard integration on the new VM. Portable application
+          # files and explicit machine/application state are restored separately.
           $registryRestored = 0
-          $ntSnapshot = Join-Path $stateRoot 'ntuser.hiv'
-          if (Restore-HiveSnapshot -Snapshot $ntSnapshot -TargetRoot $sid) { $registryRestored++ }
-          Write-ManagedRdpProbe -Stage 'step11-after-ntuser'
-          $usrSnapshot = Join-Path $stateRoot 'usrclass.hiv'
-          if (Restore-HiveSnapshot -Snapshot $usrSnapshot -TargetRoot "${sid}_Classes") { $registryRestored++ }
-          Write-ManagedRdpProbe -Stage 'step11-after-usrclass'
-
-          if ($registryRestored -eq 0 -and ((Test-Path (Join-Path $stateRoot 'hkcu.reg')) -or (Test-Path (Join-Path $stateRoot 'usrclass.reg')))) {
-            Write-Warning 'Legacy v2 registry text export detected; profile files were restored but registry Hive state cannot be guaranteed.'
-          }
+          Write-Host 'MANAGED_WINDOWS_USER_HIVE_RESTORE_SKIPPED policy=clean-shell-v4'
+          Write-ManagedRdpProbe -Stage 'step11-clean-shell-hives-skipped'
 
           $startupPath = Join-Path $stateRoot 'machine-startup.json'
           $startupRestored = 0
@@ -1352,12 +1360,21 @@ jobs:
                 'WebCacheLock.dat','iconcache_*.db','thumbcache_*.db','settings.dat.LOG*','WPNPRMRY.tmp','wpndatabase.db-shm','wpndatabase.db-wal','StartupProfileData-*',
                 '/XD',
                 (Join-Path $profileSource 'AppData\Local\Temp'),
-                (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\INetCache'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\Windows'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\Caches'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\WebCache'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\Notifications'),
-                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\TempState'),
-                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\TempState'),
+                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy'),
+                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy'),
+                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.Windows.ShellExperienceHost_cw5n1h2txyewy'),
+                (Join-Path $profileSource 'AppData\Local\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy'),
+                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy'),
+                (Join-Path $profileSource 'AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\TokenBroker'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\IdentityCache'),
+                (Join-Path $profileSource 'AppData\Local\Microsoft\OneAuth'),
+                (Join-Path $profileSource 'AppData\Local\ConnectedDevicesPlatform'),
+                (Join-Path $profileSource 'AppData\Local\D3DSCache'),
                 (Join-Path $profileSource 'AppData\Local\CrashDumps'),
                 (Join-Path $profileSource 'AppData\Local\Google\Chrome\User Data\Default\Cache'),
                 (Join-Path $profileSource 'AppData\Local\Google\Chrome\User Data\Default\Code Cache'),
@@ -1477,12 +1494,9 @@ jobs:
             }
 
             $registryExports = 0
-            $ntUser = Join-Path $profileRoot 'NTUSER.DAT'
-            if (Save-HiveSnapshot -ProviderRoot "Registry::HKEY_USERS\$sid" -RegRoot "HKU\$sid" -MountRoot 'ManagedState' -HiveFile $ntUser -Destination (Join-Path $stateRoot 'ntuser.hiv')) { $registryExports++ }
-            $usrClass = Join-Path $profileRoot 'AppData\Local\Microsoft\Windows\UsrClass.dat'
-            if (Save-HiveSnapshot -ProviderRoot "Registry::HKEY_USERS\${sid}_Classes" -RegRoot "HKU\${sid}_Classes" -MountRoot 'ManagedState_Classes' -HiveFile $usrClass -Destination (Join-Path $stateRoot 'usrclass.hiv')) { $registryExports++ }
+            Write-Host 'MANAGED_WINDOWS_USER_HIVE_BACKUP_SKIPPED policy=clean-shell-v4'
 
-            # Machine Run / RunOnce entries. User Run entries are already inside the HKCU export.
+            # Preserve machine Run / RunOnce entries separately; complete HKCU hives are intentionally not portable.
             $startupEntries = @()
             foreach ($path in @(
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
@@ -1628,7 +1642,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 3
+              version = 4
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1636,7 +1650,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v3'
+              scope = 'managed-windows-state-v4-clean-shell'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -1658,7 +1672,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V3_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V4_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
