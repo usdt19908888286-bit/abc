@@ -1157,9 +1157,33 @@ jobs:
                     $updateError = [ManagedRootPnpInstaller]::Update($hardwareId,$inf.FullName,[ref]$updateReboot)
                     Write-Host "MANAGED_WINDOWS_PNP_UPDATE_RESULT hardware=$hardwareId error=$updateError reboot=$updateReboot"
                     if ($updateError -ne 0) {
-                      Write-Warning "Standard PnP driver update returned Win32 error $updateError; retrying through pnputil."
-                      & pnputil.exe /add-driver $inf.FullName /install | Out-Host
-                      if ($LASTEXITCODE -ne 0) { throw "PnP bind after root-device creation failed exit=$LASTEXITCODE inf=$originalInf updateError=$updateError" }
+                      Write-Warning "Standard PnP driver update returned Win32 error $updateError; looking for a restored DevCon fallback."
+                      $devconSucceeded = $false
+                      $softwareManifestPath = Join-Path $stateRoot 'software-roots.json'
+                      if (Test-Path -LiteralPath $softwareManifestPath) {
+                        $seenDevcon = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        foreach ($softwareEntry in @(Get-Content -LiteralPath $softwareManifestPath -Raw | ConvertFrom-Json)) {
+                          $softwareVolume = ([string]$softwareEntry.volume).ToUpperInvariant()
+                          $softwareRelative = ([string]$softwareEntry.relative).TrimStart('\\')
+                          if ($softwareVolume -notmatch '^[A-Z]:$' -or -not $softwareRelative) { continue }
+                          $softwareDestination = Join-Path "$softwareVolume\\" $softwareRelative
+                          if (-not (Test-Path -LiteralPath $softwareDestination -PathType Container)) { continue }
+                          foreach ($devcon in @(Get-ChildItem -LiteralPath $softwareDestination -Filter 'devcon.exe' -File -Recurse -ErrorAction SilentlyContinue)) {
+                            if (-not $seenDevcon.Add($devcon.FullName)) { continue }
+                            Write-Host "MANAGED_WINDOWS_PNP_DEVCON_TRY path=$($devcon.FullName) hardware=$hardwareId"
+                            & $devcon.FullName install $inf.FullName $hardwareId | Out-Host
+                            $devconExit = $LASTEXITCODE
+                            Write-Host "MANAGED_WINDOWS_PNP_DEVCON_RESULT path=$($devcon.FullName) exit=$devconExit"
+                            if ($devconExit -in @(0,1)) { $devconSucceeded = $true; break }
+                          }
+                          if ($devconSucceeded) { break }
+                        }
+                      }
+                      if (-not $devconSucceeded) {
+                        Write-Warning 'No restored DevCon candidate completed the ROOT-device install; retrying through pnputil.'
+                        & pnputil.exe /add-driver $inf.FullName /install | Out-Host
+                        if ($LASTEXITCODE -ne 0) { throw "PnP bind after root-device creation failed exit=$LASTEXITCODE inf=$originalInf updateError=$updateError" }
+                      }
                     }
                     & pnputil.exe /scan-devices | Out-Host
                     if ($LASTEXITCODE -ne 0) { throw "PnP scan after root-device creation failed exit=$LASTEXITCODE" }
