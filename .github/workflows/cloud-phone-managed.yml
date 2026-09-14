@@ -1,0 +1,1131 @@
+name: Managed Android Cloud Phone
+run-name: ${{ inputs.phone_name || 'Managed Phone' }} · ${{ inputs.phone_id || '001' }} / ${{ inputs.mode || 'new' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Create a new phone or restore the latest encrypted backup
+        required: true
+        default: new
+        type: choice
+        options:
+          - new
+          - restore
+      phone_id:
+        description: Logical phone ID (digits only, e.g. 001)
+        required: true
+        default: '001'
+        type: string
+      phone_name:
+        description: Friendly phone name shown in GitHub and the local GUI
+        required: false
+        default: 'BICOIN-001'
+        type: string
+      bootstrap_ticket:
+        description: Cloudflare bootstrap ticket
+        required: true
+        type: string
+      web_url:
+        description: Current Web URL
+        required: true
+        type: string
+      package_name:
+        description: Android package used for GUI monitoring/launch only; it is not auto-installed
+        required: false
+        default: 'com.temperaturecoin'
+        type: string
+      apk_url:
+        description: Legacy optional APK reference retained for compatibility
+        required: false
+        default: 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk'
+        type: string
+      new_phone_apk_urls_b64:
+        description: Base64 JSON list of APK URLs to install only for brand-new phones
+        required: false
+        default: ''
+        type: string
+      api_level:
+        description: Android API level
+        required: false
+        default: '35'
+        type: string
+      target:
+        description: Android system image target
+        required: false
+        default: 'google_apis'
+        type: string
+      arch:
+        description: Android emulator architecture
+        required: false
+        default: 'x86_64'
+        type: string
+      profile:
+        description: Android device profile
+        required: false
+        default: 'pixel_6'
+        type: string
+      cores:
+        description: Emulator CPU cores
+        required: false
+        default: '4'
+        type: string
+      ram_mb:
+        description: Emulator RAM in MiB
+        required: false
+        default: '8192'
+        type: string
+      use_s5:
+        description: Route Android network through the phone-specific SOCKS5 proxy
+        required: false
+        default: 'false'
+        type: string
+      device_manufacturer:
+        description: Optional Android Build.MANUFACTURER value for emulator compatibility testing
+        required: false
+        default: ''
+        type: string
+      device_brand:
+        description: Optional Android Build.BRAND value for emulator compatibility testing
+        required: false
+        default: ''
+        type: string
+      device_model:
+        description: Optional Android Build.MODEL value for emulator compatibility testing
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: managed-android-phone-${{ inputs.phone_id || '001' }}
+  cancel-in-progress: true
+
+env:
+  DISPLAY: :99
+  APK_URL: ${{ inputs.apk_url || 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk' }}
+  PHONE_ID: ${{ inputs.phone_id || '001' }}
+  PHONE_NAME: ${{ inputs.phone_name || 'BICOIN-001' }}
+  PACKAGE_NAME: ${{ inputs.package_name || 'com.temperaturecoin' }}
+  AVD_NAME: managed-phone-${{ inputs.phone_id || '001' }}
+  DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || '' }}
+  DEVICE_BRAND: ${{ inputs.device_brand || '' }}
+  DEVICE_MODEL: ${{ inputs.device_model || '' }}
+  USE_S5: ${{ inputs.use_s5 || 'false' }}
+  NEW_PHONE_APK_URLS_B64: ${{ inputs.new_phone_apk_urls_b64 || '' }}
+  WEB_URL: ${{ inputs.web_url }}
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load managed runtime
+        env:
+          CF_RUNTIME_REF: ${{ inputs.bootstrap_ticket }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${CF_RUNTIME_REF}"
+          INSTANCE_KEY="instance:android:${PHONE_ID}"
+          echo "INSTANCE_KEY=${INSTANCE_KEY}" >> "$GITHUB_ENV"
+          echo "CF_RUNTIME_REF=${CF_RUNTIME_REF}" >> "$GITHUB_ENV"
+          BODY=$(printf '{"instanceKey":"%s","repository":"%s","runId":%s}' "$INSTANCE_KEY" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare Web URL is invalid'; exit 1 ;; esac
+          curl -fsS --retry 3 -H 'content-type: application/json' -H "X-Bootstrap-Ticket: ${CF_RUNTIME_REF}" --data "$BODY" "${WEB_URL}/api/runner/bootstrap" -o /tmp/cloud-bootstrap.json
+          TS_CLIENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('tailscaleClientId',''))")
+          TS_CLIENT_SECRET=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('tailscaleClientSecret',''))")
+          AVD_BACKUP_KEY=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('avdBackupKey',''))")
+          S5_CONFIG_B64=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('s5ConfigB64',''))")
+          TUNNEL_MODE=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('tunnelMode','tailscale'))")
+          TS_DNS_HOSTNAME=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('tailscaleHostname',''))")
+          CF_TUNNEL_HOSTNAME=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('cloudflareHostname',''))")
+          CF_TUNNEL_TOKEN=$(python3 -c "import json; print(json.load(open('/tmp/cloud-bootstrap.json')).get('cloudflareTunnelToken',''))")
+          [ -n "$TS_CLIENT_ID" ] && [ -n "$TS_CLIENT_SECRET" ] || { echo '::error::Cloudflare Tailscale configuration is incomplete'; exit 1; }
+          if [ "$TUNNEL_MODE" = 'cloudflare' ] || [ "$TUNNEL_MODE" = 'dual' ]; then
+            [ -n "$CF_TUNNEL_HOSTNAME" ] && [ -n "$CF_TUNNEL_TOKEN" ] || { echo '::error::Cloudflare Tunnel bootstrap is incomplete'; exit 1; }
+          fi
+          if [ "${{ inputs.mode }}" = 'restore' ] && [ -z "$AVD_BACKUP_KEY" ]; then echo '::error::Cloudflare AVD backup key is missing'; exit 1; fi
+          if [ "${USE_S5:-false}" = 'true' ] && [ -z "$S5_CONFIG_B64" ]; then echo '::error::Cloudflare S5 configuration is missing'; exit 1; fi
+          for value in "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$AVD_BACKUP_KEY" "$S5_CONFIG_B64" "$CF_TUNNEL_TOKEN"; do [ -z "$value" ] || echo "::add-mask::$value"; done
+          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nAVD_BACKUP_KEY=%s\nS5_CONFIG_B64=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\n' \
+            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$AVD_BACKUP_KEY" "$S5_CONFIG_B64" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" >> "$GITHUB_ENV"
+          rm -f /tmp/cloud-bootstrap.json
+          echo 'CLOUDFLARE_BOOTSTRAP_OK'
+
+      - name: Validate inputs and backup encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PHONE_ID" in
+            ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
+          esac
+          printf '%s\n' "${PACKAGE_NAME:-}" | grep -Eq '^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$' || { echo '::error::package_name is invalid'; exit 1; }
+          printf '%s\n' "${DEVICE_MANUFACTURER:-}" | grep -Eq '^[A-Za-z0-9._+ -]*$' || { echo '::error::device_manufacturer contains unsupported characters'; exit 1; }
+          printf '%s\n' "${DEVICE_BRAND:-}" | grep -Eq '^[A-Za-z0-9._+-]*$' || { echo '::error::device_brand contains unsupported characters'; exit 1; }
+          printf '%s\n' "${DEVICE_MODEL:-}" | grep -Eq '^[A-Za-z0-9._+() -]*$' || { echo '::error::device_model contains unsupported characters'; exit 1; }
+          if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then
+            echo '::error::device_model requires device_manufacturer and device_brand'
+            exit 1
+          fi
+          if [ "${{ inputs.mode }}" = 'restore' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then
+            echo '::error::Cloudflare AVD backup key is required to restore an encrypted backup.'
+            exit 1
+          fi
+          if [ -z "${AVD_BACKUP_KEY:-}" ]; then
+            echo '::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.'
+          fi
+          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"
+
+      - name: Prepare phone identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Network identity is intentionally independent from the display/business name.
+          # The same Phone ID always reuses the same Tailscale/MagicDNS hostname.
+          TS_HOSTNAME="phone-${PHONE_ID}"
+          echo "ts_hostname=${TS_HOSTNAME}" >> "$GITHUB_OUTPUT"
+          echo "TAILSCALE_STABLE_HOSTNAME=${TS_HOSTNAME}"
+          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ env.TS_CLIENT_ID }}
+          oauth-secret: ${{ env.TS_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: ${{ steps.identity.outputs.ts_hostname }}
+          version: latest
+
+      - name: Report Tailscale presence to Cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${CF_RUNTIME_REF}"
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ] || { echo '::error::No Tailscale IPv4 address was assigned'; exit 1; }
+          export TS_IPV4
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare Web URL is invalid'; exit 1 ;; esac
+          BODY=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              'instanceKey': os.environ['INSTANCE_KEY'],
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'runId': int(os.environ['GITHUB_RUN_ID']),
+              'nodeName': f"phone-{os.environ['PHONE_ID']}",
+              'address': f"{os.environ['TS_IPV4']}:5555",
+              'tailscaleAddress': f"{os.environ['TS_IPV4']}:5555",
+              'tailscaleHostname': os.environ.get('TS_DNS_HOSTNAME',''),
+              'cloudflareAddress': os.environ.get('CF_TUNNEL_HOSTNAME',''),
+              'cloudflareHostname': os.environ.get('CF_TUNNEL_HOSTNAME',''),
+              'tunnelMode': os.environ.get('TUNNEL_MODE','tailscale'),
+              'status': 'network_ready',
+          }, separators=(',', ':')))
+          PY
+          )
+          curl -fsS --retry 3 -H 'content-type: application/json' -H "X-Bootstrap-Ticket: ${CF_RUNTIME_REF}" --data "$BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-early-report.json
+          echo "TAILSCALE_EARLY_REPORT_OK=${TS_IPV4}:5555"
+
+      - name: Enable KVM and install runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq python3-pip
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+
+      - name: Prepare and verify phone network
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${USE_S5:-false}" != 'true' ]; then
+            curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+            echo 'DIRECT_NETWORK_OK'
+            exit 0
+          fi
+
+          [ -n "${S5_CONFIG_B64:-}" ] || { echo '::error::S5 is enabled but the phone-specific S5 secret is missing'; exit 1; }
+          python3 -m pip install --quiet --break-system-packages PySocks
+
+          cat >/tmp/s5_bridge.py <<'PY'
+          import base64
+          import json
+          import os
+          import select
+          import socketserver
+          from urllib.parse import urlsplit
+          import socks
+
+          cfg = json.loads(base64.b64decode(os.environ['S5_CONFIG_B64']).decode('utf-8'))
+          S5_HOST = str(cfg.get('host') or '').strip()
+          S5_PORT = int(cfg.get('port') or 0)
+          S5_USER = str(cfg.get('user') or '') or None
+          S5_PASS = str(cfg.get('pass') or '') or None
+          if not S5_HOST or not (1 <= S5_PORT <= 65535):
+              raise SystemExit('invalid S5 configuration')
+
+          def open_upstream(host, port):
+              s = socks.socksocket()
+              s.set_proxy(
+                  socks.SOCKS5,
+                  S5_HOST,
+                  S5_PORT,
+                  rdns=True,
+                  username=S5_USER,
+                  password=S5_PASS,
+              )
+              s.settimeout(30)
+              s.connect((host, int(port)))
+              s.settimeout(None)
+              return s
+
+          def relay(a, b):
+              sockets = [a, b]
+              while True:
+                  readable, _, _ = select.select(sockets, [], [], 60)
+                  if not readable:
+                      continue
+                  for src in readable:
+                      dst = b if src is a else a
+                      data = src.recv(65536)
+                      if not data:
+                          return
+                      dst.sendall(data)
+
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  client = self.request
+                  client.settimeout(30)
+                  data = b''
+                  while b'\r\n\r\n' not in data and len(data) < 65536:
+                      chunk = client.recv(4096)
+                      if not chunk:
+                          return
+                      data += chunk
+                  if b'\r\n\r\n' not in data:
+                      return
+                  head, rest = data.split(b'\r\n\r\n', 1)
+                  lines = head.split(b'\r\n')
+                  parts = lines[0].decode('latin1').split(' ', 2)
+                  if len(parts) != 3:
+                      return
+                  method, target, version = parts
+                  try:
+                      if method.upper() == 'CONNECT':
+                          host, port = target.rsplit(':', 1)
+                          upstream = open_upstream(host.strip('[]'), int(port))
+                          client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                          if rest:
+                              upstream.sendall(rest)
+                          relay(client, upstream)
+                          upstream.close()
+                          return
+
+                      parsed = urlsplit(target)
+                      if parsed.hostname:
+                          host = parsed.hostname
+                          port = parsed.port or 80
+                          path = parsed.path or '/'
+                          if parsed.query:
+                              path += '?' + parsed.query
+                      else:
+                          host_header = ''
+                          for line in lines[1:]:
+                              if line.lower().startswith(b'host:'):
+                                  host_header = line.split(b':', 1)[1].strip().decode('latin1')
+                                  break
+                          if not host_header:
+                              return
+                          if ':' in host_header:
+                              host, port_text = host_header.rsplit(':', 1)
+                              port = int(port_text)
+                          else:
+                              host, port = host_header, 80
+                          path = target
+                      upstream = open_upstream(host, port)
+                      lines[0] = f'{method} {path} {version}'.encode('latin1')
+                      upstream.sendall(b'\r\n'.join(lines) + b'\r\n\r\n' + rest)
+                      relay(client, upstream)
+                      upstream.close()
+                  except Exception:
+                      try:
+                          client.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+                      except Exception:
+                          pass
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+
+          Server(('127.0.0.1', 8118), Handler).serve_forever()
+          PY
+
+          cat >/tmp/s5_bridge_supervisor.sh <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          while true; do
+            python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1
+            echo 'SOCKS5_BRIDGE_RESTARTING' >>/tmp/s5_bridge.log
+            sleep 2
+          done
+          SH
+          chmod +x /tmp/s5_bridge_supervisor.sh
+          : >/tmp/s5_bridge.log
+          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &
+          S5_BRIDGE_PID=$!
+          echo "$S5_BRIDGE_PID" >/tmp/s5_bridge_supervisor.pid
+          sleep 1
+          kill -0 "$S5_BRIDGE_PID" 2>/dev/null || { echo '::error::SOCKS5 local bridge failed to start'; exit 1; }
+
+          python3 - <<'PY'
+          import base64, json, os, socks
+          cfg = json.loads(base64.b64decode(os.environ['S5_CONFIG_B64']).decode('utf-8'))
+          s = socks.socksocket()
+          s.set_proxy(
+              socks.SOCKS5,
+              str(cfg['host']),
+              int(cfg['port']),
+              rdns=True,
+              username=(str(cfg.get('user') or '') or None),
+              password=(str(cfg.get('pass') or '') or None),
+          )
+          s.settimeout(12)
+          s.connect(('www.cloudflare.com', 443))
+          s.close()
+          print('SOCKS5_UPSTREAM_OK')
+          PY
+
+          curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 10 --max-time 20 \
+            https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+          echo 'SOCKS5_BRIDGE_OK'
+
+      - name: Restore latest encrypted AVD backup
+        if: inputs.mode == 'restore'
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: /tmp/managed-avd-backup
+          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}
+          restore-keys: |
+            managed-avd-${{ inputs.phone_id }}-
+
+      - name: Decrypt restored AVD
+        if: inputs.mode == 'restore'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {
+            echo '::error::No encrypted AVD backup exists for this phone_id.'
+            exit 1
+          }
+          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name '*.enc' | head -n1)
+          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]
+          mkdir -p "$HOME/.android"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst
+          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"
+          rm -f /tmp/managed-avd.tar.zst
+          test -f "$HOME/.android/avd/${AVD_NAME}.ini"
+          test -d "$HOME/.android/avd/${AVD_NAME}.avd"
+          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"
+          echo 'MANAGED_AVD_DECRYPT_RESTORE_OK'
+
+      - name: Prepare runner status service
+        shell: bash
+        run: |
+          cat >/tmp/runner_status_server.py <<'PY'
+          import http.server, json, os, subprocess, time
+
+          RUN_ID = os.environ.get('GITHUB_RUN_ID', '')
+          PHONE_ID = os.environ.get('PHONE_ID', '')
+
+          def cpu_sample():
+              def snap():
+                  with open('/proc/stat', 'r', encoding='utf-8') as f:
+                      vals = [int(x) for x in f.readline().split()[1:]]
+                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                  return sum(vals), idle
+              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()
+              total = max(1, b_total - a_total)
+              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)
+
+          def mem_sample():
+              vals = {}
+              with open('/proc/meminfo', 'r', encoding='utf-8') as f:
+                  for line in f:
+                      k, v = line.split(':', 1)
+                      vals[k] = int(v.strip().split()[0])
+              total = vals.get('MemTotal', 0)
+              avail = vals.get('MemAvailable', 0)
+              used = max(0, total - avail)
+              pct = round(100.0 * used / total, 1) if total else 0
+              return total, used, avail, pct
+
+          def qemu_sample():
+              cp = subprocess.run(
+                  ['ps', '-C', 'qemu-system-x86_64', '-o', '%cpu=,%mem=,rss=,pid=', '--sort=-%cpu'],
+                  capture_output=True, text=True
+              )
+              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), '')
+              if not line:
+                  return {'cpu_percent': 0.0, 'mem_percent': 0.0, 'rss_kib': 0, 'pid': None}
+              parts = line.split()
+              try:
+                  return {
+                      'cpu_percent': float(parts[0]),
+                      'mem_percent': float(parts[1]),
+                      'rss_kib': int(parts[2]),
+                      'pid': int(parts[3]),
+                  }
+              except Exception:
+                  return {'raw': line}
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path not in ('/', '/status'):
+                      self.send_response(404); self.end_headers(); return
+                  total, used, avail, pct = mem_sample()
+                  load = os.getloadavg()
+                  data = {
+                      'ok': True,
+                      'run_id': RUN_ID,
+                      'phone_id': PHONE_ID,
+                      'cpu_percent': cpu_sample(),
+                      'load1': round(load[0], 2),
+                      'load5': round(load[1], 2),
+                      'load15': round(load[2], 2),
+                      'mem_total_kib': total,
+                      'mem_used_kib': used,
+                      'mem_available_kib': avail,
+                      'mem_percent': pct,
+                      'qemu': qemu_sample(),
+                  }
+                  body = json.dumps(data).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(body)))
+                  self.end_headers(); self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8787), Handler).serve_forever()
+          PY
+          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &
+          sleep 1
+          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json
+          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787
+          echo 'RUNNER_STATUS_READY=8787'
+
+      - name: Prepare managed Android bootstrap script
+        shell: bash
+        run: |
+          cat >/tmp/managed-phone.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          wait_android_boot() {
+            adb wait-for-device
+            for _ in $(seq 1 180); do
+              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          echo 'MANAGED_AVD_BOOT_WAIT'
+          wait_android_boot
+          echo 'MANAGED_AVD_BOOT_COMPLETE'
+
+          # Optional Build identity for emulator compatibility testing. Android Emulator
+          # does not allow arbitrary ro.product.* values through -prop, so use the
+          # writable-system/remount development path and verify after reboot.
+          if [ -n "${DEVICE_MODEL:-}" ]; then
+            echo "DEVICE_IDENTITY_TARGET=${DEVICE_MANUFACTURER}|${DEVICE_BRAND}|${DEVICE_MODEL}"
+            IDENTITY_READY=0
+            if adb root >/tmp/adb-root.log 2>&1; then
+              adb wait-for-device
+              sleep 2
+              if adb remount >/tmp/adb-remount.log 2>&1; then
+                IDENTITY_READY=1
+              else
+                adb disable-verity >/tmp/adb-disable-verity.log 2>&1 || true
+                adb reboot || true
+                if wait_android_boot; then
+                  adb root >/tmp/adb-root2.log 2>&1 || true
+                  adb wait-for-device
+                  sleep 2
+                  if adb remount >/tmp/adb-remount2.log 2>&1; then
+                    IDENTITY_READY=1
+                  fi
+                fi
+              fi
+            fi
+
+            if [ "$IDENTITY_READY" = '1' ]; then
+              cat >/tmp/patch-device-identity.sh <<'DEVICEPATCH'
+          #!/system/bin/sh
+          set -eu
+          patch_prop() {
+            key="$1"
+            value="$2"
+            file="$3"
+            [ -f "$file" ] || return 0
+            if grep -q "^${key}=" "$file" 2>/dev/null; then
+              sed -i "s|^${key}=.*|${key}=${value}|g" "$file"
+            fi
+          }
+          for file in             /system/build.prop /system/system/build.prop             /product/build.prop /system/product/build.prop             /vendor/build.prop /system/vendor/build.prop             /odm/build.prop /system/odm/build.prop             /system_ext/build.prop /system/system_ext/build.prop; do
+            for suffix in '' '.system' '.product' '.vendor' '.odm' '.system_ext'; do
+              patch_prop "ro.product${suffix}.manufacturer" "$TARGET_MANUFACTURER" "$file"
+              patch_prop "ro.product${suffix}.brand" "$TARGET_BRAND" "$file"
+              patch_prop "ro.product${suffix}.model" "$TARGET_MODEL" "$file"
+            done
+          done
+          sync
+          DEVICEPATCH
+              adb push /tmp/patch-device-identity.sh /data/local/tmp/patch-device-identity.sh >/dev/null
+              adb shell chmod 700 /data/local/tmp/patch-device-identity.sh
+              if adb shell "TARGET_MANUFACTURER='${DEVICE_MANUFACTURER}' TARGET_BRAND='${DEVICE_BRAND}' TARGET_MODEL='${DEVICE_MODEL}' sh /data/local/tmp/patch-device-identity.sh"; then
+                adb reboot || true
+                wait_android_boot
+              fi
+            else
+              echo '::warning::Could not remount emulator system; continuing with stock AVD identity.'
+            fi
+
+            ACTUAL_MANUFACTURER=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r')
+            ACTUAL_BRAND=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d '\r')
+            ACTUAL_MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+            echo "DEVICE_IDENTITY_ACTUAL=${ACTUAL_MANUFACTURER}|${ACTUAL_BRAND}|${ACTUAL_MODEL}"
+            if [ "$ACTUAL_MODEL" = "$DEVICE_MODEL" ]; then
+              echo 'DEVICE_REAL_MODEL_APPLIED'
+            else
+              echo "::warning::Requested model '${DEVICE_MODEL}', but Android reports '${ACTUAL_MODEL}'."
+            fi
+          fi
+
+          # Fresh Android often needs a short settling period before first app launch.
+          sleep 12
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          adb shell settings put global disable_window_blurs 1 || true
+          adb shell settings put system peak_refresh_rate 60.0 || true
+          adb shell settings put system min_refresh_rate 60.0 || true
+          adb shell wm size 720x1600 || true
+          adb shell wm density 280 || true
+
+          # Optional new-phone-only APK installation. Restore mode deliberately skips
+          # this block so backed-up application/data state is never overwritten.
+          if [ "${PHONE_MODE:-}" = 'new' ] && [ -n "${NEW_PHONE_APK_URLS_B64:-}" ]; then
+            python3 - <<'PY' >/tmp/new-phone-apk-urls.txt
+          import base64
+          import json
+          import os
+          from urllib.parse import urlparse
+
+          raw = os.environ.get('NEW_PHONE_APK_URLS_B64', '')
+          try:
+              urls = json.loads(base64.b64decode(raw).decode('utf-8'))
+          except Exception as exc:
+              raise SystemExit(f'invalid new-phone APK URL payload: {exc}')
+          if not isinstance(urls, list) or len(urls) > 20:
+              raise SystemExit('new-phone APK URL payload must be a list with at most 20 entries')
+          seen = set()
+          for item in urls:
+              url = str(item or '').strip()
+              parsed = urlparse(url)
+              if not url or len(url) > 2048 or parsed.scheme.lower() not in ('http', 'https') or not parsed.netloc:
+                  raise SystemExit('invalid new-phone APK URL')
+              if url in seen:
+                  continue
+              seen.add(url)
+              print(url)
+          PY
+
+            APP_INDEX=0
+            while IFS= read -r APP_URL || [ -n "$APP_URL" ]; do
+              [ -n "$APP_URL" ] || continue
+              APP_INDEX=$((APP_INDEX + 1))
+              APP_FILE="/tmp/managed-auto-app-${APP_INDEX}.apk"
+              echo "AUTO_APP_DOWNLOAD_START index=${APP_INDEX}"
+              if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 300 "$APP_URL" -o "$APP_FILE"; then
+                echo "::error::AUTO_APP_DOWNLOAD_FAILED index=${APP_INDEX}"
+                exit 1
+              fi
+              if ! unzip -tq "$APP_FILE" >/dev/null 2>&1; then
+                echo "::error::AUTO_APP_INVALID_APK index=${APP_INDEX}"
+                exit 1
+              fi
+              echo "AUTO_APP_INSTALL_START index=${APP_INDEX}"
+              if ! adb install -r "$APP_FILE"; then
+                echo "::error::AUTO_APP_INSTALL_FAILED index=${APP_INDEX}"
+                exit 1
+              fi
+              rm -f "$APP_FILE"
+              echo "AUTO_APP_INSTALL_OK index=${APP_INDEX}"
+            done </tmp/new-phone-apk-urls.txt
+            echo "AUTO_APP_INSTALL_COMPLETE count=${APP_INDEX}"
+          elif [ "${PHONE_MODE:-}" = 'restore' ]; then
+            echo 'RESTORE_SKIPS_AUTO_APP_INSTALL'
+          else
+            echo 'NEW_PHONE_AUTO_APP_INSTALL_NONE'
+          fi
+
+          DEFAULT_PACKAGE="$PACKAGE_NAME"
+          if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then
+            echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"
+          else
+            echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"
+          fi
+
+          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true
+          adb shell settings put global auto_update_system_apps 0 || true
+
+          echo 'ADB_TCPIP_BOOTSTRAP_START'
+          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 5555 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 5555
+          echo 'ADB_TCPIP_5555_READY'
+
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ]
+          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+          if [ "${TUNNEL_MODE:-tailscale}" = 'cloudflare' ] || [ "${TUNNEL_MODE:-tailscale}" = 'dual' ]; then
+            [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ -n "${CF_TUNNEL_HOSTNAME:-}" ] || { echo '::error::Cloudflare Tunnel bootstrap is incomplete'; exit 1; }
+            echo "::add-mask::${CF_TUNNEL_TOKEN}"
+            CLOUDFLARED=/tmp/cloudflared-managed
+            TOKEN_FILE=/tmp/cloudflared-managed-token
+            LOG_FILE=/tmp/cloudflared-managed.log
+            if [ ! -x "$CLOUDFLARED" ]; then
+              curl -fsSL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o "$CLOUDFLARED"
+              chmod +x "$CLOUDFLARED"
+            fi
+            printf '%s' "$CF_TUNNEL_TOKEN" > "$TOKEN_FILE"
+            chmod 600 "$TOKEN_FILE"
+            : > "$LOG_FILE"
+            nohup "$CLOUDFLARED" tunnel --no-autoupdate --loglevel info --logfile "$LOG_FILE" run --token-file "$TOKEN_FILE" >/dev/null 2>&1 &
+            echo $! >/tmp/cloudflared-managed.pid
+            CF_READY=0
+            for _ in $(seq 1 60); do
+              if grep -q 'Registered tunnel connection' "$LOG_FILE" 2>/dev/null; then CF_READY=1; break; fi
+              kill -0 "$(cat /tmp/cloudflared-managed.pid)" 2>/dev/null || break
+              sleep 1
+            done
+            if [ "$CF_READY" != '1' ]; then
+              tail -n 80 "$LOG_FILE" || true
+              echo '::error::Cloudflare ADB tunnel did not connect'
+              exit 1
+            fi
+            echo "CLOUDFLARE_ADB_TUNNEL=${CF_TUNNEL_HOSTNAME}"
+          fi
+
+          echo 'MANAGED_CLOUD_PHONE_READY'
+          echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"
+          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+
+          REPORT_BODY=$(jq -nc \
+            --arg key "instance:android:${PHONE_ID}" --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
+            --arg node "phone-${PHONE_ID}" --arg ts "${TS_IPV4}:5555" \
+            --arg tsHost "${TS_DNS_HOSTNAME:-}" --arg cf "${CF_TUNNEL_HOSTNAME:-}" --arg mode "${TUNNEL_MODE:-tailscale}" \
+            '{instanceKey:$key,repository:$repo,runId:$run,nodeName:$node,address:$ts,tailscaleAddress:$ts,tailscaleHostname:$tsHost,cloudflareAddress:$cf,cloudflareHostname:$cf,tunnelMode:$mode,status:"in_progress"}')
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare Web URL is invalid'; exit 1 ;; esac
+          curl -fsS --retry 3 -H "X-Bootstrap-Ticket: ${CF_RUNTIME_REF}" -H 'content-type: application/json' --data "$REPORT_BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-report.json
+          echo "CLOUDFLARE_RUNNER_REPORT_OK=${TS_IPV4}:5555"
+          jq -r 'select(.tailscaleDomain != null and .tailscaleDomain != "") | "TAILSCALE_FIXED_DOMAIN=" + .tailscaleDomain' /tmp/cloud-report.json || true
+          jq -r 'select(.cloudflareDomain != null and .cloudflareDomain != "") | "CLOUDFLARE_FIXED_DOMAIN=" + .cloudflareDomain' /tmp/cloud-report.json || true
+          rm -f /tmp/cloud-report.json
+
+          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"
+          for _ in $(seq 1 1800); do
+            ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | .number" \
+              2>/dev/null | head -n1 || true)
+            if [ -n "$ISSUE_NO" ]; then
+              ISSUE_BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" \
+                --jq '.body // ""' 2>/dev/null || true)
+              CMD_JSON=$(printf '%s\n' "$ISSUE_BODY" | grep -m1 '^{' || true)
+              if [ -n "$CMD_JSON" ]; then
+                CMD=$(jq -r '.command // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_RUN=$(jq -r '.run_id // 0' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_PHONE=$(jq -r '.phone_id // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                if [ "$CMD" = 'backup' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then
+                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then
+                    echo 'BACKUP_REQUEST_REJECTED_NO_KEY'
+                  else
+                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"
+                    printf '%s' "$ISSUE_NO" >/tmp/managed-backup-issue-number
+                    touch /tmp/managed-backup-requested
+                    adb shell sync || true
+                    exit 0
+                  fi
+                fi
+              fi
+            fi
+            sleep 10
+          done
+
+          # End-of-life safety backup when the 5-hour session naturally expires.
+          if [ -n "${AVD_BACKUP_KEY:-}" ]; then
+            echo 'SESSION_TIMEOUT_AUTO_BACKUP'
+            touch /tmp/managed-backup-requested
+            adb shell sync || true
+          else
+            echo 'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY'
+          fi
+          SCRIPT
+          chmod +x /tmp/managed-phone.sh
+          bash -n /tmp/managed-phone.sh
+          echo 'MANAGED_BOOTSTRAP_SCRIPT_READY'
+
+      - name: Select Android emulator backend
+        id: emulator-backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_API='${{ inputs.api_level }}'
+          API_MAJOR=$(printf '%s' "$RAW_API" | sed -nE 's/^([0-9]+).*/\1/p')
+          if [ -n "$API_MAJOR" ] && [ "$API_MAJOR" -ge 37 ]; then
+            echo 'manual=true' >> "$GITHUB_OUTPUT"
+            echo "ANDROID_EMULATOR_BACKEND=manual-major-minor api=${RAW_API}"
+          else
+            echo 'manual=false' >> "$GITHUB_OUTPUT"
+            echo "ANDROID_EMULATOR_BACKEND=reactivecircus api=${RAW_API}"
+          fi
+
+      - name: Start managed Android phone
+        if: steps.emulator-backend.outputs.manual != 'true'
+        id: android
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          PHONE_MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          api-level: ${{ inputs.api_level }}
+          target: ${{ inputs.target }}
+          arch: ${{ inputs.arch }}
+          profile: ${{ inputs.profile }}
+          avd-name: managed-phone-${{ inputs.phone_id || '001' }}
+          cores: ${{ inputs.cores }}
+          ram-size: ${{ format('{0}M', inputs.ram_mb) }}
+          force-avd-creation: ${{ inputs.mode == 'new' }}
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            ${{ (inputs.device_model != '' || inputs.mode == 'restore') && '-writable-system' || '' }}
+            ${{ inputs.use_s5 == 'true' && '-http-proxy http://127.0.0.1:8118' || '' }}
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/managed-phone.sh
+
+      - name: Start managed Android phone (API 37+)
+        if: steps.emulator-backend.outputs.manual == 'true'
+        env:
+          PHONE_MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_API: ${{ inputs.api_level }}
+          REQUESTED_TARGET: ${{ inputs.target }}
+          REQUESTED_ARCH: ${{ inputs.arch }}
+          REQUESTED_PROFILE: ${{ inputs.profile }}
+          REQUESTED_CORES: ${{ inputs.cores }}
+          REQUESTED_RAM_MB: ${{ inputs.ram_mb }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK"
+          export ANDROID_SDK_ROOT="$SDK"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+
+          BASE_SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$BASE_SDKMANAGER" ] || { echo '::error::Base sdkmanager not found'; exit 1; }
+          yes | "$BASE_SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          # Android 17/API 37 introduced Major.Minor system-image packages. Older
+          # avdmanager versions can silently write target=android-0 for those images,
+          # so install a known-good command-line-tools version side-by-side.
+          CLT_VERSION=22.0
+          if ! "$BASE_SDKMANAGER" --install "cmdline-tools;${CLT_VERSION}" >/dev/null 2>&1; then
+            CLT_VERSION=20.0
+            "$BASE_SDKMANAGER" --install "cmdline-tools;${CLT_VERSION}" >/dev/null
+          fi
+          SDKMANAGER="$SDK/cmdline-tools/${CLT_VERSION}/bin/sdkmanager"
+          AVDMANAGER="$SDK/cmdline-tools/${CLT_VERSION}/bin/avdmanager"
+          [ -x "$SDKMANAGER" ] && [ -x "$AVDMANAGER" ] || { echo '::error::Modern Android command-line tools are unavailable'; exit 1; }
+          export PATH="$(dirname "$SDKMANAGER"):$SDK/platform-tools:$SDK/emulator:$PATH"
+          echo "ANDROID_CMDLINE_TOOLS_VERSION=$($SDKMANAGER --version | head -n1)"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          SDK_LIST=/tmp/managed-sdk-packages.txt
+          "$SDKMANAGER" --list --channel=3 > "$SDK_LIST"
+
+          SYS_IMAGE=$(python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          requested_api = os.environ['REQUESTED_API'].strip()
+          requested_target = os.environ['REQUESTED_TARGET'].strip() or 'google_apis'
+          requested_arch = os.environ['REQUESTED_ARCH'].strip() or 'x86_64'
+          phone_mode = os.environ.get('PHONE_MODE', 'new').strip()
+          avd_name = os.environ['AVD_NAME']
+          avd_home = Path(os.environ['ANDROID_AVD_HOME'])
+
+          major_match = re.match(r'^(\d+)', requested_api)
+          if not major_match:
+              raise SystemExit(f'API 37+ backend requires a numeric API prefix, got: {requested_api}')
+          requested_major = int(major_match.group(1))
+
+          packages = []
+          for raw in Path('/tmp/managed-sdk-packages.txt').read_text(encoding='utf-8', errors='replace').splitlines():
+              name = raw.split('|', 1)[0].strip()
+              if name.startswith('system-images;'):
+                  packages.append(name)
+
+          # Restore must use the exact image recorded inside the backed-up AVD.
+          if phone_mode == 'restore':
+              config = avd_home / f'{avd_name}.avd' / 'config.ini'
+              if config.is_file():
+                  for raw in config.read_text(encoding='utf-8', errors='replace').splitlines():
+                      if not raw.startswith('image.sysdir.1='):
+                          continue
+                      rel = raw.split('=', 1)[1].strip().replace('\\', '/').strip('/')
+                      if rel.startswith('system-images/'):
+                          restored = rel.replace('/', ';')
+                          if restored in packages:
+                              print(restored)
+                              raise SystemExit(0)
+                          raise SystemExit(f'Restored AVD requires unavailable system image: {restored}')
+
+          candidates = []
+          for pkg in packages:
+              parts = pkg.split(';')
+              if len(parts) != 4 or parts[0] != 'system-images' or not parts[1].startswith('android-'):
+                  continue
+              level = parts[1][len('android-'):]
+              m = re.match(r'^(\d+)', level)
+              if not m or int(m.group(1)) != requested_major or parts[3] != requested_arch:
+                  continue
+              candidates.append((pkg, level, parts[2]))
+
+          target_preferences = [requested_target]
+          if requested_target in ('google_apis', 'google_apis_playstore'):
+              target_preferences.append(requested_target + '_ps16k')
+
+          # Keep integer API inputs deterministic: "37" means the 37.0 base
+          # feature drop when available. A caller can request "37.1" explicitly.
+          if re.fullmatch(r'\d+', requested_api):
+              preferred_levels = [f'{requested_major}.0', str(requested_major)]
+          else:
+              preferred_levels = [requested_api]
+
+          selected = [item for item in candidates if item[2] in target_preferences]
+          if not selected:
+              available = ', '.join(sorted(pkg for pkg, _, _ in candidates)) or '(none)'
+              raise SystemExit(
+                  f'No API {requested_major} system image for target={requested_target} arch={requested_arch}. '
+                  f'Available same-major images: {available}'
+              )
+
+          def candidate_key(item):
+              _pkg, level, target = item
+              try:
+                  level_rank = preferred_levels.index(level)
+              except ValueError:
+                  level_rank = len(preferred_levels)
+              target_rank = target_preferences.index(target)
+              numeric_penalty = 0 if re.fullmatch(r'\d+(?:\.\d+)*', level) else 1
+              numeric_version = tuple(-int(x) for x in re.findall(r'\d+', level))
+              return (level_rank, target_rank, numeric_penalty, numeric_version, level)
+
+          selected.sort(key=candidate_key)
+          print(selected[0][0])
+          PY
+          )
+          [ -n "$SYS_IMAGE" ] || { echo '::error::Could not resolve API 37+ system image'; exit 1; }
+          echo "ANDROID_SYSTEM_IMAGE=$SYS_IMAGE"
+          SYS_TARGET=$(printf '%s' "$SYS_IMAGE" | cut -d';' -f3)
+          if [ "$SYS_TARGET" != "$REQUESTED_TARGET" ]; then
+            echo "::notice::Requested target $REQUESTED_TARGET is unavailable for API $REQUESTED_API; using $SYS_TARGET"
+          fi
+
+          "$SDKMANAGER" --install platform-tools emulator >/dev/null
+          "$SDKMANAGER" --install "$SYS_IMAGE" --channel=3 >/dev/null
+
+          if [ "$PHONE_MODE" = 'new' ]; then
+            rm -rf "$ANDROID_AVD_HOME/${AVD_NAME}.avd" "$ANDROID_AVD_HOME/${AVD_NAME}.ini"
+            echo no | "$AVDMANAGER" create avd --force \
+              --name "$AVD_NAME" \
+              --package "$SYS_IMAGE" \
+              --device "$REQUESTED_PROFILE"
+          else
+            test -f "$ANDROID_AVD_HOME/${AVD_NAME}.ini"
+            test -d "$ANDROID_AVD_HOME/${AVD_NAME}.avd"
+          fi
+
+          AVD_CONFIG="$ANDROID_AVD_HOME/${AVD_NAME}.avd/config.ini"
+          test -f "$AVD_CONFIG"
+          {
+            echo "hw.cpu.ncore=${REQUESTED_CORES}"
+            echo "hw.ramSize=${REQUESTED_RAM_MB}"
+          } >> "$AVD_CONFIG"
+          if grep -q '^target=android-0$' "$ANDROID_AVD_HOME/${AVD_NAME}.ini" 2>/dev/null; then
+            echo '::error::AVD was created with invalid target=android-0; command-line tools are too old for this image'
+            exit 1
+          fi
+
+          EMULATOR="$SDK/emulator/emulator"
+          ADB="$SDK/platform-tools/adb"
+          [ -x "$EMULATOR" ] && [ -x "$ADB" ] || { echo '::error::Emulator or adb is missing after SDK installation'; exit 1; }
+
+          EMU_ARGS=(
+            -avd "$AVD_NAME"
+            -port 5554
+            -no-snapshot
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          )
+          if [ -n "${DEVICE_MODEL:-}" ] || [ "$PHONE_MODE" = 'restore' ]; then
+            EMU_ARGS+=( -writable-system )
+          fi
+          if [ "${USE_S5:-false}" = 'true' ]; then
+            EMU_ARGS+=( -http-proxy http://127.0.0.1:8118 )
+          fi
+
+          : >/tmp/managed-emulator.log
+          "$EMULATOR" "${EMU_ARGS[@]}" >/tmp/managed-emulator.log 2>&1 &
+          EMULATOR_PID=$!
+          cleanup_emulator() {
+            "$ADB" -s emulator-5554 emu kill >/dev/null 2>&1 || true
+            if kill -0 "$EMULATOR_PID" 2>/dev/null; then
+              kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+            fi
+            wait "$EMULATOR_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup_emulator EXIT
+
+          BOOTED=0
+          for _ in $(seq 1 600); do
+            if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+              echo '::error::Android Emulator exited before boot completed'
+              tail -n 200 /tmp/managed-emulator.log || true
+              exit 1
+            fi
+            if [ "$("$ADB" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)" = '1' ]; then
+              BOOTED=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$BOOTED" != '1' ]; then
+            echo '::error::Android Emulator boot timed out after 600 seconds'
+            tail -n 200 /tmp/managed-emulator.log || true
+            "$ADB" -s emulator-5554 logcat -d -t 200 2>/dev/null || true
+            exit 1
+          fi
+          echo 'MANAGED_API37_EMULATOR_BOOT_COMPLETE'
+
+          bash /tmp/managed-phone.sh
+
+      - name: Pack and encrypt full AVD backup
+        id: pack
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/managed-backup-requested ]; then
+            echo 'should_save=false' >> "$GITHUB_OUTPUT"
+            echo 'NO_BACKUP_REQUEST'
+            exit 0
+          fi
+          test -d "$HOME/.android/avd/${AVD_NAME}.avd"
+          mkdir -p /tmp/managed-avd-backup
+          rm -f /tmp/managed-avd-backup/*
+          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -pass env:AVD_BACKUP_KEY \
+            -in /tmp/managed-avd.tar.zst \
+            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"
+          rm -f /tmp/managed-avd.tar.zst
+          BYTES=$(stat -c '%s' /tmp/managed-avd-backup/*.enc)
+          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"
+          echo 'should_save=true' >> "$GITHUB_OUTPUT"
+          echo 'FULL_AVD_ENCRYPTED_BACKUP_READY'
+
+      - name: Save encrypted AVD backup to GitHub Actions Cache
+        if: steps.pack.outputs.should_save == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: /tmp/managed-avd-backup
+          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}
+
+      - name: Close consumed backup command
+        if: steps.pack.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s /tmp/managed-backup-issue-number ]; then
+            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)
+            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true
+          fi
+          echo 'MANAGED_BACKUP_SAVED'
+
+      - name: Report Android workflow failure to Cloudflare
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set +e
+          echo "::add-mask::${CF_RUNTIME_REF:-}"
+          WEB_URL="${WEB_URL%/}"
+          case "$WEB_URL" in https://*) ;; *) exit 0 ;; esac
+          TS_IPV4=$(tailscale ip -4 2>/dev/null | head -n1)
+          export TS_IPV4
+          BODY=$(python3 - <<'PY'
+          import json, os
+          ts = (os.environ.get('TS_IPV4') or '').strip()
+          print(json.dumps({
+              'instanceKey': os.environ.get('INSTANCE_KEY', f"instance:android:{os.environ.get('PHONE_ID','001')}"),
+              'repository': os.environ.get('GITHUB_REPOSITORY',''),
+              'runId': int(os.environ.get('GITHUB_RUN_ID','0') or 0),
+              'nodeName': f"phone-{os.environ.get('PHONE_ID','001')}",
+              'address': f"{ts}:5555" if ts else '',
+              'tailscaleAddress': f"{ts}:5555" if ts else '',
+              'tailscaleHostname': os.environ.get('TS_DNS_HOSTNAME',''),
+              'cloudflareAddress': os.environ.get('CF_TUNNEL_HOSTNAME',''),
+              'cloudflareHostname': os.environ.get('CF_TUNNEL_HOSTNAME',''),
+              'tunnelMode': os.environ.get('TUNNEL_MODE','tailscale'),
+              'status': 'failure',
+          }, separators=(',', ':')))
+          PY
+          )
+          [ -z "${CF_RUNTIME_REF:-}" ] || curl -fsS -H 'content-type: application/json' -H "X-Bootstrap-Ticket: ${CF_RUNTIME_REF}" --data "$BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-failure-report.json || true
