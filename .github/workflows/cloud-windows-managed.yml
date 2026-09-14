@@ -550,7 +550,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
-        shell: pwsh
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Continue'
 
@@ -1102,3 +1102,4 @@ jobs:
             status = 'failure'
           } | ConvertTo-Json -Compress
           try { Invoke-RestMethod -Method Post -Uri "$webUrl/api/runner/report" -Headers @{ 'X-Bootstrap-Ticket' = $env:BOOTSTRAP_TICKET } -ContentType 'application/json' -Body $payload | Out-Null } catch { Write-Warning $_.Exception.Message }
+
