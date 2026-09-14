@@ -714,22 +714,49 @@ jobs:
             New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
             New-Item -ItemType Directory -Path $taskRoot -Force | Out-Null
 
-            # User files and application data. Registry hives are exported separately below.
-            $args = @(
-              $profileRoot, $backupProfile,
-              '/E','/COPY:DAT','/DCOPY:DAT','/R:1','/W:1','/XJ','/NFL','/NDL','/NP',
-              '/XF','NTUSER.DAT','NTUSER.DAT.LOG*','ntuser.ini','UsrClass.dat','UsrClass.dat.LOG*',
-              '/XD',
-              (Join-Path $profileRoot 'AppData\Local\Temp'),
-              (Join-Path $profileRoot 'AppData\Local\Microsoft\Windows\INetCache'),
-              (Join-Path $profileRoot 'AppData\Local\CrashDumps'),
-              (Join-Path $profileRoot 'AppData\Local\Google\Chrome\User Data\Default\Cache'),
-              (Join-Path $profileRoot 'AppData\Local\Google\Chrome\User Data\Default\Code Cache'),
-              (Join-Path $profileRoot 'AppData\Local\Microsoft\Edge\User Data\Default\Cache'),
-              (Join-Path $profileRoot 'AppData\Local\Microsoft\Edge\User Data\Default\Code Cache')
-            )
-            & robocopy.exe @args | Out-Host
-            if ($LASTEXITCODE -ge 8) { throw "robocopy backup failed with exit code $LASTEXITCODE" }
+            # Copy the live user profile through a VSS snapshot. The managed desktop
+            # shares the runner's active Windows session, so files such as WebCache,
+            # Search/StartMenu settings and notification databases can be locked while
+            # RDP/UU remains connected. VSS gives robocopy a stable read-only view
+            # without logging the user off or weakening backup fidelity.
+            $volumeRoot = [IO.Path]::GetPathRoot($profileRoot)
+            if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Could not resolve profile volume: $profileRoot" }
+            $shadow = $null
+            try {
+              $create = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume=$volumeRoot; Context='ClientAccessible' } -ErrorAction Stop
+              if ([int]$create.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$create.ShadowID)) {
+                throw "VSS snapshot create failed return=$($create.ReturnValue)"
+              }
+              $shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($create.ShadowID)'" -ErrorAction Stop | Select-Object -First 1
+              if ($null -eq $shadow -or [string]::IsNullOrWhiteSpace([string]$shadow.DeviceObject)) { throw 'VSS snapshot device was not found' }
+              $relativeProfile = $profileRoot.Substring($volumeRoot.Length).TrimStart('\')
+              $snapshotRoot = ([string]$shadow.DeviceObject).TrimEnd('\')
+              $profileSource = "$snapshotRoot\$relativeProfile"
+              Write-Host "MANAGED_WINDOWS_VSS_READY id=$($create.ShadowID) source=$profileSource"
+
+              $args = @(
+                $profileSource, $backupProfile,
+                '/E','/COPY:DAT','/DCOPY:DAT','/R:1','/W:1','/XJ','/NFL','/NDL','/NP',
+                '/XF','NTUSER.DAT','NTUSER.DAT.LOG*','ntuser.ini','UsrClass.dat','UsrClass.dat.LOG*',
+                '/XD',
+                "$profileSource\AppData\Local\Temp",
+                "$profileSource\AppData\Local\Microsoft\Windows\INetCache",
+                "$profileSource\AppData\Local\CrashDumps",
+                "$profileSource\AppData\Local\Google\Chrome\User Data\Default\Cache",
+                "$profileSource\AppData\Local\Google\Chrome\User Data\Default\Code Cache",
+                "$profileSource\AppData\Local\Microsoft\Edge\User Data\Default\Cache",
+                "$profileSource\AppData\Local\Microsoft\Edge\User Data\Default\Code Cache"
+              )
+              & robocopy.exe @args | Out-Host
+              $robocopyExit = $LASTEXITCODE
+              if ($robocopyExit -ge 8) { throw "robocopy VSS backup failed with exit code $robocopyExit" }
+              Write-Host "MANAGED_WINDOWS_VSS_COPY_OK exit=$robocopyExit"
+            } finally {
+              if ($null -ne $shadow) {
+                try { Remove-CimInstance -InputObject $shadow -ErrorAction SilentlyContinue } catch { }
+                Write-Host 'MANAGED_WINDOWS_VSS_RELEASED'
+              }
+            }
 
             function Save-HiveSnapshot {
               param(
