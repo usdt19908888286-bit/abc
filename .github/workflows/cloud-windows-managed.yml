@@ -190,6 +190,22 @@ jobs:
           $baselineApps = @(Get-InstalledAppInventory)
           ConvertTo-Json -InputObject $baselineApps -Depth 6 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installed-apps.json') -Encoding UTF8
 
+          # Snapshot shallow Program Files directory topology. Some installers (including
+          # per-user uninstall registrations) omit InstallLocation/DisplayIcon paths, so
+          # backup also detects directories created after this pristine runner baseline.
+          $baselineProgramDirs = [System.Collections.Generic.List[string]]::new()
+          foreach ($programRoot in @([string]$env:ProgramFiles, [string]${env:ProgramFiles(x86)})) {
+            if ([string]::IsNullOrWhiteSpace($programRoot) -or -not (Test-Path -LiteralPath $programRoot -PathType Container)) { continue }
+            try {
+              $rootFull = [IO.Path]::GetFullPath($programRoot).TrimEnd('\')
+              Get-ChildItem -LiteralPath $rootFull -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try { [void]$baselineProgramDirs.Add([IO.Path]::GetFullPath($_.FullName).TrimEnd('\')) } catch { }
+              }
+            } catch { }
+          }
+          $baselineProgramDirs = @($baselineProgramDirs | Sort-Object -Unique)
+          ConvertTo-Json -InputObject @($baselineProgramDirs) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'program-dirs.json') -Encoding UTF8
+
           # Managed backup boundary:
           # - portable/no-install files belong under the user profile and are preserved by the profile snapshot;
           # - installed software is discovered only from explicit install evidence (uninstall registry,
@@ -721,8 +737,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $stateRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup\state'
+          $backupRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
+          $stateRoot = Join-Path $backupRoot 'state'
           $deltaPath = Join-Path $stateRoot 'installed-apps-delta.json'
+          $allowLegacyMissingPayload = $false
+          $metadataPath = Join-Path $backupRoot 'metadata.json'
+          if (Test-Path -LiteralPath $metadataPath) {
+            try {
+              $backupMetadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+              $allowLegacyMissingPayload = ([int]$backupMetadata.version -le 5 -and [int]$backupMetadata.software_app_delta_count -gt 0 -and [int]$backupMetadata.software_root_count -eq 0)
+            } catch { }
+          }
           if (-not (Test-Path -LiteralPath $deltaPath)) {
             Write-Host 'MANAGED_WINDOWS_APP_RESTORE_VERIFY none'
             exit 0
@@ -768,6 +793,11 @@ jobs:
               if (Test-Path -LiteralPath $exe) { [void]$existingEvidence.Add("command:$exe") }
             }
             if ($declaredEvidence -gt 0 -and $existingEvidence.Count -eq 0) {
+              if ($allowLegacyMissingPayload) {
+                Write-Warning "MANAGED_WINDOWS_APP_RESTORE_LEGACY_PAYLOAD_MISSING name=$name registry=$regPath"
+                $verified++
+                continue
+              }
               throw "Restored app payload is missing: $name registry=$regPath"
             }
             $verified++
@@ -1312,6 +1342,35 @@ jobs:
               return ''
             }
 
+            # Fallback for installers that register an app but omit usable install paths.
+            # Compare shallow Program Files topology against the pristine runner baseline;
+            # this catches new vendor/app directories such as Program Files\Netease\GameViewer
+            # without scanning or backing up the whole system drive.
+            if (@($appDelta).Count -gt 0) {
+              $baselineProgramDirSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+              $baselineProgramDirsPath = Join-Path $baselineRoot 'program-dirs.json'
+              if (Test-Path -LiteralPath $baselineProgramDirsPath) {
+                foreach ($savedDir in @(Get-Content -LiteralPath $baselineProgramDirsPath -Raw | ConvertFrom-Json)) {
+                  if ([string]::IsNullOrWhiteSpace([string]$savedDir)) { continue }
+                  try { [void]$baselineProgramDirSet.Add([IO.Path]::GetFullPath([string]$savedDir).TrimEnd('\')) } catch { }
+                }
+              }
+              foreach ($programRoot in @([string]$env:ProgramFiles, [string]${env:ProgramFiles(x86)})) {
+                if ([string]::IsNullOrWhiteSpace($programRoot) -or -not (Test-Path -LiteralPath $programRoot -PathType Container)) { continue }
+                try {
+                  $rootFull = [IO.Path]::GetFullPath($programRoot).TrimEnd('\')
+                  Get-ChildItem -LiteralPath $rootFull -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                      $currentDir = [IO.Path]::GetFullPath($_.FullName).TrimEnd('\')
+                      if (-not $baselineProgramDirSet.Contains($currentDir)) {
+                        Add-SoftwareRootCandidate -Path $currentDir -Reason 'program-directory-delta'
+                      }
+                    } catch { }
+                  }
+                } catch { }
+              }
+            }
+
             foreach ($app in $appDelta) {
               Add-SoftwareRootCandidate -Path ([string]$app.install_location) -Reason "install-location:$($app.name)"
               $icon = ([string]$app.display_icon -replace ',\s*-?\d+\s*$','').Trim().Trim('"')
@@ -1715,7 +1774,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 5
+              version = 6
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -1723,7 +1782,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v5-user-software-registry'
+              scope = 'managed-windows-state-v6-program-directory-delta'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -1745,7 +1804,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V5_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V6_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) softwareRoots=$(@($softwareRoots).Count) registry=$registryExports uninstallRegistry=$(@($uninstallRegistryManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
