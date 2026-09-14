@@ -241,6 +241,74 @@ jobs:
           }
           ConvertTo-Json -InputObject @($baselineAppRegistryKeys | Sort-Object -Unique) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'app-registry-keys.json') -Encoding UTF8
 
+          # Generic installer-state baselines. These are intentionally app-agnostic and are diffed later.
+          function Get-RegistryValueInventory {
+            param([Parameter(Mandatory=$true)][string]$Path)
+            $result = [System.Collections.Generic.List[object]]::new()
+            if (-not (Test-Path -LiteralPath $Path)) { return @() }
+            $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+            foreach ($name in $key.GetValueNames()) {
+              if ([string]::IsNullOrWhiteSpace($name)) { continue }
+              $kind = $key.GetValueKind($name).ToString()
+              $raw = $key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              $entry = [ordered]@{ path=$Path; name=$name; kind=$kind; value=$null; value_b64=''; value_multi=@() }
+              if ($raw -is [byte[]]) { $entry.value_b64 = [Convert]::ToBase64String($raw) }
+              elseif ($raw -is [string[]]) { $entry.value_multi = @($raw) }
+              else { $entry.value = $raw }
+              [void]$result.Add([pscustomobject]$entry)
+            }
+            return @($result)
+          }
+          $installerValueRoots = @(
+            'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+            'HKCU:\Environment',
+            'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules',
+            'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules',
+            'HKLM:\SOFTWARE\RegisteredApplications',
+            'HKCU:\SOFTWARE\RegisteredApplications',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved'
+          )
+          $baselineInstallerValues = [System.Collections.Generic.List[object]]::new()
+          foreach ($root in $installerValueRoots) { foreach ($entry in @(Get-RegistryValueInventory -Path $root)) { [void]$baselineInstallerValues.Add($entry) } }
+          ConvertTo-Json -InputObject @($baselineInstallerValues) -Depth 8 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installer-registry-values.json') -Encoding UTF8
+
+          $baselineIdentitySid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $installerTreeRoots = @(
+            [pscustomobject]@{ id='hklm_classes'; provider='HKLM:\SOFTWARE\Classes'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes' },
+            [pscustomobject]@{ id='hklm_app_paths'; provider='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths' },
+            [pscustomobject]@{ id='hkcu_app_paths'; provider='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths'; reg='HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths' },
+            [pscustomobject]@{ id='hklm_shell_overlays'; provider='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers' },
+            [pscustomobject]@{ id='hkcu_shell_overlays'; provider='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'; reg='HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers' },
+            [pscustomobject]@{ id='hklm_clsid'; provider='HKLM:\SOFTWARE\Classes\CLSID'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID' },
+            [pscustomobject]@{ id='hklm_appid'; provider='HKLM:\SOFTWARE\Classes\AppID'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\AppID' },
+            [pscustomobject]@{ id='hklm_typelib'; provider='HKLM:\SOFTWARE\Classes\TypeLib'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\TypeLib' },
+            [pscustomobject]@{ id='hklm_interface'; provider='HKLM:\SOFTWARE\Classes\Interface'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Interface' },
+            [pscustomobject]@{ id='hkcu_classes'; provider='HKCU:\SOFTWARE\Classes'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes' },
+            [pscustomobject]@{ id='hkcu_clsid'; provider='HKCU:\SOFTWARE\Classes\CLSID'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes\CLSID' },
+            [pscustomobject]@{ id='hkcu_appid'; provider='HKCU:\SOFTWARE\Classes\AppID'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes\AppID' },
+            [pscustomobject]@{ id='hkcu_typelib'; provider='HKCU:\SOFTWARE\Classes\TypeLib'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes\TypeLib' },
+            [pscustomobject]@{ id='msi_products'; provider='HKLM:\SOFTWARE\Classes\Installer\Products'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Products' },
+            [pscustomobject]@{ id='msi_features'; provider='HKLM:\SOFTWARE\Classes\Installer\Features'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Features' },
+            [pscustomobject]@{ id='msi_upgradecodes'; provider='HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\UpgradeCodes' },
+            [pscustomobject]@{ id='msi_machine_products'; provider='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products' },
+            [pscustomobject]@{ id='msi_user_products'; provider="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\$baselineIdentitySid\Products"; reg="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\$baselineIdentitySid\Products" }
+          )
+          $baselineInstallerTrees = [System.Collections.Generic.List[object]]::new()
+          foreach ($root in $installerTreeRoots) {
+            if (-not (Test-Path -LiteralPath $root.provider)) { continue }
+            foreach ($child in @(Get-ChildItem -LiteralPath $root.provider -ErrorAction Stop)) {
+              [void]$baselineInstallerTrees.Add([pscustomobject]@{ root_id=$root.id; child=[string]$child.PSChildName })
+            }
+          }
+          ConvertTo-Json -InputObject @($baselineInstallerTrees) -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installer-registry-trees.json') -Encoding UTF8
+          $installerCache = Join-Path $env:WINDIR 'Installer'
+          $baselineInstallerCacheFiles = @()
+          if (Test-Path -LiteralPath $installerCache -PathType Container) {
+            $baselineInstallerCacheFiles = @(Get-ChildItem -LiteralPath $installerCache -File -Recurse -Force -ErrorAction Stop | ForEach-Object { $_.FullName.Substring($installerCache.Length).TrimStart('\\') } | Sort-Object -Unique)
+          }
+          ConvertTo-Json -InputObject @($baselineInstallerCacheFiles) -Depth 3 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installer-cache-files.json') -Encoding UTF8
+
           function Get-StartupEntryInventory {
             $entries = [System.Collections.Generic.List[object]]::new()
             foreach ($path in @(
@@ -275,20 +343,46 @@ jobs:
           # Managed backup boundary:
           # - portable/no-install files belong under the user profile and are preserved by the profile snapshot;
           # - installed software is discovered only from explicit install evidence and baseline deltas.
-          $baselineServices = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
-            [pscustomobject]@{ name=[string]$_.Name; path=[string]$_.PathName; start_mode=[string]$_.StartMode; start_name=[string]$_.StartName; display_name=[string]$_.DisplayName }
-          })
+          function Get-RegistryServiceInventory {
+            param([Parameter(Mandatory=$true)][ValidateSet('service','driver')][string]$Kind)
+            $items = [System.Collections.Generic.List[object]]::new()
+            $servicesRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+            foreach ($key in @(Get-ChildItem -LiteralPath $servicesRoot -ErrorAction Stop)) {
+              $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+              $type = if ($null -eq $props.Type) { 0 } else { [int64]$props.Type }
+              if ($Kind -eq 'service') {
+                if (($type -band 0x30) -eq 0) { continue }
+              } else {
+                if (($type -band 0x3) -eq 0) { continue }
+              }
+              $start = if ($null -eq $props.Start) { -1 } else { [int]$props.Start }
+              $startMode = switch ($start) { 0 {'Boot'} 1 {'System'} 2 {'Auto'} 3 {'Manual'} 4 {'Disabled'} default {'Unknown'} }
+              [void]$items.Add([pscustomobject]@{
+                name=[string]$key.PSChildName; path=[string]$props.ImagePath; start_mode=$startMode;
+                start=[int]$start; start_name=[string]$props.ObjectName; display_name=[string]$props.DisplayName;
+                type=[int64]$type; error_control=if ($null -eq $props.ErrorControl) { -1 } else { [int]$props.ErrorControl }
+              })
+            }
+            return @($items | Sort-Object name -Unique)
+          }
+          $baselineServices = @(Get-RegistryServiceInventory -Kind service)
+          if ($baselineServices.Count -lt 100) { throw "Service registry inventory sanity check failed: count=$($baselineServices.Count)" }
           ConvertTo-Json -InputObject $baselineServices -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'services.json') -Encoding UTF8
 
-          $baselineDrivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | ForEach-Object {
-            [pscustomobject]@{ name=[string]$_.Name; display_name=[string]$_.DisplayName; path=[string]$_.PathName; start_mode=[string]$_.StartMode; state=[string]$_.State }
-          })
+          $baselineDrivers = @(Get-RegistryServiceInventory -Kind driver)
+          if ($baselineDrivers.Count -lt 100) { throw "Driver registry inventory sanity check failed: count=$($baselineDrivers.Count)" }
           ConvertTo-Json -InputObject $baselineDrivers -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'drivers.json') -Encoding UTF8
+          $pnputilBaselineDevices = (& pnputil.exe /enum-devices 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "pnputil baseline device inventory failed exit=$LASTEXITCODE" }
+          $baselinePnpIds = @([regex]::Matches($pnputilBaselineDevices, '(?im)^\s*Instance ID\s*:\s*(.+?)\s*$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Sort-Object -Unique)
+          if ($baselinePnpIds.Count -lt 20) { throw "PnP baseline inventory sanity check failed: count=$($baselinePnpIds.Count)" }
+          $baselinePnpIds | Set-Content -LiteralPath (Join-Path $baselineRoot 'pnp-device-ids.txt') -Encoding UTF8
           try {
             $pnputilBaseline = (& pnputil.exe /enum-drivers 2>$null) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "pnputil baseline driver package inventory failed exit=$LASTEXITCODE" }
             $baselineOemInf = @([regex]::Matches($pnputilBaseline, '(?im)^\s*Published Name\s*:\s*(oem\d+\.inf)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Sort-Object -Unique)
             $baselineOemInf | Set-Content -LiteralPath (Join-Path $baselineRoot 'driver-packages.txt') -Encoding UTF8
-          } catch { }
+          } catch { throw "Driver package baseline inventory failed: $($_.Exception.Message)" }
 
           @{ captured_at=[DateTime]::UtcNow.ToString('o'); installed_apps=@($baselineApps).Count; services=@($baselineServices).Count; drivers=@($baselineDrivers).Count } |
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baselineRoot 'baseline.json') -Encoding UTF8
@@ -371,6 +465,79 @@ jobs:
             throw 'RDP TCP/3389 listener did not become ready before account rename'
           }
           Write-Host 'RDP_PRE_RENAME_READY=3389'
+
+      - name: Finalize installer-state baseline after platform init
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baselineRoot = Join-Path $env:RUNNER_TEMP 'managed-software-baseline'
+          if (-not (Test-Path -LiteralPath $baselineRoot)) { throw 'Managed software baseline directory is missing' }
+
+          function Get-RegistryServiceInventory {
+            param([Parameter(Mandatory=$true)][ValidateSet('service','driver')][string]$Kind)
+            $items = [System.Collections.Generic.List[object]]::new()
+            foreach ($key in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction Stop)) {
+              $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+              $type = if ($null -eq $props.Type) { 0 } else { [int64]$props.Type }
+              if ($Kind -eq 'service') { if (($type -band 0x30) -eq 0) { continue } }
+              else { if (($type -band 0x3) -eq 0) { continue } }
+              $start = if ($null -eq $props.Start) { -1 } else { [int]$props.Start }
+              $startMode = switch ($start) { 0 {'Boot'} 1 {'System'} 2 {'Auto'} 3 {'Manual'} 4 {'Disabled'} default {'Unknown'} }
+              [void]$items.Add([pscustomobject]@{
+                name=[string]$key.PSChildName; path=[string]$props.ImagePath; start_mode=$startMode;
+                start=[int]$start; start_name=[string]$props.ObjectName; display_name=[string]$props.DisplayName;
+                type=[int64]$type; error_control=if ($null -eq $props.ErrorControl) { 1 } else { [int]$props.ErrorControl }
+              })
+            }
+            return @($items | Sort-Object name -Unique)
+          }
+          $baselineServices = @(Get-RegistryServiceInventory -Kind service)
+          $baselineDrivers = @(Get-RegistryServiceInventory -Kind driver)
+          if ($baselineServices.Count -lt 100 -or $baselineDrivers.Count -lt 100) { throw "Final machine baseline sanity failure services=$($baselineServices.Count) drivers=$($baselineDrivers.Count)" }
+          ConvertTo-Json -InputObject $baselineServices -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'services.json') -Encoding UTF8
+          ConvertTo-Json -InputObject $baselineDrivers -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'drivers.json') -Encoding UTF8
+
+          $pnpText = (& pnputil.exe /enum-devices 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "Final PnP baseline failed exit=$LASTEXITCODE" }
+          $pnpIds = @([regex]::Matches($pnpText, '(?im)^\s*Instance ID\s*:\s*(.+?)\s*$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Sort-Object -Unique)
+          if ($pnpIds.Count -lt 20) { throw "Final PnP baseline sanity failure count=$($pnpIds.Count)" }
+          $pnpIds | Set-Content -LiteralPath (Join-Path $baselineRoot 'pnp-device-ids.txt') -Encoding UTF8
+          $driverText = (& pnputil.exe /enum-drivers 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "Final driver-package baseline failed exit=$LASTEXITCODE" }
+          @([regex]::Matches($driverText, '(?im)^\s*Published Name\s*:\s*(oem\d+\.inf)\s*$') | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Sort-Object -Unique) |
+            Set-Content -LiteralPath (Join-Path $baselineRoot 'driver-packages.txt') -Encoding UTF8
+
+          function Get-RegistryValueInventory {
+            param([Parameter(Mandatory=$true)][string]$Path)
+            $result = [System.Collections.Generic.List[object]]::new()
+            if (-not (Test-Path -LiteralPath $Path)) { return @() }
+            $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+            foreach ($name in $key.GetValueNames()) {
+              if ([string]::IsNullOrWhiteSpace($name)) { continue }
+              $kind = $key.GetValueKind($name).ToString()
+              $raw = $key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              $entry = [ordered]@{ path=$Path; name=$name; kind=$kind; value=$null; value_b64=''; value_multi=@() }
+              if ($raw -is [byte[]]) { $entry.value_b64 = [Convert]::ToBase64String($raw) }
+              elseif ($raw -is [string[]]) { $entry.value_multi = @($raw) }
+              else { $entry.value = $raw }
+              [void]$result.Add([pscustomobject]$entry)
+            }
+            return @($result)
+          }
+          $valueRoots = @(
+            'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+            'HKCU:\Environment',
+            'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules',
+            'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules',
+            'HKLM:\SOFTWARE\RegisteredApplications',
+            'HKCU:\SOFTWARE\RegisteredApplications',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved'
+          )
+          $values = [System.Collections.Generic.List[object]]::new()
+          foreach ($root in $valueRoots) { foreach ($entry in @(Get-RegistryValueInventory -Path $root)) { [void]$values.Add($entry) } }
+          ConvertTo-Json -InputObject @($values) -Depth 8 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installer-registry-values.json') -Encoding UTF8
+          Write-Host "MANAGED_WINDOWS_INSTALLER_BASELINE_FINAL services=$($baselineServices.Count) drivers=$($baselineDrivers.Count) pnp=$($pnpIds.Count) values=$($values.Count)"
 
       - name: Restore latest Windows user backup
         if: ${{ inputs.mode == 'restore' }}
@@ -738,14 +905,105 @@ jobs:
             }
           }
 
+          # Restore generic installer-state deltas before driver/service activation.
+          $installerCacheRestored = 0
+          $installerCacheManifestPath = Join-Path $stateRoot 'installer-cache.json'
+          if (Test-Path -LiteralPath $installerCacheManifestPath) {
+            $liveInstallerCache = Join-Path $env:WINDIR 'Installer'
+            New-Item -ItemType Directory -Path $liveInstallerCache -Force | Out-Null
+            foreach ($entry in @(Get-Content -LiteralPath $installerCacheManifestPath -Raw | ConvertFrom-Json)) {
+              $relative = ([string]$entry.relative).TrimStart('\')
+              if (-not $relative -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { throw "Unsafe installer cache relative path: $relative" }
+              $source = Join-Path (Join-Path $stateRoot 'installer-cache') $relative
+              if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Installer cache payload missing: $relative" }
+              $destination = Join-Path $liveInstallerCache $relative
+              New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+              Copy-Item -LiteralPath $source -Destination $destination -Force
+              $installerCacheRestored++
+            }
+          }
+
+          $installerTreesRestored = 0
+          $installerTreeManifestPath = Join-Path $stateRoot 'installer-registry-trees.json'
+          if (Test-Path -LiteralPath $installerTreeManifestPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $installerTreeManifestPath -Raw | ConvertFrom-Json)) {
+              $source = Join-Path (Join-Path $stateRoot 'installer-registry') ([string]$entry.file)
+              if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Installer registry payload missing: $($entry.file)" }
+              $importFile = $source
+              $tempFile = ''
+              if ($metadata.source_sid -and -not ([string]$metadata.source_sid).Equals($sid,[System.StringComparison]::OrdinalIgnoreCase)) {
+                $text = Get-Content -LiteralPath $source -Raw
+                if ($text.Contains([string]$metadata.source_sid)) {
+                  $text = $text.Replace([string]$metadata.source_sid,$sid)
+                  $tempFile = Join-Path $env:RUNNER_TEMP "installer-reg-$([guid]::NewGuid().ToString('N')).reg"
+                  Set-Content -LiteralPath $tempFile -Value $text -Encoding Unicode
+                  $importFile = $tempFile
+                }
+              }
+              try {
+                & reg.exe import $importFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "reg import exited $LASTEXITCODE" }
+                $installerTreesRestored++
+              } finally {
+                if ($tempFile) { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue }
+              }
+            }
+          }
+
+          $installerValuesRestored = 0
+          $installerValuesPath = Join-Path $stateRoot 'installer-registry-values.json'
+          if (Test-Path -LiteralPath $installerValuesPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $installerValuesPath -Raw | ConvertFrom-Json)) {
+              $path = [string]$entry.path
+              $name = [string]$entry.name
+              if (-not $path -or -not $name) { continue }
+              New-Item -Path $path -Force | Out-Null
+              $kind = [string]$entry.kind
+              switch ($kind) {
+                'Binary' { $value = [Convert]::FromBase64String([string]$entry.value_b64); $propertyType = 'Binary' }
+                'MultiString' { $value = [string[]]@($entry.value_multi); $propertyType = 'MultiString' }
+                'ExpandString' { $value = [string]$entry.value; $propertyType = 'ExpandString' }
+                'DWord' { $value = [int]$entry.value; $propertyType = 'DWord' }
+                'QWord' { $value = [long]$entry.value; $propertyType = 'QWord' }
+                default { $value = [string]$entry.value; $propertyType = 'String' }
+              }
+              New-ItemProperty -Path $path -Name $name -Value $value -PropertyType $propertyType -Force | Out-Null
+              $installerValuesRestored++
+            }
+          }
+          Write-Host "MANAGED_WINDOWS_INSTALLER_STATE_RESTORED cache=$installerCacheRestored registryTrees=$installerTreesRestored registryValues=$installerValuesRestored"
+
+          $softwareAclRestored = 0
+          $softwareAclManifestPath = Join-Path $stateRoot 'software-acl.json'
+          if (Test-Path -LiteralPath $softwareAclManifestPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $softwareAclManifestPath -Raw | ConvertFrom-Json)) {
+              $volume = ([string]$entry.volume).ToUpperInvariant()
+              $relative = ([string]$entry.relative).TrimStart('\')
+              if ($volume -notmatch '^[A-Z]:$' -or -not $relative) { throw "Invalid software ACL target volume=$volume relative=$relative" }
+              $volumeRootForAcl = "$volume\"
+              $aclFile = Join-Path (Join-Path $stateRoot 'software-acl') ([string]$entry.file)
+              if (-not (Test-Path -LiteralPath $aclFile -PathType Leaf)) { throw "Software ACL payload missing: $($entry.file)" }
+              $args = @($volumeRootForAcl,'/restore',$aclFile,'/c','/q')
+              if ($metadata.source_sid -and -not ([string]$metadata.source_sid).Equals($sid,[System.StringComparison]::OrdinalIgnoreCase)) {
+                $args += @('/substitute',[string]$metadata.source_sid,$sid)
+              }
+              & icacls.exe @args | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "icacls restore failed exit=$LASTEXITCODE volume=$volume" }
+              $softwareAclRestored++
+            }
+          }
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_ACL_RESTORED count=$softwareAclRestored"
+
           # Reinstall exported PnP driver packages before restoring explicit driver service
           # registrations. pnputil may assign a different oem*.inf name on the new runner;
           # that is expected and does not affect the original INF payload.
           $driverPackagesRestored = 0
           $driverPackagesFailed = 0
           $driverPackageManifestPath = Join-Path $stateRoot 'driver-packages.json'
+          $driverPackages = @()
           if (Test-Path -LiteralPath $driverPackageManifestPath) {
-            foreach ($package in @(Get-Content -LiteralPath $driverPackageManifestPath -Raw | ConvertFrom-Json)) {
+            $driverPackages = @(Get-Content -LiteralPath $driverPackageManifestPath -Raw | ConvertFrom-Json)
+            foreach ($package in $driverPackages) {
               $packageDir = Join-Path (Join-Path $stateRoot 'drivers\packages') ([string]$package.directory)
               $infFiles = @(Get-ChildItem -LiteralPath $packageDir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
               if (-not $infFiles.Count) { $driverPackagesFailed++; Write-Warning "Driver package backup has no INF: $($package.published_name)"; continue }
@@ -756,6 +1014,146 @@ jobs:
               }
               if ($packageOk) { $driverPackagesRestored++; Write-Host "MANAGED_WINDOWS_DRIVER_PACKAGE_RESTORED source=$($package.published_name)" }
               else { $driverPackagesFailed++; Write-Warning "Driver package restore failed: $($package.published_name)" }
+            }
+          }
+
+          # Restore installer-created PnP device instances after their driver packages are staged.
+          $pnpDevicesRestored = 0
+          $pnpDevicesFailed = 0
+          $pnpPending = [System.Collections.Generic.List[object]]::new()
+          $pnpManifestPath = Join-Path $stateRoot 'pnp-devices.json'
+          if (Test-Path -LiteralPath $pnpManifestPath) {
+            if (-not ('ManagedRootPnpInstaller' -as [type])) {
+              Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+
+          public static class ManagedRootPnpInstaller {
+              [StructLayout(LayoutKind.Sequential)]
+              public struct SP_DEVINFO_DATA {
+                  public int cbSize;
+                  public Guid ClassGuid;
+                  public int DevInst;
+                  public IntPtr Reserved;
+              }
+
+              [DllImport("setupapi.dll", SetLastError=true)]
+              private static extern IntPtr SetupDiCreateDeviceInfoList(ref Guid ClassGuid, IntPtr hwndParent);
+
+              [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+              private static extern bool SetupDiCreateDeviceInfo(
+                  IntPtr DeviceInfoSet, string DeviceName, ref Guid ClassGuid, string DeviceDescription,
+                  IntPtr hwndParent, uint CreationFlags, ref SP_DEVINFO_DATA DeviceInfoData);
+
+              [DllImport("setupapi.dll", SetLastError=true)]
+              private static extern bool SetupDiSetDeviceRegistryProperty(
+                  IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint Property,
+                  byte[] PropertyBuffer, uint PropertyBufferSize);
+
+              [DllImport("setupapi.dll", SetLastError=true)]
+              private static extern bool SetupDiCallClassInstaller(
+                  uint InstallFunction, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData);
+
+              [DllImport("setupapi.dll", SetLastError=true)]
+              private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+
+              [DllImport("newdev.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+              private static extern bool UpdateDriverForPlugAndPlayDevices(
+                  IntPtr hwndParent, string HardwareId, string FullInfPath, uint InstallFlags, out bool RebootRequired);
+
+              private static void ThrowLast(string stage) {
+                  throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), stage);
+              }
+
+              public static bool Install(string hardwareId, string deviceName, string description, string classGuidText, string infPath) {
+                  Guid classGuid = new Guid(classGuidText.Trim('{','}'));
+                  IntPtr set = SetupDiCreateDeviceInfoList(ref classGuid, IntPtr.Zero);
+                  if (set == new IntPtr(-1)) ThrowLast("SetupDiCreateDeviceInfoList");
+                  try {
+                      SP_DEVINFO_DATA data = new SP_DEVINFO_DATA();
+                      data.cbSize = Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
+                      const uint DICD_GENERATE_ID = 0x00000001;
+                      if (!SetupDiCreateDeviceInfo(set, deviceName, ref classGuid, description, IntPtr.Zero, DICD_GENERATE_ID, ref data))
+                          ThrowLast("SetupDiCreateDeviceInfo");
+                      const uint SPDRP_HARDWAREID = 0x00000001;
+                      byte[] hwid = Encoding.Unicode.GetBytes(hardwareId + "\0\0");
+                      if (!SetupDiSetDeviceRegistryProperty(set, ref data, SPDRP_HARDWAREID, hwid, (uint)hwid.Length))
+                          ThrowLast("SetupDiSetDeviceRegistryProperty");
+                      const uint DIF_REGISTERDEVICE = 0x00000019;
+                      if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, ref data))
+                          ThrowLast("SetupDiCallClassInstaller(DIF_REGISTERDEVICE)");
+                      bool reboot;
+                      const uint INSTALLFLAG_FORCE = 0x00000001;
+                      const uint INSTALLFLAG_NONINTERACTIVE = 0x00000004;
+                      if (!UpdateDriverForPlugAndPlayDevices(IntPtr.Zero, hardwareId, infPath, INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, out reboot))
+                          ThrowLast("UpdateDriverForPlugAndPlayDevices");
+                      return reboot;
+                  } finally {
+                      SetupDiDestroyDeviceInfoList(set);
+                  }
+              }
+          }
+          '@
+            }
+
+            function Test-ManagedPnpDevice {
+              param([Parameter(Mandatory=$true)][string]$HardwareId,[string]$ClassGuid,[switch]$RequireStarted)
+              $all = (& pnputil.exe /enum-devices 2>&1) -join "`n"
+              if ($LASTEXITCODE -ne 0) { throw "PnP verification inventory failed exit=$LASTEXITCODE" }
+              $ids = @([regex]::Matches($all, '(?im)^\s*Instance ID\s*:\s*(.+?)\s*$') | ForEach-Object { $_.Groups[1].Value.Trim() })
+              foreach ($id in $ids) {
+                $detail = (& pnputil.exe /enum-devices /instanceid $id /deviceids /drivers 2>&1) -join "`n"
+                if ($LASTEXITCODE -ne 0) { continue }
+                $hw = [regex]::Match($detail, '(?im)^\s*Hardware IDs\s*:\s*(.+?)\s*$')
+                if (-not $hw.Success -or -not $hw.Groups[1].Value.Trim().Equals($HardwareId,[System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                if ($ClassGuid) {
+                  $cg = [regex]::Match($detail, '(?im)^\s*Class GUID\s*:\s*(\{[0-9A-Fa-f-]+\})\s*$')
+                  if (-not $cg.Success -or -not $cg.Groups[1].Value.Trim().Equals($ClassGuid,[System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                }
+                if ($RequireStarted) {
+                  $st = [regex]::Match($detail, '(?im)^\s*Status\s*:\s*(.+?)\s*$')
+                  if (-not $st.Success -or -not $st.Groups[1].Value.Trim().Equals('Started',[System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                }
+                return $true
+              }
+              return $false
+            }
+
+            foreach ($device in @(Get-Content -LiteralPath $pnpManifestPath -Raw | ConvertFrom-Json)) {
+              try {
+                $hardwareId = [string]$device.hardware_id
+                $classGuid = [string]$device.class_guid
+                if ([string]::IsNullOrWhiteSpace($hardwareId)) { throw "PnP backup has no hardware ID for $($device.instance_id)" }
+                $requireStarted = ([string]$device.status).Equals('Started',[System.StringComparison]::OrdinalIgnoreCase)
+                if (-not (Test-ManagedPnpDevice -HardwareId $hardwareId -ClassGuid $classGuid -RequireStarted:$requireStarted)) {
+                  if ([string]$device.restore_strategy -eq 'root-setupapi') {
+                    $originalInf = [string]$device.original_inf
+                    $package = $driverPackages | Where-Object { $_.original_name -and ([string]$_.original_name).Equals($originalInf,[System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+                    if ($null -eq $package) { throw "No restored driver package matches original INF '$originalInf'" }
+                    $packageDir = Join-Path (Join-Path $stateRoot 'drivers\packages') ([string]$package.directory)
+                    $inf = Get-ChildItem -LiteralPath $packageDir -Filter $originalInf -Recurse -File -ErrorAction Stop | Select-Object -First 1
+                    if ($null -eq $inf) { throw "Restored INF payload is missing: $originalInf" }
+                    $description = if ([string]::IsNullOrWhiteSpace([string]$device.description)) { $hardwareId } else { [string]$device.description }
+                    $deviceName = if ([string]::IsNullOrWhiteSpace([string]$device.class_name)) { ($hardwareId -replace '^.*\\','') } else { [string]$device.class_name }
+                    $reboot = [ManagedRootPnpInstaller]::Install($hardwareId,$deviceName,$description,$classGuid,$inf.FullName)
+                    Write-Host "MANAGED_WINDOWS_PNP_ROOT_CREATED hardware=$hardwareId inf=$originalInf reboot=$reboot"
+                    & pnputil.exe /scan-devices | Out-Host
+                  } else {
+                    [void]$pnpPending.Add($device)
+                    Write-Host "MANAGED_WINDOWS_PNP_DEFERRED hardware=$hardwareId strategy=$($device.restore_strategy)"
+                    continue
+                  }
+                }
+                if (-not (Test-ManagedPnpDevice -HardwareId $hardwareId -ClassGuid $classGuid -RequireStarted:$requireStarted)) {
+                  throw "PnP device was not restored to expected state hardware=$hardwareId strategy=$($device.restore_strategy)"
+                }
+                $pnpDevicesRestored++
+                Write-Host "MANAGED_WINDOWS_PNP_RESTORED hardware=$hardwareId strategy=$($device.restore_strategy)"
+              } catch {
+                $pnpDevicesFailed++
+                Write-Warning "PnP device restore failed: $($_.Exception.Message)"
+              }
             }
           }
 
@@ -901,43 +1299,87 @@ jobs:
 
 
           $serviceDeltaRestored = 0
+          $serviceDeltaFailed = 0
           $serviceDeltaPath = Join-Path $stateRoot 'services-delta.json'
           if (Test-Path -LiteralPath $serviceDeltaPath) {
             foreach ($saved in @(Get-Content -LiteralPath $serviceDeltaPath -Raw | ConvertFrom-Json)) {
               $name = [string]$saved.name
               if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace([string]$saved.path)) { continue }
               try {
-                $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
-                if ($null -eq $existing) {
-                  $startValue = switch ([string]$saved.start_mode) {
-                    'Auto' { 'auto' }
-                    'Automatic' { 'auto' }
-                    'Disabled' { 'disabled' }
-                    default { 'demand' }
-                  }
-                  $createArgs = @('create', $name, "binPath= $([string]$saved.path)", "start= $startValue")
+                & sc.exe query $name 2>$null | Out-Null
+                $exists = ($LASTEXITCODE -eq 0)
+                $startValue = switch ([int]$saved.start) { 0 {'boot'} 1 {'system'} 2 {'auto'} 4 {'disabled'} default {'demand'} }
+                $errorValue = switch ([int]$saved.error_control) { 0 {'ignore'} 2 {'severe'} 3 {'critical'} default {'normal'} }
+                $typeValue = if (([int64]$saved.type -band 0x20) -ne 0) { 'share' } else { 'own' }
+                $startName = [string]$saved.start_name
+                $safeObjectName = ''
+                if ([string]::IsNullOrWhiteSpace($startName) -or $startName -in @('LocalSystem','NT AUTHORITY\LocalSystem')) { $safeObjectName = 'LocalSystem' }
+                elseif ($startName -match '^(?i)NT AUTHORITY\\(LocalService|NetworkService)$' -or $startName -match '^(?i)NT SERVICE\\') { $safeObjectName = $startName }
+                else { $safeObjectName = 'LocalSystem'; Write-Warning "Service $name uses credentialed account '$startName'; no password is stored, restoring service account as LocalSystem." }
+
+                if (-not $exists) {
+                  $createArgs = @('create', $name, "binPath= $([string]$saved.path)", "start= $startValue", "type= $typeValue", "error= $errorValue")
                   if ($saved.display_name) { $createArgs += "DisplayName= $([string]$saved.display_name)" }
-                  $startName = [string]$saved.start_name
-                  if ($startName -and $startName -notin @('LocalSystem','NT AUTHORITY\LocalSystem')) {
-                    if ($startName -match '^(?i)NT AUTHORITY\\(LocalService|NetworkService)$' -or $startName -match '^(?i)NT SERVICE\\') {
-                      $createArgs += "obj= $startName"
-                    } else {
-                      Write-Warning "Service $name uses a credentialed account '$startName'; restoring as LocalSystem because no service password is stored."
-                    }
-                  }
+                  if ($safeObjectName) { $createArgs += "obj= $safeObjectName" }
+                  if (@($saved.depend_on_service).Count) { $createArgs += "depend= $(@($saved.depend_on_service) -join '/')" }
                   & sc.exe @createArgs | Out-Host
                   if ($LASTEXITCODE -ne 0) { throw "sc create exited $LASTEXITCODE" }
-                  $existing = Get-Service -Name $name -ErrorAction Stop
-                  Write-Host "MANAGED_WINDOWS_SERVICE_CREATED name=$name start=$startValue"
+                  Write-Host "MANAGED_WINDOWS_SERVICE_CREATED name=$name start=$startValue type=$typeValue"
                 }
-                if ([string]$saved.start_mode -in @('Auto','Automatic')) { Set-Service -Name $name -StartupType Automatic }
-                elseif ([string]$saved.start_mode -eq 'Disabled') { Set-Service -Name $name -StartupType Disabled }
-                else { Set-Service -Name $name -StartupType Manual }
-                if ([string]$saved.state -eq 'Running') { Start-Service -Name $name -ErrorAction SilentlyContinue }
+
+                # Reapply the complete installer-created registry subtree (FailureActions,
+                # RequiredPrivileges, delayed start, service SID metadata, parameters, etc.).
+                if ($saved.registry_file) {
+                  $regFile = Join-Path (Join-Path $stateRoot 'services') ([string]$saved.registry_file)
+                  if (-not (Test-Path -LiteralPath $regFile -PathType Leaf)) { throw "Service registry payload is missing: $regFile" }
+                  & reg.exe import $regFile | Out-Null
+                  if ($LASTEXITCODE -ne 0) { throw "service registry import exited $LASTEXITCODE" }
+                }
+
+                # Explicit sc config keeps SCM's live configuration synchronized with imported registry data.
+                $configArgs = @('config', $name, "binPath= $([string]$saved.path)", "start= $startValue", "type= $typeValue", "error= $errorValue")
+                if ($saved.display_name) { $configArgs += "DisplayName= $([string]$saved.display_name)" }
+                if ($safeObjectName) { $configArgs += "obj= $safeObjectName" }
+                if (@($saved.depend_on_service).Count) { $configArgs += "depend= $(@($saved.depend_on_service) -join '/')" }
+                & sc.exe @configArgs | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "sc config exited $LASTEXITCODE" }
+
+                if ($saved.sddl) {
+                  $serviceSddl = [string]$saved.sddl
+                  if ($metadata.source_sid) { $serviceSddl = $serviceSddl.Replace([string]$metadata.source_sid,$sid) }
+                  & sc.exe sdset $name $serviceSddl | Out-Null
+                  if ($LASTEXITCODE -ne 0) { throw "sc sdset exited $LASTEXITCODE" }
+                }
+                if ([string]$saved.state -eq 'Running') {
+                  & sc.exe start $name 2>$null | Out-Null
+                  Start-Sleep -Milliseconds 500
+                  $query = (& sc.exe query $name 2>&1) -join "`n"
+                  if ($query -notmatch '(?im)^\s*STATE\s*:\s*4\s+RUNNING\b') { throw 'service did not reach RUNNING state' }
+                }
                 $serviceDeltaRestored++
-              } catch { Write-Warning "service delta restore failed for ${name}: $($_.Exception.Message)" }
+                Write-Host "MANAGED_WINDOWS_SERVICE_RESTORED name=$name state=$($saved.state)"
+              } catch {
+                $serviceDeltaFailed++
+                Write-Warning "service delta restore failed for ${name}: $($_.Exception.Message)"
+              }
             }
           }
+          if ($pnpPending.Count -gt 0) {
+            & pnputil.exe /scan-devices | Out-Host
+            foreach ($device in $pnpPending) {
+              $hardwareId = [string]$device.hardware_id
+              $classGuid = [string]$device.class_guid
+              $requireStarted = ([string]$device.status).Equals('Started',[System.StringComparison]::OrdinalIgnoreCase)
+              if (Test-ManagedPnpDevice -HardwareId $hardwareId -ClassGuid $classGuid -RequireStarted:$requireStarted) {
+                $pnpDevicesRestored++
+                Write-Host "MANAGED_WINDOWS_PNP_LATE_RESTORED hardware=$hardwareId strategy=$($device.restore_strategy)"
+              } else {
+                $pnpDevicesFailed++
+                Write-Warning "PnP device did not materialize after complete installer-state restore hardware=$hardwareId strategy=$($device.restore_strategy)"
+              }
+            }
+          }
+
           if ($version -ge 9) {
             $expectedAppRegistry = if ($null -eq $metadata.app_registry_count) { 0 } else { [int]$metadata.app_registry_count }
             $expectedStartup = if ($null -eq $metadata.machine_startup_count) { 0 } else { [int]$metadata.machine_startup_count }
@@ -945,15 +1387,29 @@ jobs:
             $expectedCommonStartup = if ($null -eq $metadata.common_startup_count) { 0 } else { [int]$metadata.common_startup_count }
             $expectedDrivers = if ($null -eq $metadata.driver_delta_count) { 0 } else { [int]$metadata.driver_delta_count }
             $expectedDriverPackages = if ($null -eq $metadata.driver_package_delta_count) { 0 } else { [int]$metadata.driver_package_delta_count }
-            if ($appRegistryRestored -lt $expectedAppRegistry) { throw "V9 app registry restore incomplete expected=$expectedAppRegistry actual=$appRegistryRestored" }
-            if ($startupRestored -lt $expectedStartup) { throw "V9 startup restore incomplete expected=$expectedStartup actual=$startupRestored" }
-            if ($startupApprovedRestored -lt $expectedStartupApproved) { throw "V9 StartupApproved restore incomplete expected=$expectedStartupApproved actual=$startupApprovedRestored" }
-            if ($commonStartupRestored -lt $expectedCommonStartup) { throw "V9 common Startup restore incomplete expected=$expectedCommonStartup actual=$commonStartupRestored" }
-            if ($driversRestored -lt $expectedDrivers -or $driversFailed -gt 0) { throw "V9 driver restore incomplete expected=$expectedDrivers actual=$driversRestored failed=$driversFailed" }
-            if ($driverPackagesRestored -lt $expectedDriverPackages -or $driverPackagesFailed -gt 0) { throw "V9 driver package restore incomplete expected=$expectedDriverPackages actual=$driverPackagesRestored failed=$driverPackagesFailed" }
+            if ($appRegistryRestored -lt $expectedAppRegistry) { throw "V$version app registry restore incomplete expected=$expectedAppRegistry actual=$appRegistryRestored" }
+            if ($startupRestored -lt $expectedStartup) { throw "V$version startup restore incomplete expected=$expectedStartup actual=$startupRestored" }
+            if ($startupApprovedRestored -lt $expectedStartupApproved) { throw "V$version StartupApproved restore incomplete expected=$expectedStartupApproved actual=$startupApprovedRestored" }
+            if ($commonStartupRestored -lt $expectedCommonStartup) { throw "V$version common Startup restore incomplete expected=$expectedCommonStartup actual=$commonStartupRestored" }
+            if ($driversRestored -lt $expectedDrivers -or $driversFailed -gt 0) { throw "V$version driver restore incomplete expected=$expectedDrivers actual=$driversRestored failed=$driversFailed" }
+            if ($driverPackagesRestored -lt $expectedDriverPackages -or $driverPackagesFailed -gt 0) { throw "V$version driver package restore incomplete expected=$expectedDriverPackages actual=$driverPackagesRestored failed=$driverPackagesFailed" }
+          }
+          if ($version -ge 11) {
+            $expectedServices = if ($null -eq $metadata.software_service_delta_count) { 0 } else { [int]$metadata.software_service_delta_count }
+            $expectedPnpDevices = if ($null -eq $metadata.pnp_device_delta_count) { 0 } else { [int]$metadata.pnp_device_delta_count }
+            $expectedSoftwareAcl = if ($null -eq $metadata.software_acl_count) { 0 } else { [int]$metadata.software_acl_count }
+            $expectedInstallerValues = if ($null -eq $metadata.installer_registry_value_delta_count) { 0 } else { [int]$metadata.installer_registry_value_delta_count }
+            $expectedInstallerTrees = if ($null -eq $metadata.installer_registry_tree_delta_count) { 0 } else { [int]$metadata.installer_registry_tree_delta_count }
+            $expectedInstallerCache = if ($null -eq $metadata.installer_cache_delta_count) { 0 } else { [int]$metadata.installer_cache_delta_count }
+            if ($serviceDeltaRestored -lt $expectedServices -or $serviceDeltaFailed -gt 0) { throw "V11 service restore incomplete expected=$expectedServices actual=$serviceDeltaRestored failed=$serviceDeltaFailed" }
+            if ($pnpDevicesRestored -lt $expectedPnpDevices -or $pnpDevicesFailed -gt 0) { throw "V11 PnP restore incomplete expected=$expectedPnpDevices actual=$pnpDevicesRestored failed=$pnpDevicesFailed" }
+            if ($softwareAclRestored -lt $expectedSoftwareAcl) { throw "V11 software ACL restore incomplete expected=$expectedSoftwareAcl actual=$softwareAclRestored" }
+            if ($installerValuesRestored -lt $expectedInstallerValues) { throw "V11 installer registry-value restore incomplete expected=$expectedInstallerValues actual=$installerValuesRestored" }
+            if ($installerTreesRestored -lt $expectedInstallerTrees) { throw "V11 installer registry-tree restore incomplete expected=$expectedInstallerTrees actual=$installerTreesRestored" }
+            if ($installerCacheRestored -lt $expectedInstallerCache) { throw "V11 installer cache restore incomplete expected=$expectedInstallerCache actual=$installerCacheRestored" }
           }
           Write-ManagedRdpProbe -Stage 'step11-end'
-          Write-Host "MANAGED_WINDOWS_STATE_V9_RESTORED registry=$registryRestored appRegistry=$appRegistryRestored uninstallRegistry=$uninstallRegistryRestored startup=$startupRestored startupApproved=$startupApprovedRestored commonStartup=$commonStartupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored drivers=$driversRestored driverFailed=$driversFailed driverPackages=$driverPackagesRestored driverPackageFailed=$driverPackagesFailed softwarePackagesFailed=$softwareFailed"
+          Write-Host "MANAGED_WINDOWS_STATE_RESTORED version=$version registry=$registryRestored appRegistry=$appRegistryRestored uninstallRegistry=$uninstallRegistryRestored installerValues=$installerValuesRestored installerTrees=$installerTreesRestored installerCache=$installerCacheRestored softwareAcl=$softwareAclRestored startup=$startupRestored startupApproved=$startupApprovedRestored commonStartup=$commonStartupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored serviceFailed=$serviceDeltaFailed drivers=$driversRestored driverFailed=$driversFailed driverPackages=$driverPackagesRestored driverPackageFailed=$driverPackagesFailed pnpDevices=$pnpDevicesRestored pnpFailed=$pnpDevicesFailed softwarePackagesFailed=$softwareFailed"
 
       - name: Verify restored Windows application delta
         if: ${{ inputs.mode == 'restore' }}
@@ -1880,7 +2336,7 @@ jobs:
 
             # Fallback for installers that register an app but omit usable install paths.
             # Compare shallow Program Files topology against the pristine runner baseline;
-            # this catches new vendor/app directories such as Program Files\Netease\GameViewer
+            # this catches vendor/application directories created after the pristine runner baseline
             # without scanning or backing up the whole system drive.
             if (@($appDelta).Count -gt 0) {
               $baselineProgramDirSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -2025,23 +2481,62 @@ jobs:
 
             ConvertTo-Json -InputObject @($appPayloadEvidence) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-payload-evidence.json') -Encoding UTF8
 
-            $baselineServiceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $baselineServicesPath = Join-Path $baselineRoot 'services.json'
-            if (Test-Path -LiteralPath $baselineServicesPath) {
-              foreach ($service in @(Get-Content -LiteralPath $baselineServicesPath -Raw | ConvertFrom-Json)) {
-                if ($service.name) { [void]$baselineServiceNames.Add([string]$service.name) }
+            function Get-RegistryServiceInventory {
+              param([Parameter(Mandatory=$true)][ValidateSet('service','driver')][string]$Kind)
+              $items = [System.Collections.Generic.List[object]]::new()
+              foreach ($key in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction Stop)) {
+                $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+                $type = if ($null -eq $props.Type) { 0 } else { [int64]$props.Type }
+                if ($Kind -eq 'service') { if (($type -band 0x30) -eq 0) { continue } }
+                else { if (($type -band 0x3) -eq 0) { continue } }
+                $start = if ($null -eq $props.Start) { -1 } else { [int]$props.Start }
+                $startMode = switch ($start) { 0 {'Boot'} 1 {'System'} 2 {'Auto'} 3 {'Manual'} 4 {'Disabled'} default {'Unknown'} }
+                [void]$items.Add([pscustomobject]@{
+                  name=[string]$key.PSChildName; path=[string]$props.ImagePath; display_name=[string]$props.DisplayName;
+                  start=[int]$start; start_mode=$startMode; start_name=[string]$props.ObjectName; type=[int64]$type;
+                  error_control=if ($null -eq $props.ErrorControl) { 1 } else { [int]$props.ErrorControl };
+                  depend_on_service=@($props.DependOnService); delayed_auto_start=if ($null -eq $props.DelayedAutoStart) { 0 } else { [int]$props.DelayedAutoStart }
+                })
               }
+              return @($items | Sort-Object name -Unique)
             }
-            $serviceDelta = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
-              $_.Name -and -not $baselineServiceNames.Contains([string]$_.Name) -and $_.PathName -and $_.PathName -notmatch '(?i)\\Windows\\(System32|SysWOW64)'
-            } | ForEach-Object {
-              $exe = Resolve-CommandExecutablePath -Value ([string]$_.PathName)
-              if ($exe) {
-                try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($exe)) -Reason "service-command:$($_.Name)" } catch { }
-              }
-              [pscustomobject]@{ name=[string]$_.Name; display_name=[string]$_.DisplayName; path=[string]$_.PathName; start_mode=[string]$_.StartMode; start_name=[string]$_.StartName; state=[string]$_.State }
-            })
-            ConvertTo-Json -InputObject $serviceDelta -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'services-delta.json') -Encoding UTF8
+
+            $baselineServicesPath = Join-Path $baselineRoot 'services.json'
+            if (-not (Test-Path -LiteralPath $baselineServicesPath)) { throw 'Baseline service inventory is missing' }
+            $baselineServicesSaved = @(Get-Content -LiteralPath $baselineServicesPath -Raw | ConvertFrom-Json)
+            if ($baselineServicesSaved.Count -lt 100) { throw "Baseline service inventory is invalid: count=$($baselineServicesSaved.Count)" }
+            $baselineServiceNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($service in $baselineServicesSaved) { if ($service.name) { [void]$baselineServiceNames.Add([string]$service.name) } }
+
+            $currentServices = @(Get-RegistryServiceInventory -Kind service)
+            if ($currentServices.Count -lt [math]::Floor($baselineServicesSaved.Count * 0.7)) {
+              throw "Current service inventory failed sanity check baseline=$($baselineServicesSaved.Count) current=$($currentServices.Count)"
+            }
+            $serviceStateRoot = Join-Path $stateRoot 'services'
+            New-Item -ItemType Directory -Path $serviceStateRoot -Force | Out-Null
+            $serviceDelta = [System.Collections.Generic.List[object]]::new()
+            $serviceIndex = 0
+            foreach ($service in @($currentServices | Where-Object { $_.name -and -not $baselineServiceNames.Contains([string]$_.name) })) {
+              if (-not $service.path -or [string]$service.path -match '(?i)\\Windows\\(System32|SysWOW64)') { continue }
+              $serviceIndex++
+              $exe = Resolve-CommandExecutablePath -Value ([string]$service.path)
+              if ($exe) { try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($exe)) -Reason "service-command:$($service.name)" } catch { } }
+              $regFile = ('service-{0:D4}.reg' -f $serviceIndex)
+              $regPath = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$([string]$service.name)"
+              & reg.exe export $regPath (Join-Path $serviceStateRoot $regFile) /y | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "Service registry export failed: $($service.name)" }
+              $queryText = (& sc.exe query ([string]$service.name) 2>&1) -join "`n"
+              $state = if ($queryText -match '(?im)^\s*STATE\s*:\s*4\s+RUNNING\b') { 'Running' } else { 'Stopped' }
+              $sdLines = @(& sc.exe sdshow ([string]$service.name) 2>$null | Where-Object { $_ -and $_ -notmatch '^\[SC\]' })
+              $sddl = if ($sdLines.Count) { ([string]$sdLines[-1]).Trim() } else { '' }
+              [void]$serviceDelta.Add([pscustomobject]@{
+                name=$service.name; display_name=$service.display_name; path=$service.path; start=$service.start;
+                start_mode=$service.start_mode; start_name=$service.start_name; type=$service.type; error_control=$service.error_control;
+                depend_on_service=@($service.depend_on_service); delayed_auto_start=$service.delayed_auto_start;
+                state=$state; registry_file=$regFile; sddl=$sddl
+              })
+            }
+            ConvertTo-Json -InputObject @($serviceDelta) -Depth 8 | Set-Content -LiteralPath (Join-Path $stateRoot 'services-delta.json') -Encoding UTF8
 
             # Collapse nested paths on the same volume. Discovery is bounded to explicit
             # install/service evidence plus shallow Program Files deltas and registry-identity matches.
@@ -2058,6 +2553,31 @@ jobs:
               if (-not $nested) { [void]$softwareRoots.Add($candidate) }
             }
             ConvertTo-Json -InputObject @($softwareRoots) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'software-roots.json') -Encoding UTF8
+
+            # Preserve installer-assigned DACLs for discovered software roots. icacls /save stores
+            # portable SID-based descriptors; restore substitutes the old managed-user SID with the new runner SID.
+            $softwareAclRoot = Join-Path $stateRoot 'software-acl'
+            New-Item -ItemType Directory -Path $softwareAclRoot -Force | Out-Null
+            $softwareAclManifest = [System.Collections.Generic.List[object]]::new()
+            $softwareAclIndex = 0
+            foreach ($softwareRoot in $softwareRoots) {
+              $softwareAclIndex++
+              $volume = ([string]$softwareRoot.volume).ToUpperInvariant()
+              $relative = ([string]$softwareRoot.relative).TrimStart('\')
+              if ($volume -notmatch '^[A-Z]:$' -or -not $relative) { continue }
+              $volumeRootForAcl = "$volume\"
+              $liveRootForAcl = Join-Path $volumeRootForAcl $relative
+              if (-not (Test-Path -LiteralPath $liveRootForAcl)) { continue }
+              $aclFile = ('software-acl-{0:D4}.txt' -f $softwareAclIndex)
+              $aclDestination = Join-Path $softwareAclRoot $aclFile
+              Push-Location $volumeRootForAcl
+              try {
+                & icacls.exe $relative /save $aclDestination /t /c /q | Out-Null
+                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $aclDestination)) { throw "icacls save failed exit=$LASTEXITCODE root=$liveRootForAcl" }
+              } finally { Pop-Location }
+              [void]$softwareAclManifest.Add([pscustomobject]@{ volume=$volume; relative=$relative; file=$aclFile })
+            }
+            ConvertTo-Json -InputObject @($softwareAclManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'software-acl.json') -Encoding UTF8
 
             # Preserve uninstall registration for apps that did not exist in the pristine runner.
             $uninstallRegistryManifest = [System.Collections.Generic.List[object]]::new()
@@ -2128,10 +2648,122 @@ jobs:
             }
             ConvertTo-Json -InputObject @($appRegistryManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-registry.json') -Encoding UTF8
 
+            # Generic installer registry/value deltas: environment variables, firewall rules,
+            # COM/Classes/ProgID/TypeLib/AppID and MSI product registration created after baseline.
+            function Get-RegistryValueInventory {
+              param([Parameter(Mandatory=$true)][string]$Path)
+              $result = [System.Collections.Generic.List[object]]::new()
+              if (-not (Test-Path -LiteralPath $Path)) { return @() }
+              $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+              foreach ($name in $key.GetValueNames()) {
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                $kind = $key.GetValueKind($name).ToString()
+                $raw = $key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $entry = [ordered]@{ path=$Path; name=$name; kind=$kind; value=$null; value_b64=''; value_multi=@() }
+                if ($raw -is [byte[]]) { $entry.value_b64 = [Convert]::ToBase64String($raw) }
+                elseif ($raw -is [string[]]) { $entry.value_multi = @($raw) }
+                else { $entry.value = $raw }
+                [void]$result.Add([pscustomobject]$entry)
+              }
+              return @($result)
+            }
+            $installerValueRoots = @(
+              'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+              'HKCU:\Environment',
+              'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules',
+              'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules',
+            'HKLM:\SOFTWARE\RegisteredApplications',
+            'HKCU:\SOFTWARE\RegisteredApplications',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved'
+            )
+            $baselineInstallerValueMap = @{}
+            $baselineInstallerValuesPath = Join-Path $baselineRoot 'installer-registry-values.json'
+            if (Test-Path -LiteralPath $baselineInstallerValuesPath) {
+              foreach ($entry in @(Get-Content -LiteralPath $baselineInstallerValuesPath -Raw | ConvertFrom-Json)) {
+                $k = "$([string]$entry.path)|$([string]$entry.name)".ToLowerInvariant()
+                $baselineInstallerValueMap[$k] = ($entry | ConvertTo-Json -Compress -Depth 8)
+              }
+            }
+            $installerValueDelta = [System.Collections.Generic.List[object]]::new()
+            foreach ($root in $installerValueRoots) {
+              foreach ($entry in @(Get-RegistryValueInventory -Path $root)) {
+                $k = "$([string]$entry.path)|$([string]$entry.name)".ToLowerInvariant()
+                $nowJson = ($entry | ConvertTo-Json -Compress -Depth 8)
+                if (-not $baselineInstallerValueMap.ContainsKey($k) -or $baselineInstallerValueMap[$k] -ne $nowJson) { [void]$installerValueDelta.Add($entry) }
+              }
+            }
+            ConvertTo-Json -InputObject @($installerValueDelta) -Depth 8 | Set-Content -LiteralPath (Join-Path $stateRoot 'installer-registry-values.json') -Encoding UTF8
+
+            $installerRegistryRoot = Join-Path $stateRoot 'installer-registry'
+            $installerCacheBackupRoot = Join-Path $stateRoot 'installer-cache'
+            New-Item -ItemType Directory -Path $installerRegistryRoot -Force | Out-Null
+            New-Item -ItemType Directory -Path $installerCacheBackupRoot -Force | Out-Null
+            $installerTreeRoots = @(
+              [pscustomobject]@{ id='hklm_classes'; provider='HKLM:\SOFTWARE\Classes'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes' },
+            [pscustomobject]@{ id='hklm_app_paths'; provider='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths' },
+            [pscustomobject]@{ id='hkcu_app_paths'; provider='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths'; reg='HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths' },
+            [pscustomobject]@{ id='hklm_shell_overlays'; provider='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers' },
+            [pscustomobject]@{ id='hkcu_shell_overlays'; provider='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'; reg='HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers' },
+              [pscustomobject]@{ id='hklm_clsid'; provider='HKLM:\SOFTWARE\Classes\CLSID'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID' },
+              [pscustomobject]@{ id='hklm_appid'; provider='HKLM:\SOFTWARE\Classes\AppID'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\AppID' },
+              [pscustomobject]@{ id='hklm_typelib'; provider='HKLM:\SOFTWARE\Classes\TypeLib'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\TypeLib' },
+              [pscustomobject]@{ id='hklm_interface'; provider='HKLM:\SOFTWARE\Classes\Interface'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Interface' },
+              [pscustomobject]@{ id='hkcu_classes'; provider='HKCU:\SOFTWARE\Classes'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes' },
+              [pscustomobject]@{ id='hkcu_clsid'; provider='HKCU:\SOFTWARE\Classes\CLSID'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes\CLSID' },
+              [pscustomobject]@{ id='hkcu_appid'; provider='HKCU:\SOFTWARE\Classes\AppID'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes\AppID' },
+              [pscustomobject]@{ id='hkcu_typelib'; provider='HKCU:\SOFTWARE\Classes\TypeLib'; reg='HKEY_CURRENT_USER\SOFTWARE\Classes\TypeLib' },
+              [pscustomobject]@{ id='msi_products'; provider='HKLM:\SOFTWARE\Classes\Installer\Products'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Products' },
+              [pscustomobject]@{ id='msi_features'; provider='HKLM:\SOFTWARE\Classes\Installer\Features'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Features' },
+              [pscustomobject]@{ id='msi_upgradecodes'; provider='HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\UpgradeCodes' },
+              [pscustomobject]@{ id='msi_machine_products'; provider='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products'; reg='HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products' },
+              [pscustomobject]@{ id='msi_user_products'; provider="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\$sid\Products"; reg="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\$sid\Products" }
+            )
+            $baselineInstallerTreeSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineInstallerTreesPath = Join-Path $baselineRoot 'installer-registry-trees.json'
+            if (Test-Path -LiteralPath $baselineInstallerTreesPath) {
+              foreach ($saved in @(Get-Content -LiteralPath $baselineInstallerTreesPath -Raw | ConvertFrom-Json)) { [void]$baselineInstallerTreeSet.Add("$([string]$saved.root_id)|$([string]$saved.child)") }
+            }
+            $installerTreeManifest = [System.Collections.Generic.List[object]]::new()
+            $installerTreeIndex = 0
+            foreach ($root in $installerTreeRoots) {
+              if (-not (Test-Path -LiteralPath $root.provider)) { continue }
+              foreach ($child in @(Get-ChildItem -LiteralPath $root.provider -ErrorAction Stop)) {
+                $treeKey = "$([string]$root.id)|$([string]$child.PSChildName)"
+                if ($baselineInstallerTreeSet.Contains($treeKey)) { continue }
+                $installerTreeIndex++
+                $file = ('installer-registry-{0:D5}.reg' -f $installerTreeIndex)
+                $regPath = "$([string]$root.reg)\$([string]$child.PSChildName)"
+                & reg.exe export $regPath (Join-Path $installerRegistryRoot $file) /y | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Installer registry tree export failed: $regPath" }
+                [void]$installerTreeManifest.Add([pscustomobject]@{ root_id=$root.id; child=[string]$child.PSChildName; registry_path=$regPath; file=$file })
+              }
+            }
+            ConvertTo-Json -InputObject @($installerTreeManifest) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'installer-registry-trees.json') -Encoding UTF8
+
+            $baselineInstallerCacheSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $baselineInstallerCachePath = Join-Path $baselineRoot 'installer-cache-files.json'
+            if (Test-Path -LiteralPath $baselineInstallerCachePath) {
+              foreach ($saved in @(Get-Content -LiteralPath $baselineInstallerCachePath -Raw | ConvertFrom-Json)) { if ($saved) { [void]$baselineInstallerCacheSet.Add([string]$saved) } }
+            }
+            $installerCacheManifest = [System.Collections.Generic.List[object]]::new()
+            $liveInstallerCache = Join-Path $env:WINDIR 'Installer'
+            if (Test-Path -LiteralPath $liveInstallerCache -PathType Container) {
+              foreach ($fileInfo in @(Get-ChildItem -LiteralPath $liveInstallerCache -File -Recurse -Force -ErrorAction Stop)) {
+                $relative = $fileInfo.FullName.Substring($liveInstallerCache.Length).TrimStart('\')
+                if ($baselineInstallerCacheSet.Contains($relative)) { continue }
+                $destination = Join-Path $installerCacheBackupRoot $relative
+                New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+                Copy-Item -LiteralPath $fileInfo.FullName -Destination $destination -Force
+                [void]$installerCacheManifest.Add([pscustomobject]@{ relative=$relative; bytes=[int64]$fileInfo.Length })
+              }
+            }
+            ConvertTo-Json -InputObject @($installerCacheManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'installer-cache.json') -Encoding UTF8
+
             # Copy the live user profile through a VSS snapshot. The managed desktop
             # shares the runner's active Windows session, so files such as WebCache,
             # Search/StartMenu settings and notification databases can be locked while
-            # RDP/UU remains connected. VSS gives robocopy a stable read-only view
+            # the managed desktop remains connected. VSS gives robocopy a stable read-only view
             # without logging the user off or weakening backup fidelity.
             $volumeRoot = [IO.Path]::GetPathRoot($profileRoot)
             if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Could not resolve profile volume: $profileRoot" }
@@ -2423,56 +3055,61 @@ jobs:
             }
             ConvertTo-Json -InputObject @($taskManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'scheduled-tasks.json') -Encoding UTF8
 
-            # Record third-party auto-start services. Installers recreate the service; restore reapplies Automatic startup.
-            $autoServices = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
-              $_.StartMode -eq 'Auto' -and $_.PathName -and $_.PathName -notmatch '(?i)\\Windows\\(System32|SysWOW64)'
+            # Record third-party auto-start services from the same registry-backed inventory used for the delta.
+            $autoServices = @($currentServices | Where-Object {
+              $_.start -eq 2 -and $_.path -and $_.path -notmatch '(?i)\\Windows\\(System32|SysWOW64)'
             } | ForEach-Object {
-              [pscustomobject]@{ name=$_.Name; display_name=$_.DisplayName; path=[string]$_.PathName; state=[string]$_.State }
+              [pscustomobject]@{ name=$_.name; display_name=$_.display_name; path=[string]$_.path; state=if ((& sc.exe query ([string]$_.name) 2>&1) -match '(?im)STATE\s*:\s*4\s+RUNNING') { 'Running' } else { 'Stopped' } }
             })
             ConvertTo-Json -InputObject $autoServices -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'auto-services.json') -Encoding UTF8
 
-            # Capture kernel/system-driver deltas. Remote-control software frequently installs
-            # display/input/capture drivers that do not appear in Win32_Service.
-            $baselineDriverNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            # Capture kernel/system-driver deltas from HKLM\SYSTEM\CurrentControlSet\Services instead of CIM.
+            # This remains reliable after Rename-LocalUser and fails closed if the baseline/current inventory is implausible.
             $baselineDriversPath = Join-Path $baselineRoot 'drivers.json'
-            if (Test-Path -LiteralPath $baselineDriversPath) {
-              foreach ($driver in @(Get-Content -LiteralPath $baselineDriversPath -Raw | ConvertFrom-Json)) { if ($driver.name) { [void]$baselineDriverNames.Add([string]$driver.name) } }
-            }
+            if (-not (Test-Path -LiteralPath $baselineDriversPath)) { throw 'Baseline driver inventory is missing' }
+            $baselineDriversSaved = @(Get-Content -LiteralPath $baselineDriversPath -Raw | ConvertFrom-Json)
+            if ($baselineDriversSaved.Count -lt 100) { throw "Baseline driver inventory is invalid: count=$($baselineDriversSaved.Count)" }
+            $baselineDriverNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($driver in $baselineDriversSaved) { if ($driver.name) { [void]$baselineDriverNames.Add([string]$driver.name) } }
             function Resolve-DriverBinaryPath {
               param([string]$Value)
               if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
               $path = [Environment]::ExpandEnvironmentVariables($Value.Trim().Trim('"'))
               if ($path -match '^(?i)\\SystemRoot\\(.+)$') { $path = Join-Path $env:SystemRoot $matches[1] }
               if ($path -match '^(?i)System32\\(.+)$') { $path = Join-Path $env:SystemRoot $path }
-              try {
-                if ([IO.Path]::IsPathRooted($path)) { return [IO.Path]::GetFullPath($path) }
-              } catch { }
+              try { if ([IO.Path]::IsPathRooted($path)) { return [IO.Path]::GetFullPath($path) } } catch { }
               return ''
+            }
+            $currentDrivers = @(Get-RegistryServiceInventory -Kind driver)
+            if ($currentDrivers.Count -lt [math]::Floor($baselineDriversSaved.Count * 0.7)) {
+              throw "Current driver inventory failed sanity check baseline=$($baselineDriversSaved.Count) current=$($currentDrivers.Count)"
             }
             $driverManifest = [System.Collections.Generic.List[object]]::new()
             $driverIndex = 0
-            $driverDelta = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | Where-Object { $_.Name -and -not $baselineDriverNames.Contains([string]$_.Name) })
+            $driverDelta = @($currentDrivers | Where-Object { $_.name -and -not $baselineDriverNames.Contains([string]$_.name) })
             foreach ($driver in $driverDelta) {
               $driverIndex++
-              $safeName = ([string]$driver.Name -replace '[^A-Za-z0-9._-]','_')
+              $safeName = ([string]$driver.name -replace '[^A-Za-z0-9._-]','_')
               $regFile = ('driver-{0:D4}.reg' -f $driverIndex)
-              $regPath = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$([string]$driver.Name)"
+              $regPath = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$([string]$driver.name)"
               $regDestination = Join-Path $driverStateRoot $regFile
               & reg.exe export $regPath $regDestination /y | Out-Null
-              if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $regDestination -Force -ErrorAction SilentlyContinue; $regFile = '' }
-              $binaryPath = Resolve-DriverBinaryPath -Value ([string]$driver.PathName)
+              if ($LASTEXITCODE -ne 0) { throw "Driver registry export failed: $($driver.name)" }
+              $binaryPath = Resolve-DriverBinaryPath -Value ([string]$driver.path)
               $binaryFile = ''
               if ($binaryPath -and (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
                 $extension = [IO.Path]::GetExtension($binaryPath)
                 $binaryFile = "$safeName$extension"
                 Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $driverFileRoot $binaryFile) -Force
               }
+              $queryText = (& sc.exe query ([string]$driver.name) 2>&1) -join "`n"
+              $driverState = if ($queryText -match '(?im)^\s*STATE\s*:\s*4\s+RUNNING\b') { 'Running' } else { 'Stopped' }
               [void]$driverManifest.Add([pscustomobject]@{
-                name=[string]$driver.Name; display_name=[string]$driver.DisplayName; path=[string]$driver.PathName;
-                start_mode=[string]$driver.StartMode; state=[string]$driver.State; registry_file=$regFile;
-                binary_path=$binaryPath; binary_file=$binaryFile
+                name=[string]$driver.name; display_name=[string]$driver.display_name; path=[string]$driver.path;
+                start=[int]$driver.start; start_mode=[string]$driver.start_mode; state=$driverState; registry_file=$regFile;
+                binary_path=$binaryPath; binary_file=$binaryFile; type=[int64]$driver.type; error_control=[int]$driver.error_control
               })
-              Write-Host "MANAGED_WINDOWS_DRIVER_DELTA name=$($driver.Name) path=$binaryPath registry=$regFile file=$binaryFile"
+              Write-Host "MANAGED_WINDOWS_DRIVER_DELTA name=$($driver.name) path=$binaryPath registry=$regFile file=$binaryFile"
             }
             ConvertTo-Json -InputObject @($driverManifest) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'drivers.json') -Encoding UTF8
 
@@ -2491,7 +3128,9 @@ jobs:
                 New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
                 & pnputil.exe /export-driver $publishedName $packageDir | Out-Host
                 if ($LASTEXITCODE -eq 0 -and (Get-ChildItem -LiteralPath $packageDir -Filter '*.inf' -Recurse -ErrorAction SilentlyContinue)) {
-                  [void]$driverPackageManifest.Add([pscustomobject]@{ published_name=$publishedName; directory=[IO.Path]::GetFileName($packageDir) })
+                  $exportedInf = @(Get-ChildItem -LiteralPath $packageDir -Filter '*.inf' -Recurse -File -ErrorAction Stop | Select-Object -First 1)
+                  $originalName = if ($exportedInf.Count) { [string]$exportedInf[0].Name } else { '' }
+                  [void]$driverPackageManifest.Add([pscustomobject]@{ published_name=$publishedName; original_name=$originalName; directory=[IO.Path]::GetFileName($packageDir) })
                   Write-Host "MANAGED_WINDOWS_DRIVER_PACKAGE_BACKED_UP published=$publishedName"
                 } else {
                   Remove-Item -LiteralPath $packageDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -2499,6 +3138,56 @@ jobs:
               }
             } catch { Write-Warning "driver package delta export skipped: $($_.Exception.Message)" }
             ConvertTo-Json -InputObject @($driverPackageManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'driver-packages.json') -Encoding UTF8
+
+            # Capture PnP device-instance deltas tied to driver packages installed after the pristine baseline.
+            # This is app-agnostic: no vendor/product names are hard-coded. ROOT devices can be recreated generically;
+            # other enumerators are recorded and strictly verified after package restore.
+            $baselinePnpPath = Join-Path $baselineRoot 'pnp-device-ids.txt'
+            if (-not (Test-Path -LiteralPath $baselinePnpPath)) { throw 'Baseline PnP inventory is missing' }
+            $baselinePnpIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($line in Get-Content -LiteralPath $baselinePnpPath) { if ($line.Trim()) { [void]$baselinePnpIds.Add($line.Trim()) } }
+            if ($baselinePnpIds.Count -lt 20) { throw "Baseline PnP inventory is invalid: count=$($baselinePnpIds.Count)" }
+            $currentPnpText = (& pnputil.exe /enum-devices 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "Current PnP inventory failed exit=$LASTEXITCODE" }
+            $currentPnpIds = @([regex]::Matches($currentPnpText, '(?im)^\s*Instance ID\s*:\s*(.+?)\s*$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Sort-Object -Unique)
+            if ($currentPnpIds.Count -lt [math]::Floor($baselinePnpIds.Count * 0.5)) {
+              throw "Current PnP inventory failed sanity check baseline=$($baselinePnpIds.Count) current=$($currentPnpIds.Count)"
+            }
+            $deltaPackageNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $deltaOriginalInfNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($pkg in $driverPackageManifest) {
+              if ($pkg.published_name) { [void]$deltaPackageNames.Add([string]$pkg.published_name) }
+              if ($pkg.original_name) { [void]$deltaOriginalInfNames.Add([string]$pkg.original_name) }
+            }
+            $pnpDeviceManifest = [System.Collections.Generic.List[object]]::new()
+            foreach ($instanceId in @($currentPnpIds | Where-Object { -not $baselinePnpIds.Contains([string]$_) })) {
+              $detail = (& pnputil.exe /enum-devices /instanceid $instanceId /deviceids /drivers 2>&1) -join "`n"
+              if ($LASTEXITCODE -ne 0) { throw "PnP detail inventory failed for $instanceId exit=$LASTEXITCODE" }
+              $driverMatch = [regex]::Match($detail, '(?im)^\s*Driver Name\s*:\s*(.+?)\s*$')
+              $originalMatch = [regex]::Match($detail, '(?im)^\s*Original Name\s*:\s*(.+?)\s*$')
+              $driverName = if ($driverMatch.Success) { $driverMatch.Groups[1].Value.Trim() } else { '' }
+              $originalName = if ($originalMatch.Success) { $originalMatch.Groups[1].Value.Trim() } else { '' }
+              if (-not (($driverName -and $deltaPackageNames.Contains($driverName)) -or ($originalName -and $deltaOriginalInfNames.Contains($originalName)))) { continue }
+              $descriptionMatch = [regex]::Match($detail, '(?im)^\s*Device Description\s*:\s*(.+?)\s*$')
+              $classNameMatch = [regex]::Match($detail, '(?im)^\s*Class Name\s*:\s*(.+?)\s*$')
+              $classGuidMatch = [regex]::Match($detail, '(?im)^\s*Class GUID\s*:\s*(\{[0-9A-Fa-f-]+\})\s*$')
+              $manufacturerMatch = [regex]::Match($detail, '(?im)^\s*Manufacturer Name\s*:\s*(.+?)\s*$')
+              $statusMatch = [regex]::Match($detail, '(?im)^\s*Status\s*:\s*(.+?)\s*$')
+              $hardwareMatch = [regex]::Match($detail, '(?im)^\s*Hardware IDs\s*:\s*(.+?)\s*$')
+              $hardwareId = if ($hardwareMatch.Success) { $hardwareMatch.Groups[1].Value.Trim() } else { '' }
+              $strategy = if ($instanceId.StartsWith('ROOT\',[System.StringComparison]::OrdinalIgnoreCase) -and $hardwareId -and $classGuidMatch.Success) { 'root-setupapi' } else { 'package-install-verify' }
+              [void]$pnpDeviceManifest.Add([pscustomobject]@{
+                instance_id=[string]$instanceId; hardware_id=$hardwareId;
+                description=if ($descriptionMatch.Success) { $descriptionMatch.Groups[1].Value.Trim() } else { '' };
+                class_name=if ($classNameMatch.Success) { $classNameMatch.Groups[1].Value.Trim() } else { '' };
+                class_guid=if ($classGuidMatch.Success) { $classGuidMatch.Groups[1].Value.Trim() } else { '' };
+                manufacturer=if ($manufacturerMatch.Success) { $manufacturerMatch.Groups[1].Value.Trim() } else { '' };
+                status=if ($statusMatch.Success) { $statusMatch.Groups[1].Value.Trim() } else { '' };
+                published_inf=$driverName; original_inf=$originalName; restore_strategy=$strategy
+              })
+              Write-Host "MANAGED_WINDOWS_PNP_DELTA instance=$instanceId hardware=$hardwareId inf=$originalName strategy=$strategy"
+            }
+            ConvertTo-Json -InputObject @($pnpDeviceManifest) -Depth 7 | Set-Content -LiteralPath (Join-Path $stateRoot 'pnp-devices.json') -Encoding UTF8
 
             # installed-apps.json and installed-apps-delta.json were captured before VSS
             # so their install roots could participate in the machine-level software snapshot.
@@ -2625,7 +3314,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 9
+              version = 11
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -2633,7 +3322,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v9-runtime-startup-registry-drivers'
+              scope = 'managed-windows-state-v11-installer-delta-services-drivers-pnp'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -2647,6 +3336,11 @@ jobs:
               app_registry_count = @($appRegistryManifest).Count
               driver_delta_count = @($driverManifest).Count
               driver_package_delta_count = @($driverPackageManifest).Count
+              pnp_device_delta_count = @($pnpDeviceManifest).Count
+              software_acl_count = @($softwareAclManifest).Count
+              installer_registry_value_delta_count = @($installerValueDelta).Count
+              installer_registry_tree_delta_count = @($installerTreeManifest).Count
+              installer_cache_delta_count = @($installerCacheManifest).Count
               startup_approved_count = @($startupApproved).Count
               common_startup_count = @($commonStartupManifest).Count
               app_profile_evidence_count = @($appProfileEvidence).Count
@@ -2663,7 +3357,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V9_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V11_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
