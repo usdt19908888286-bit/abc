@@ -306,7 +306,9 @@ jobs:
               'AppData\Local\Microsoft\Windows\WebCacheLock.dat',
               'AppData\Local\Microsoft\Windows\Explorer\iconcache_*.db',
               'AppData\Local\Microsoft\Windows\Explorer\thumbcache_*.db',
+              'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat',
               'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat.LOG*',
+              'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat',
               'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat.LOG*'
             )
             function Test-ManagedVolatilePath {
@@ -326,6 +328,8 @@ jobs:
               $restoreProfile, $profileRoot,
               '/E','/COPY:DAT','/DCOPY:DAT','/R:1','/W:1','/XJ','/NFL','/NDL','/NP',
               '/XF','WebCacheLock.dat','iconcache_*.db','thumbcache_*.db','settings.dat.LOG*','WPNPRMRY.tmp','wpndatabase.db-shm','wpndatabase.db-wal',
+              (Join-Path $restoreProfile 'AppData\Local\Packages\Microsoft.Windows.Search_cw5n1h2txyewy\Settings\settings.dat'),
+              (Join-Path $restoreProfile 'AppData\Local\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\Settings\settings.dat'),
               '/XD',
               (Join-Path $restoreProfile 'AppData\Local\Microsoft\Windows\Caches'),
               (Join-Path $restoreProfile 'AppData\Local\Microsoft\Windows\WebCache'),
