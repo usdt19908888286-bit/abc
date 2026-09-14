@@ -1067,6 +1067,10 @@ jobs:
               [DllImport("setupapi.dll", SetLastError=true)]
               private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
 
+              [DllImport("newdev.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+              private static extern bool UpdateDriverForPlugAndPlayDevices(
+                  IntPtr hwndParent, string HardwareId, string FullInfPath, uint InstallFlags, out bool RebootRequired);
+
               private static void ThrowLast(string stage) {
                   throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), stage);
               }
@@ -1092,6 +1096,12 @@ jobs:
                   } finally {
                       SetupDiDestroyDeviceInfoList(set);
                   }
+              }
+
+              public static int Update(string hardwareId, string infPath, out bool rebootRequired) {
+                  rebootRequired = false;
+                  if (UpdateDriverForPlugAndPlayDevices(IntPtr.Zero, hardwareId, infPath, 0, out rebootRequired)) return 0;
+                  return Marshal.GetLastWin32Error();
               }
           }
           '@
@@ -1138,18 +1148,37 @@ jobs:
                     $deviceName = if ([string]::IsNullOrWhiteSpace([string]$device.class_name)) { ($hardwareId -replace '^.*\\','') } else { [string]$device.class_name }
                     $reboot = [ManagedRootPnpInstaller]::Install($hardwareId,$deviceName,$description,$classGuid,$inf.FullName)
                     Write-Host "MANAGED_WINDOWS_PNP_ROOT_CREATED hardware=$hardwareId inf=$originalInf reboot=$reboot"
-                    & pnputil.exe /add-driver $inf.FullName /install | Out-Host
-                    if ($LASTEXITCODE -ne 0) { throw "PnP bind after root-device creation failed exit=$LASTEXITCODE inf=$originalInf" }
+                    $updateReboot = $false
+                    $updateError = [ManagedRootPnpInstaller]::Update($hardwareId,$inf.FullName,[ref]$updateReboot)
+                    Write-Host "MANAGED_WINDOWS_PNP_UPDATE_RESULT hardware=$hardwareId error=$updateError reboot=$updateReboot"
+                    if ($updateError -ne 0) {
+                      Write-Warning "Standard PnP driver update returned Win32 error $updateError; retrying through pnputil."
+                      & pnputil.exe /add-driver $inf.FullName /install | Out-Host
+                      if ($LASTEXITCODE -ne 0) { throw "PnP bind after root-device creation failed exit=$LASTEXITCODE inf=$originalInf updateError=$updateError" }
+                    }
                     & pnputil.exe /scan-devices | Out-Host
                     if ($LASTEXITCODE -ne 0) { throw "PnP scan after root-device creation failed exit=$LASTEXITCODE" }
-                    Start-Sleep -Milliseconds 750
+                    & pnputil.exe /enable-device /deviceid $hardwareId 2>$null | Out-Host
+                    & pnputil.exe /restart-device /deviceid $hardwareId 2>$null | Out-Host
                   } else {
                     [void]$pnpPending.Add($device)
                     Write-Host "MANAGED_WINDOWS_PNP_DEFERRED hardware=$hardwareId strategy=$($device.restore_strategy)"
                     continue
                   }
                 }
-                if (-not (Test-ManagedPnpDevice -HardwareId $hardwareId -ClassGuid $classGuid -RequireStarted:$requireStarted)) {
+                $pnpReady = $false
+                for ($pnpAttempt = 0; $pnpAttempt -lt 40; $pnpAttempt++) {
+                  if (Test-ManagedPnpDevice -HardwareId $hardwareId -ClassGuid $classGuid -RequireStarted:$requireStarted) { $pnpReady = $true; break }
+                  Start-Sleep -Milliseconds 500
+                }
+                if (-not $pnpReady) {
+                  Write-Host "===== PNP RESTORE DIAGNOSTICS hardware=$hardwareId ====="
+                  & pnputil.exe /enum-devices /deviceid $hardwareId /deviceids /drivers /services /stack 2>&1 | Out-Host
+                  $setupLog = Join-Path $env:SystemRoot 'INF\setupapi.dev.log'
+                  if (Test-Path -LiteralPath $setupLog) {
+                    $needle = [regex]::Escape($hardwareId)
+                    Get-Content -LiteralPath $setupLog -Tail 1200 -ErrorAction SilentlyContinue | Select-String -Pattern $needle,[regex]::Escape([string]$originalInf),'ROOT\\DISPLAY' -Context 2,5 | Select-Object -Last 120 | ForEach-Object { $_.ToString() } | Out-Host
+                  }
                   throw "PnP device was not restored to expected state hardware=$hardwareId strategy=$($device.restore_strategy)"
                 }
                 $pnpDevicesRestored++
