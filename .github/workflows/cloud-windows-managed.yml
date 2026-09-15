@@ -1296,10 +1296,57 @@ jobs:
                 }
                 if ($driver.registry_file) {
                   $regFile = Join-Path (Join-Path $stateRoot 'drivers') ([string]$driver.registry_file)
-                  if (Test-Path -LiteralPath $regFile) {
-                    & reg.exe import $regFile | Out-Null
-                    if ($LASTEXITCODE -ne 0) { throw "driver registry import exited $LASTEXITCODE" }
+                  if (-not (Test-Path -LiteralPath $regFile -PathType Leaf)) { throw "Driver registry payload is missing: $regFile" }
+                  & reg.exe import $regFile | Out-Null
+                  $regImportExit = $LASTEXITCODE
+                  if ($regImportExit -ne 0) {
+                    # PnP can create/load the driver before this generic delta pass.
+                    # The service key's Enum/Security branches are then OS-managed and
+                    # can reject an otherwise valid full .reg import. Retry only the
+                    # stable installer-owned branches; dynamic bindings are verified by
+                    # the PnP verifier separately.
+                    $driverName = [string]$driver.name
+                    $rootReg = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$driverName"
+                    $escapedRoot = [regex]::Escape($rootReg)
+                    $sanitizedReg = Join-Path $env:RUNNER_TEMP ("managed-driver-{0}.reg" -f ([guid]::NewGuid().ToString('N')))
+                    $lines = @(Get-Content -LiteralPath $regFile -ErrorAction Stop)
+                    $outputLines = [System.Collections.Generic.List[string]]::new()
+                    $skipSection = $false
+                    foreach ($line in $lines) {
+                      if ($line -match '^\[(.+)\]\s*$') {
+                        $section = [string]$matches[1]
+                        $skipSection = ($section -match "^${escapedRoot}\\(Enum|Security)(\\|$)")
+                      }
+                      if (-not $skipSection) { [void]$outputLines.Add([string]$line) }
+                    }
+                    Set-Content -LiteralPath $sanitizedReg -Value $outputLines -Encoding Unicode
+                    & reg.exe import $sanitizedReg | Out-Null
+                    $sanitizedExit = $LASTEXITCODE
+                    Remove-Item -LiteralPath $sanitizedReg -Force -ErrorAction SilentlyContinue
+                    if ($sanitizedExit -ne 0) { throw "driver stable registry import exited $sanitizedExit after full import exit=$regImportExit" }
+                    Write-Host "MANAGED_WINDOWS_DRIVER_REGISTRY_SANITIZED_RESTORED name=$driverName"
                   }
+
+                  $driverKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$([string]$driver.name)"
+                  if (-not (Test-Path -LiteralPath $driverKey)) { throw "Driver registry key missing after restore: $driverKey" }
+                  $liveDriver = Get-ItemProperty -LiteralPath $driverKey -ErrorAction Stop
+                  $registryMismatches = [System.Collections.Generic.List[string]]::new()
+                  if ($null -ne $driver.type -and [int64]$liveDriver.Type -ne [int64]$driver.type) { [void]$registryMismatches.Add("Type live=$($liveDriver.Type) saved=$($driver.type)") }
+                  if ($null -ne $driver.start -and [int]$liveDriver.Start -ne [int]$driver.start) { [void]$registryMismatches.Add("Start live=$($liveDriver.Start) saved=$($driver.start)") }
+                  if ($null -ne $driver.error_control -and [int]$driver.error_control -ge 0 -and [int]$liveDriver.ErrorControl -ne [int]$driver.error_control) { [void]$registryMismatches.Add("ErrorControl live=$($liveDriver.ErrorControl) saved=$($driver.error_control)") }
+                  if ($driver.binary_path) {
+                    $expectedBinaryPath = [IO.Path]::GetFullPath([string]$driver.binary_path)
+                    $liveImagePath = [Environment]::ExpandEnvironmentVariables(([string]$liveDriver.ImagePath).Trim().Trim('"'))
+                    $liveImagePath = $liveImagePath -replace '^(?i)\\\?\?\\',''
+                    if ($liveImagePath -match '^(?i)\\SystemRoot\\(.+)$') { $liveImagePath = Join-Path $env:SystemRoot $matches[1] }
+                    elseif ($liveImagePath -match '^(?i)System32\\(.+)$') { $liveImagePath = Join-Path $env:SystemRoot $liveImagePath }
+                    try { if ([IO.Path]::IsPathRooted($liveImagePath)) { $liveImagePath = [IO.Path]::GetFullPath($liveImagePath) } } catch { }
+                    if (-not $liveImagePath.Equals($expectedBinaryPath,[System.StringComparison]::OrdinalIgnoreCase)) {
+                      [void]$registryMismatches.Add("ImagePath live=$liveImagePath saved=$expectedBinaryPath")
+                    }
+                  }
+                  if ($registryMismatches.Count -gt 0) { throw "Driver live registry verification failed: $($registryMismatches -join '; ')" }
+                  Write-Host "MANAGED_WINDOWS_DRIVER_REGISTRY_VERIFIED name=$($driver.name)"
                 }
                 if ([string]$driver.state -eq 'Running') { & sc.exe start ([string]$driver.name) 2>$null | Out-Null }
                 $driversRestored++
