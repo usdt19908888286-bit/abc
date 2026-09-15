@@ -153,6 +153,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y openssh-server rsync jq
 
+          # Capture the clean runner's manually-installed package baseline after
+          # workflow dependencies are present. Backup stores only packages added
+          # later by the user, so restore does not replay the whole runner image.
+          apt-mark showmanual | LC_ALL=C sort -u >/tmp/managed-ubuntu-baseline-manual.txt
+
           if ! id "$DESKTOP_USERNAME" >/dev/null 2>&1; then
             if getent group "$DESKTOP_USERNAME" >/dev/null 2>&1; then
               # GitHub Ubuntu images already contain some system groups (notably "admin").
@@ -168,6 +173,54 @@ jobs:
           if [ "$MACHINE_MODE" = 'restore' ]; then
             [ -f /tmp/managed-desktop-backup/metadata.json ] || { echo '::error::Restore mode requested, but no managed Ubuntu backup was found.'; exit 1; }
             [ -d /tmp/managed-desktop-backup/home ] || { echo '::error::Ubuntu backup home directory is missing.'; exit 1; }
+
+            # V2 backups include the apt packages that were manually installed
+            # after the clean runner baseline. Reinstall by package name first so
+            # normal repositories can provide a compatible current build. Cached
+            # .deb payloads are a fallback for packages no longer resolvable by name.
+            APT_STATE=/tmp/managed-desktop-backup/apt
+            if [ -s "$APT_STATE/manual-added.txt" ]; then
+              mapfile -t RESTORE_APT_PACKAGES < <(sed '/^[[:space:]]*$/d' "$APT_STATE/manual-added.txt" | LC_ALL=C sort -u)
+              if [ "${#RESTORE_APT_PACKAGES[@]}" -gt 0 ]; then
+                echo "MANAGED_UBUNTU_APT_RESTORE_COUNT=${#RESTORE_APT_PACKAGES[@]}"
+                sudo apt-get update -qq
+                if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}"; then
+                  echo '::warning::Some saved apt packages were not directly resolvable; trying cached .deb payloads.'
+                fi
+
+                MISSING_APT_PACKAGES=()
+                for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
+                  if ! dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+                    MISSING_APT_PACKAGES+=("$pkg")
+                  fi
+                done
+
+                if [ "${#MISSING_APT_PACKAGES[@]}" -gt 0 ]; then
+                  shopt -s nullglob
+                  RESTORE_DEBS=("$APT_STATE"/debs/*.deb)
+                  shopt -u nullglob
+                  if [ "${#RESTORE_DEBS[@]}" -gt 0 ]; then
+                    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${RESTORE_DEBS[@]}" || true
+                  fi
+                fi
+
+                UNRESTORED_APT_PACKAGES=()
+                for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
+                  if ! dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+                    UNRESTORED_APT_PACKAGES+=("$pkg")
+                  fi
+                done
+                if [ "${#UNRESTORED_APT_PACKAGES[@]}" -gt 0 ]; then
+                  printf '::error::Ubuntu package restore failed for: %s\n' "${UNRESTORED_APT_PACKAGES[*]}"
+                  exit 1
+                fi
+                sudo apt-mark manual "${RESTORE_APT_PACKAGES[@]}" >/dev/null 2>&1 || true
+                echo 'MANAGED_UBUNTU_APT_RESTORE_APPLIED'
+              fi
+            else
+              echo 'MANAGED_UBUNTU_APT_RESTORE_LEGACY_BACKUP'
+            fi
+
             sudo rsync -a /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
             sudo chown -R "${DESKTOP_USERNAME}:${DESKTOP_USERNAME}" "/home/${DESKTOP_USERNAME}"
             echo 'MANAGED_DESKTOP_RESTORE_APPLIED'
@@ -258,21 +311,43 @@ jobs:
             sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
             sleep 2
             rm -rf /tmp/managed-desktop-backup
-            mkdir -p /tmp/managed-desktop-backup/home
+            mkdir -p /tmp/managed-desktop-backup/home /tmp/managed-desktop-backup/apt/debs
             sudo rsync -a --delete --exclude='.cache/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
+
+            apt-mark showmanual | LC_ALL=C sort -u >/tmp/managed-ubuntu-current-manual.txt
+            if [ -s /tmp/managed-ubuntu-baseline-manual.txt ]; then
+              comm -13 /tmp/managed-ubuntu-baseline-manual.txt /tmp/managed-ubuntu-current-manual.txt \
+                >/tmp/managed-desktop-backup/apt/manual-added.txt
+            else
+              cp /tmp/managed-ubuntu-current-manual.txt /tmp/managed-desktop-backup/apt/manual-added.txt
+            fi
+
+            : >/tmp/managed-desktop-backup/apt/versions.tsv
+            while IFS= read -r pkg || [ -n "$pkg" ]; do
+              [ -n "$pkg" ] || continue
+              version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+              [ -n "$version" ] || continue
+              printf '%s\t%s\n' "$pkg" "$version" >>/tmp/managed-desktop-backup/apt/versions.tsv
+              (
+                cd /tmp/managed-desktop-backup/apt/debs
+                apt-get download "${pkg}=${version}" >/dev/null 2>&1 || apt-get download "$pkg" >/dev/null 2>&1 || true
+              )
+            done </tmp/managed-desktop-backup/apt/manual-added.txt
+            echo "MANAGED_UBUNTU_APT_BACKUP_COUNT=$(wc -l </tmp/managed-desktop-backup/apt/manual-added.txt | tr -d ' ')"
+
             sudo chown -R "$USER:$USER" /tmp/managed-desktop-backup
             python3 - <<'PY' >/tmp/managed-desktop-backup/metadata.json
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 1,
+              'version': 2,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-user-home-without-dot-cache',
+              'scope': 'managed-user-home-plus-apt-manual-delta-without-dot-cache',
           }, separators=(',', ':')))
           PY
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
@@ -305,7 +380,7 @@ jobs:
           done
 
 
-      - name: Save Ubuntu user backup to GitHub Actions Cache
+      - name: Save Ubuntu user and apt-state backup to GitHub Actions Cache
         if: steps.session.outputs.should_save == 'true'
         uses: actions/cache/save@v5
         with:
