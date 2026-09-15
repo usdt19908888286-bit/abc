@@ -1320,7 +1320,7 @@ jobs:
                         $section = [string]$matches[1]
                         if ($section.Equals($rootReg,[System.StringComparison]::OrdinalIgnoreCase) -or $section.StartsWith("$rootReg\",[System.StringComparison]::OrdinalIgnoreCase)) {
                           $relativeSection = $section.Substring($rootReg.Length)
-                          $skipSection = ($relativeSection -match '^(?i)\\(Enum|Security)(\\|$)')
+                          $skipSection = ($relativeSection -match '^(?i)\\(Enum|Security|State)(\\|$)')
                           if (-not $skipSection) { [void]$outputLines.Add("[$probeRootReg$relativeSection]") }
                         } else {
                           $skipSection = $true
