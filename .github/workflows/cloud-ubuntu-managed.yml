@@ -81,14 +81,23 @@ jobs:
           TS_DNS_HOSTNAME=$(jq -r '.tailscaleHostname // empty' /tmp/cloud-bootstrap.json)
           CF_TUNNEL_HOSTNAME=$(jq -r '.cloudflareHostname // empty' /tmp/cloud-bootstrap.json)
           CF_TUNNEL_TOKEN=$(jq -r '.cloudflareTunnelToken // empty' /tmp/cloud-bootstrap.json)
+          UBUNTU_SOCKS5_ENABLED=$(jq -r 'if .ubuntuSocks5Enabled then "true" else "false" end' /tmp/cloud-bootstrap.json)
+          UBUNTU_SOCKS5_PORT=$(jq -r '.ubuntuSocks5Port // "1080"' /tmp/cloud-bootstrap.json)
+          UBUNTU_SOCKS5_USERNAME=$(jq -r '.ubuntuSocks5Username // "cloudproxy"' /tmp/cloud-bootstrap.json)
+          UBUNTU_SOCKS5_PASSWORD=$(jq -r '.ubuntuSocks5Password // empty' /tmp/cloud-bootstrap.json)
+          UBUNTU_SOCKS5_HOSTNAME=$(jq -r '.ubuntuSocks5Hostname // empty' /tmp/cloud-bootstrap.json)
           [ -n "$TS_CLIENT_ID" ] && [ -n "$TS_CLIENT_SECRET" ] || { echo '::error::Cloudflare Tailscale configuration is incomplete'; exit 1; }
           [ -n "$CLOUD_PASSWORD" ] || { echo '::error::Cloudflare desktop password is empty'; exit 1; }
           if [ "$TUNNEL_MODE" = 'cloudflare' ] || [ "$TUNNEL_MODE" = 'dual' ]; then
             [ -n "$CF_TUNNEL_HOSTNAME" ] && [ -n "$CF_TUNNEL_TOKEN" ] || { echo '::error::Cloudflare Tunnel bootstrap is incomplete'; exit 1; }
           fi
-          for value in "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$CF_TUNNEL_TOKEN"; do [ -z "$value" ] || echo "::add-mask::$value"; done
-          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\n' \
-            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" >> "$GITHUB_ENV"
+          if [ "$UBUNTU_SOCKS5_ENABLED" = 'true' ]; then
+            [ -n "$UBUNTU_SOCKS5_PASSWORD" ] || { echo '::error::Ubuntu SOCKS5 password is empty'; exit 1; }
+            [ -n "$UBUNTU_SOCKS5_HOSTNAME" ] && [ -n "$CF_TUNNEL_TOKEN" ] || { echo '::error::Ubuntu SOCKS5 Cloudflare bootstrap is incomplete'; exit 1; }
+          fi
+          for value in "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_PASSWORD"; do [ -z "$value" ] || echo "::add-mask::$value"; done
+          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\nUBUNTU_SOCKS5_ENABLED=%s\nUBUNTU_SOCKS5_PORT=%s\nUBUNTU_SOCKS5_USERNAME=%s\nUBUNTU_SOCKS5_PASSWORD=%s\nUBUNTU_SOCKS5_HOSTNAME=%s\n' \
+            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_ENABLED" "$UBUNTU_SOCKS5_PORT" "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" "$UBUNTU_SOCKS5_HOSTNAME" >> "$GITHUB_ENV"
           rm -f /tmp/cloud-bootstrap.json
           echo 'CLOUDFLARE_BOOTSTRAP_OK'
 
@@ -101,6 +110,11 @@ jobs:
           printf '%s\n' "$RUNNER_IMAGE" | grep -Eq '^ubuntu-[0-9]{2}\.[0-9]{2}$' || { echo "::error::Unsupported Ubuntu runner image label: $RUNNER_IMAGE"; exit 1; }
           case "$MACHINE_MODE" in new|restore) ;; *) echo "::error::Unsupported mode: $MACHINE_MODE"; exit 1 ;; esac
           [ -n "${CLOUD_PASSWORD:-}" ] || { echo '::error::Desktop password secret is empty'; exit 1; }
+          if [ "${UBUNTU_SOCKS5_ENABLED:-false}" = 'true' ]; then
+            [[ "${UBUNTU_SOCKS5_PORT:-}" =~ ^[0-9]+$ ]] && [ "$UBUNTU_SOCKS5_PORT" -ge 1 ] && [ "$UBUNTU_SOCKS5_PORT" -le 65535 ] || { echo '::error::Ubuntu SOCKS5 port must be 1-65535'; exit 1; }
+            [[ "${UBUNTU_SOCKS5_USERNAME:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo '::error::Ubuntu SOCKS5 username is invalid'; exit 1; }
+            [ -n "${UBUNTU_SOCKS5_PASSWORD:-}" ] || { echo '::error::Ubuntu SOCKS5 password is empty'; exit 1; }
+          fi
 
       - name: Prepare Tailscale hostname
         id: identity
@@ -554,12 +568,59 @@ jobs:
           echo "UBUNTU_RUNNER_IMAGE=$RUNNER_IMAGE"
           echo "MANAGED_DESKTOP_MODE=$MACHINE_MODE"
 
-      - name: Start Cloudflare SSH tunnel
-        if: ${{ env.TUNNEL_MODE == 'cloudflare' || env.TUNNEL_MODE == 'dual' }}
+      - name: Deploy Ubuntu SOCKS5 service
+        if: ${{ env.UBUNTU_SOCKS5_ENABLED == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ -n "${CF_TUNNEL_HOSTNAME:-}" ] || { echo '::error::Cloudflare Tunnel bootstrap is incomplete'; exit 1; }
+          echo "::add-mask::${UBUNTU_SOCKS5_PASSWORD}"
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends dante-server
+          if id "$UBUNTU_SOCKS5_USERNAME" >/dev/null 2>&1; then
+            sudo usermod -s /usr/sbin/nologin "$UBUNTU_SOCKS5_USERNAME" || true
+          else
+            sudo useradd -M -s /usr/sbin/nologin "$UBUNTU_SOCKS5_USERNAME"
+          fi
+          printf '%s:%s\n' "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" | sudo chpasswd
+          EXT_IF=$(ip route show default | awk 'NR==1 {print $5}')
+          [ -n "$EXT_IF" ] || { echo '::error::Unable to determine Ubuntu egress interface'; exit 1; }
+          sudo tee /etc/danted.conf >/dev/null <<EOF
+          logoutput: syslog
+          internal: 127.0.0.1 port = ${UBUNTU_SOCKS5_PORT}
+          external: ${EXT_IF}
+          clientmethod: none
+          socksmethod: username
+          user.privileged: proxy
+          user.unprivileged: nobody
+          client pass {
+            from: 127.0.0.1/32 to: 0.0.0.0/0
+            log: error
+          }
+          socks pass {
+            from: 127.0.0.1/32 to: 0.0.0.0/0
+            command: connect bind udpassociate
+            log: error
+          }
+          EOF
+          sudo systemctl enable danted >/dev/null 2>&1 || true
+          sudo systemctl restart danted
+          sudo systemctl is-active --quiet danted || { sudo journalctl -u danted -n 80 --no-pager || true; exit 1; }
+          ss -ltn | grep -Eq "127\\.0\\.0\\.1:${UBUNTU_SOCKS5_PORT}[[:space:]]" || { echo '::error::Ubuntu SOCKS5 listener is not ready'; exit 1; }
+          echo "UBUNTU_SOCKS5_READY=127.0.0.1:${UBUNTU_SOCKS5_PORT}"
+
+      - name: Start Cloudflare TCP tunnel
+        if: ${{ env.TUNNEL_MODE == 'cloudflare' || env.TUNNEL_MODE == 'dual' || env.UBUNTU_SOCKS5_ENABLED == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${CF_TUNNEL_TOKEN:-}" ] || { echo '::error::Cloudflare Tunnel token is missing'; exit 1; }
+          if [ "${TUNNEL_MODE:-tailscale}" = 'cloudflare' ] || [ "${TUNNEL_MODE:-tailscale}" = 'dual' ]; then
+            [ -n "${CF_TUNNEL_HOSTNAME:-}" ] || { echo '::error::Cloudflare SSH hostname is missing'; exit 1; }
+          fi
+          if [ "${UBUNTU_SOCKS5_ENABLED:-false}" = 'true' ]; then
+            [ -n "${UBUNTU_SOCKS5_HOSTNAME:-}" ] || { echo '::error::Cloudflare SOCKS5 hostname is missing'; exit 1; }
+          fi
           echo "::add-mask::${CF_TUNNEL_TOKEN}"
           CLOUDFLARED=/tmp/cloudflared-managed
           TOKEN_FILE=/tmp/cloudflared-managed-token
@@ -577,8 +638,9 @@ jobs:
             kill -0 "$(cat /tmp/cloudflared-managed.pid)" 2>/dev/null || break
             sleep 1
           done
-          if [ "$READY" != '1' ]; then tail -n 80 "$LOG_FILE" || true; echo '::error::Cloudflare SSH tunnel did not connect'; exit 1; fi
-          echo "CLOUDFLARE_SSH_TUNNEL=${CF_TUNNEL_HOSTNAME}"
+          if [ "$READY" != '1' ]; then tail -n 80 "$LOG_FILE" || true; echo '::error::Cloudflare TCP tunnel did not connect'; exit 1; fi
+          [ -z "${CF_TUNNEL_HOSTNAME:-}" ] || echo "CLOUDFLARE_SSH_TUNNEL=${CF_TUNNEL_HOSTNAME}"
+          [ -z "${UBUNTU_SOCKS5_HOSTNAME:-}" ] || echo "CLOUDFLARE_SOCKS5_TUNNEL=${UBUNTU_SOCKS5_HOSTNAME}:${UBUNTU_SOCKS5_PORT}"
 
       - name: Sync runtime state
         env:
