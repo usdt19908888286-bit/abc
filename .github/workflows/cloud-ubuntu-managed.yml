@@ -324,9 +324,6 @@ jobs:
                 if [ "${#RESTORE_APT_MANUAL[@]}" -gt 0 ]; then
                   sudo apt-mark manual "${RESTORE_APT_MANUAL[@]}" >/dev/null 2>&1 || true
                 fi
-                if [ "${#RESTORE_APT_MANUAL[@]}" -gt 0 ]; then
-                  sudo apt-mark manual "${RESTORE_APT_MANUAL[@]}" >/dev/null 2>&1 || true
-                fi
                 echo 'MANAGED_UBUNTU_APT_RESTORE_APPLIED'
               fi
             elif [ -s "$APT_STATE/manual-added.txt" ]; then
@@ -409,34 +406,76 @@ jobs:
             sudo rsync -aHAX /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
             sudo chown -R "${DESKTOP_USERNAME}:${DESKTOP_USERNAME}" "/home/${DESKTOP_USERNAME}"
 
-            # Flatpak remotes carry GPG trust material inside their OSTree repo
-            # metadata. Restore that metadata instead of recreating remotes from
-            # URL alone (which would either fail signature validation or require an
-            # unsafe --no-gpg-verify fallback). User repo metadata is restored by
-            # the Home rsync above; system repo metadata is a small explicit archive.
+            # Flatpak is reconstructed from signed remotes instead of restoring a
+            # partial OSTree repository. We retain each remote's trusted GPG key,
+            # recreate the remote, then reinstall the recorded refs. This avoids
+            # refs pointing at objects that were not carried in the backup.
             FLATPAK_STATE=/tmp/managed-desktop-backup/flatpak
             if [ -d "$FLATPAK_STATE" ] && { [ -s "$FLATPAK_STATE/system-remotes.tsv" ] || [ -s "$FLATPAK_STATE/user-remotes.tsv" ] || [ -s "$FLATPAK_STATE/system-refs.tsv" ] || [ -s "$FLATPAK_STATE/user-refs.tsv" ]; }; then
               command -v flatpak >/dev/null 2>&1 || { echo '::error::Flatpak backup exists but flatpak is unavailable after package restore.'; exit 1; }
+              FLATPAK_USER=(sudo -H -u "$DESKTOP_USERNAME" env -u SUDO_USER -u SUDO_UID -u SUDO_GID flatpak)
+              SYSTEM_KEYS=/tmp/managed-flatpak-system-keys
+              USER_KEYS=/tmp/managed-flatpak-user-keys
+              rm -rf "$SYSTEM_KEYS" "$USER_KEYS"
+              mkdir -p "$SYSTEM_KEYS" "$USER_KEYS"
+
+              # New V3 backups store trusted keys explicitly.
+              [ ! -d "$FLATPAK_STATE/system-keys" ] || cp -a "$FLATPAK_STATE/system-keys/." "$SYSTEM_KEYS/" 2>/dev/null || true
+              [ ! -d "$FLATPAK_STATE/user-keys" ] || cp -a "$FLATPAK_STATE/user-keys/." "$USER_KEYS/" 2>/dev/null || true
+
+              # Compatibility with early V3 caches: extract only trusted keyring
+              # files from the old metadata tar, never its refs/config.
               if [ -s "$FLATPAK_STATE/system-repo-meta.tar" ]; then
-                sudo tar --acls --xattrs -xpf "$FLATPAK_STATE/system-repo-meta.tar" -C /
+                while IFS= read -r member || [ -n "$member" ]; do
+                  case "$member" in
+                    var/lib/flatpak/repo/*.trustedkeys.gpg)
+                      sudo tar -xOf "$FLATPAK_STATE/system-repo-meta.tar" "$member" >"$SYSTEM_KEYS/$(basename "$member")"
+                      ;;
+                  esac
+                done < <(sudo tar -tf "$FLATPAK_STATE/system-repo-meta.tar")
               fi
+
+              # Early V3 Home backups may contain a user OSTree repo. Preserve only
+              # its trusted keys, then discard the repo so refs are rebuilt cleanly.
+              USER_REPO="/home/${DESKTOP_USERNAME}/.local/share/flatpak/repo"
+              if [ -d "$USER_REPO" ]; then
+                sudo find "$USER_REPO" -maxdepth 1 -type f -name '*.trustedkeys.gpg' -exec cp -a {} "$USER_KEYS/" \; || true
+                sudo rm -rf "$USER_REPO"
+              fi
+              chmod -R a+rX "$SYSTEM_KEYS" "$USER_KEYS" 2>/dev/null || true
 
               if [ -s "$FLATPAK_STATE/system-remotes.tsv" ]; then
                 while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
                   [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
                   actual_url=$(flatpak remotes --system --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
-                  [ -n "$actual_url" ] || { echo "::error::Flatpak system remote trust metadata was not restored: $remote_name"; exit 1; }
-                  [ "$actual_url" = "$remote_url" ] || { echo "::error::Flatpak system remote URL mismatch for $remote_name"; exit 1; }
+                  if [ -z "$actual_url" ]; then
+                    key_file="$SYSTEM_KEYS/${remote_name}.trustedkeys.gpg"
+                    [ -s "$key_file" ] || { echo "::error::Flatpak system remote GPG key missing: $remote_name"; exit 1; }
+                    sudo flatpak remote-add --system --if-not-exists --gpg-import="$key_file" "$remote_name" "$remote_url"
+                  elif [ "$actual_url" != "$remote_url" ]; then
+                    sudo flatpak remote-modify --system --url="$remote_url" "$remote_name"
+                  fi
+                  actual_url=$(flatpak remotes --system --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
+                  [ "$actual_url" = "$remote_url" ] || { echo "::error::Flatpak system remote restore failed: $remote_name"; exit 1; }
                 done <"$FLATPAK_STATE/system-remotes.tsv"
               fi
+
               if [ -s "$FLATPAK_STATE/user-remotes.tsv" ]; then
                 while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
                   [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
-                  actual_url=$(sudo -H -u "$DESKTOP_USERNAME" flatpak remotes --user --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
-                  [ -n "$actual_url" ] || { echo "::error::Flatpak user remote trust metadata was not restored: $remote_name"; exit 1; }
-                  [ "$actual_url" = "$remote_url" ] || { echo "::error::Flatpak user remote URL mismatch for $remote_name"; exit 1; }
+                  actual_url=$("${FLATPAK_USER[@]}" remotes --user --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
+                  if [ -z "$actual_url" ]; then
+                    key_file="$USER_KEYS/${remote_name}.trustedkeys.gpg"
+                    [ -s "$key_file" ] || { echo "::error::Flatpak user remote GPG key missing: $remote_name"; exit 1; }
+                    "${FLATPAK_USER[@]}" remote-add --user --if-not-exists --gpg-import="$key_file" "$remote_name" "$remote_url"
+                  elif [ "$actual_url" != "$remote_url" ]; then
+                    "${FLATPAK_USER[@]}" remote-modify --user --url="$remote_url" "$remote_name"
+                  fi
+                  actual_url=$("${FLATPAK_USER[@]}" remotes --user --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
+                  [ "$actual_url" = "$remote_url" ] || { echo "::error::Flatpak user remote restore failed: $remote_name"; exit 1; }
                 done <"$FLATPAK_STATE/user-remotes.tsv"
               fi
+
               if [ -s "$FLATPAK_STATE/system-refs.tsv" ]; then
                 while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
                   [ -n "$ref" ] && [ -n "$origin" ] || continue
@@ -449,9 +488,9 @@ jobs:
               if [ -s "$FLATPAK_STATE/user-refs.tsv" ]; then
                 while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
                   [ -n "$ref" ] && [ -n "$origin" ] || continue
-                  sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref 2>/dev/null | grep -Fxq "$ref" \
-                    || sudo -H -u "$DESKTOP_USERNAME" flatpak install -y --noninteractive --user "$origin" "$ref"
-                  sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref 2>/dev/null | grep -Fxq "$ref" \
+                  "${FLATPAK_USER[@]}" list --user --columns=ref 2>/dev/null | grep -Fxq "$ref" \
+                    || "${FLATPAK_USER[@]}" install -y --noninteractive --user "$origin" "$ref"
+                  "${FLATPAK_USER[@]}" list --user --columns=ref 2>/dev/null | grep -Fxq "$ref" \
                     || { echo "::error::Flatpak user ref verification failed: $ref"; exit 1; }
                 done <"$FLATPAK_STATE/user-refs.tsv"
               fi
@@ -580,7 +619,8 @@ jobs:
               /tmp/managed-desktop-backup/home \
               /tmp/managed-desktop-backup/apt/debs \
               /tmp/managed-desktop-backup/snap/files \
-              /tmp/managed-desktop-backup/flatpak \
+              /tmp/managed-desktop-backup/flatpak/system-keys \
+              /tmp/managed-desktop-backup/flatpak/user-keys \
               /tmp/managed-desktop-backup/systemd \
               /tmp/managed-desktop-backup/cron \
               /tmp/managed-desktop-backup/system
@@ -605,7 +645,7 @@ jobs:
               sudo systemctl stop "$unit" >/dev/null 2>&1 || echo "::warning::Could not stop $unit before backup"
             done </tmp/managed-desktop-backup/systemd/running-added.txt
 
-            sudo rsync -aHAX --delete --exclude='.cache/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
+            sudo rsync -aHAX --delete --exclude='.cache/' --exclude='.local/share/flatpak/repo/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
 
             # Package-manager state: sources/keys, manual package delta, package
             # version delta, plus exact .deb payloads where possible.
@@ -665,20 +705,24 @@ jobs:
               done </tmp/managed-ubuntu-added-snaps.txt
             fi
 
-            # Flatpak state: remote/ref inventory plus system OSTree metadata that
-            # contains the remote GPG trust configuration. User OSTree metadata is
-            # already covered by the Home backup under ~/.local/share/flatpak.
+            # Flatpak state: keep only remote/ref inventory and trusted GPG keys.
+            # Do not archive partial OSTree refs/config without objects: doing so can
+            # leave refs pointing at missing commits on a fresh runner. Apps/runtimes
+            # are reinstalled from their signed remotes; app data remains in Home.
             if command -v flatpak >/dev/null 2>&1; then
+              FLATPAK_USER=(sudo -H -u "$DESKTOP_USERNAME" env -u SUDO_USER -u SUDO_UID -u SUDO_GID flatpak)
               flatpak remotes --system --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/system-remotes.tsv || true
               flatpak list --system --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/system-refs.tsv || true
-              sudo -H -u "$DESKTOP_USERNAME" flatpak remotes --user --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-remotes.tsv || true
-              sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-refs.tsv || true
+              "${FLATPAK_USER[@]}" remotes --user --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-remotes.tsv || true
+              "${FLATPAK_USER[@]}" list --user --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-refs.tsv || true
               if [ -d /var/lib/flatpak/repo ]; then
-                sudo tar --acls --xattrs -cpf /tmp/managed-desktop-backup/flatpak/system-repo-meta.tar \
-                  --exclude='var/lib/flatpak/repo/objects' \
-                  --exclude='var/lib/flatpak/repo/tmp' \
-                  --exclude='var/lib/flatpak/repo/state' \
-                  -C / var/lib/flatpak/repo
+                sudo find /var/lib/flatpak/repo -maxdepth 1 -type f -name '*.trustedkeys.gpg' \
+                  -exec cp -a {} /tmp/managed-desktop-backup/flatpak/system-keys/ \; || true
+              fi
+              USER_FLATPAK_REPO="/home/${DESKTOP_USERNAME}/.local/share/flatpak/repo"
+              if [ -d "$USER_FLATPAK_REPO" ]; then
+                sudo find "$USER_FLATPAK_REPO" -maxdepth 1 -type f -name '*.trustedkeys.gpg' \
+                  -exec cp -a {} /tmp/managed-desktop-backup/flatpak/user-keys/ \; || true
               fi
             fi
 
