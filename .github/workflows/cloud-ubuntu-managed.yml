@@ -576,13 +576,24 @@ jobs:
           echo "::add-mask::${UBUNTU_SOCKS5_PASSWORD}"
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends dante-server
-          if id "$UBUNTU_SOCKS5_USERNAME" >/dev/null 2>&1; then
-            sudo usermod -s /usr/sbin/nologin "$UBUNTU_SOCKS5_USERNAME" || true
-          else
-            sudo useradd -M -s /usr/sbin/nologin "$UBUNTU_SOCKS5_USERNAME"
-          fi
-          printf '%s:%s\n' "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" | sudo chpasswd
+          sudo apt-get install -y --no-install-recommends dante-server libpam-pwdfile openssl
+
+          # SOCKS5 credentials are intentionally isolated from Linux/SSH accounts.
+          # The proxy username may be identical to DESKTOP_USERNAME without sharing
+          # its shell, UID, /etc/shadow password, or any other system-account state.
+          SOCKS5_HASH=$(printf '%s\n' "$UBUNTU_SOCKS5_PASSWORD" | openssl passwd -6 -stdin)
+          [ -n "$SOCKS5_HASH" ] || { echo '::error::Unable to hash Ubuntu SOCKS5 password'; exit 1; }
+          sudo install -d -m 0755 /etc/cloud-manager
+          printf '%s:%s\n' "$UBUNTU_SOCKS5_USERNAME" "$SOCKS5_HASH" | sudo tee /etc/cloud-manager/socks5.passwd >/dev/null
+          sudo chown root:proxy /etc/cloud-manager/socks5.passwd
+          sudo chmod 640 /etc/cloud-manager/socks5.passwd
+          sudo tee /etc/pam.d/cloud-manager-socks5 >/dev/null <<'EOF'
+          auth required pam_pwdfile.so pwdfile=/etc/cloud-manager/socks5.passwd nodelay
+          account required pam_permit.so
+          session required pam_permit.so
+          password required pam_deny.so
+          EOF
+
           EXT_IF=$(ip route show default | awk 'NR==1 {print $5}')
           [ -n "$EXT_IF" ] || { echo '::error::Unable to determine Ubuntu egress interface'; exit 1; }
           sudo tee /etc/danted.conf >/dev/null <<EOF
@@ -590,7 +601,8 @@ jobs:
           internal: 127.0.0.1 port = ${UBUNTU_SOCKS5_PORT}
           external: ${EXT_IF}
           clientmethod: none
-          socksmethod: username
+          socksmethod: pam.username
+          pam.servicename: cloud-manager-socks5
           user.privileged: proxy
           user.unprivileged: nobody
           client pass {
@@ -607,6 +619,9 @@ jobs:
           sudo systemctl restart danted
           sudo systemctl is-active --quiet danted || { sudo journalctl -u danted -n 80 --no-pager || true; exit 1; }
           ss -ltn | grep -Eq "127\\.0\\.0\\.1:${UBUNTU_SOCKS5_PORT}[[:space:]]" || { echo '::error::Ubuntu SOCKS5 listener is not ready'; exit 1; }
+          curl -fsS --max-time 20 --socks5-hostname "127.0.0.1:${UBUNTU_SOCKS5_PORT}" --proxy-user "${UBUNTU_SOCKS5_USERNAME}:${UBUNTU_SOCKS5_PASSWORD}" https://www.cloudflare.com/cdn-cgi/trace -o /tmp/cloud-manager-socks5-selftest
+          grep -q '^ip=' /tmp/cloud-manager-socks5-selftest || { echo '::error::Ubuntu SOCKS5 authentication/egress self-test failed'; exit 1; }
+          rm -f /tmp/cloud-manager-socks5-selftest
           echo "UBUNTU_SOCKS5_READY=127.0.0.1:${UBUNTU_SOCKS5_PORT}"
 
       - name: Start Cloudflare TCP tunnel
