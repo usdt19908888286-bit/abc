@@ -1227,10 +1227,35 @@ jobs:
               try {
                 if ($driver.binary_file -and $driver.binary_path) {
                   $sourceFile = Join-Path (Join-Path $stateRoot 'drivers\files') ([string]$driver.binary_file)
-                  if (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
-                    $targetFile = [string]$driver.binary_path
-                    New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($targetFile)) -Force | Out-Null
-                    Copy-Item -LiteralPath $sourceFile -Destination $targetFile -Force
+                  if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
+                    throw "Driver binary payload is missing: $sourceFile"
+                  }
+                  $targetFile = [string]$driver.binary_path
+                  New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($targetFile)) -Force | Out-Null
+                  $sourceHash = (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256 -ErrorAction Stop).Hash
+                  $targetHash = ''
+                  if (Test-Path -LiteralPath $targetFile -PathType Leaf) {
+                    try { $targetHash = (Get-FileHash -LiteralPath $targetFile -Algorithm SHA256 -ErrorAction Stop).Hash } catch { $targetHash = '' }
+                  }
+                  if ($targetHash -and $targetHash -eq $sourceHash) {
+                    Write-Host "MANAGED_WINDOWS_DRIVER_BINARY_ALREADY_MATCHED name=$($driver.name) path=$targetFile sha256=$sourceHash"
+                  } else {
+                    try {
+                      Copy-Item -LiteralPath $sourceFile -Destination $targetFile -Force -ErrorAction Stop
+                    } catch {
+                      # DriverStore/PnP restore can load the driver before this generic
+                      # driver-delta pass. A loaded .sys may be locked against overwrite;
+                      # accept that only when the live binary is byte-identical to backup.
+                      $postFailureHash = ''
+                      if (Test-Path -LiteralPath $targetFile -PathType Leaf) {
+                        try { $postFailureHash = (Get-FileHash -LiteralPath $targetFile -Algorithm SHA256 -ErrorAction Stop).Hash } catch { $postFailureHash = '' }
+                      }
+                      if (-not $postFailureHash -or $postFailureHash -ne $sourceHash) { throw }
+                      Write-Host "MANAGED_WINDOWS_DRIVER_BINARY_LOCKED_MATCH name=$($driver.name) path=$targetFile sha256=$sourceHash"
+                    }
+                    $verifiedHash = (Get-FileHash -LiteralPath $targetFile -Algorithm SHA256 -ErrorAction Stop).Hash
+                    if ($verifiedHash -ne $sourceHash) { throw "Driver binary hash mismatch after restore: $targetFile" }
+                    Write-Host "MANAGED_WINDOWS_DRIVER_BINARY_VERIFIED name=$($driver.name) path=$targetFile sha256=$sourceHash"
                   }
                 }
                 if ($driver.registry_file) {
