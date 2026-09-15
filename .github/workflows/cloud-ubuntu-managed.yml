@@ -363,35 +363,6 @@ jobs:
               echo 'MANAGED_UBUNTU_SNAP_RESTORE_APPLIED'
             fi
 
-            FLATPAK_STATE=/tmp/managed-desktop-backup/flatpak
-            if [ -d "$FLATPAK_STATE" ] && { [ -s "$FLATPAK_STATE/system-remotes.tsv" ] || [ -s "$FLATPAK_STATE/user-remotes.tsv" ] || [ -s "$FLATPAK_STATE/system-refs.tsv" ] || [ -s "$FLATPAK_STATE/user-refs.tsv" ]; }; then
-              command -v flatpak >/dev/null 2>&1 || { echo '::error::Flatpak backup exists but flatpak is unavailable after package restore.'; exit 1; }
-              if [ -s "$FLATPAK_STATE/system-remotes.tsv" ]; then
-                while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
-                  [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
-                  sudo flatpak remote-add --system --if-not-exists "$remote_name" "$remote_url"
-                done <"$FLATPAK_STATE/system-remotes.tsv"
-              fi
-              if [ -s "$FLATPAK_STATE/user-remotes.tsv" ]; then
-                while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
-                  [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
-                  sudo -H -u "$DESKTOP_USERNAME" flatpak remote-add --user --if-not-exists "$remote_name" "$remote_url"
-                done <"$FLATPAK_STATE/user-remotes.tsv"
-              fi
-              if [ -s "$FLATPAK_STATE/system-refs.tsv" ]; then
-                while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
-                  [ -n "$ref" ] && [ -n "$origin" ] || continue
-                  sudo flatpak install -y --noninteractive --system "$origin" "$ref"
-                done <"$FLATPAK_STATE/system-refs.tsv"
-              fi
-              if [ -s "$FLATPAK_STATE/user-refs.tsv" ]; then
-                while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
-                  [ -n "$ref" ] && [ -n "$origin" ] || continue
-                  sudo -H -u "$DESKTOP_USERNAME" flatpak install -y --noninteractive --user "$origin" "$ref"
-                done <"$FLATPAK_STATE/user-refs.tsv"
-              fi
-              echo 'MANAGED_UBUNTU_FLATPAK_RESTORE_APPLIED'
-            fi
 
             SYSTEM_STATE=/tmp/managed-desktop-backup/system
             if [ -s "$SYSTEM_STATE/delta.tar" ]; then
@@ -432,6 +403,55 @@ jobs:
 
             sudo rsync -aHAX /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
             sudo chown -R "${DESKTOP_USERNAME}:${DESKTOP_USERNAME}" "/home/${DESKTOP_USERNAME}"
+
+            # Flatpak remotes carry GPG trust material inside their OSTree repo
+            # metadata. Restore that metadata instead of recreating remotes from
+            # URL alone (which would either fail signature validation or require an
+            # unsafe --no-gpg-verify fallback). User repo metadata is restored by
+            # the Home rsync above; system repo metadata is a small explicit archive.
+            FLATPAK_STATE=/tmp/managed-desktop-backup/flatpak
+            if [ -d "$FLATPAK_STATE" ] && { [ -s "$FLATPAK_STATE/system-remotes.tsv" ] || [ -s "$FLATPAK_STATE/user-remotes.tsv" ] || [ -s "$FLATPAK_STATE/system-refs.tsv" ] || [ -s "$FLATPAK_STATE/user-refs.tsv" ]; }; then
+              command -v flatpak >/dev/null 2>&1 || { echo '::error::Flatpak backup exists but flatpak is unavailable after package restore.'; exit 1; }
+              if [ -s "$FLATPAK_STATE/system-repo-meta.tar" ]; then
+                sudo tar --acls --xattrs -xpf "$FLATPAK_STATE/system-repo-meta.tar" -C /
+              fi
+
+              if [ -s "$FLATPAK_STATE/system-remotes.tsv" ]; then
+                while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
+                  [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
+                  actual_url=$(flatpak remotes --system --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
+                  [ -n "$actual_url" ] || { echo "::error::Flatpak system remote trust metadata was not restored: $remote_name"; exit 1; }
+                  [ "$actual_url" = "$remote_url" ] || { echo "::error::Flatpak system remote URL mismatch for $remote_name"; exit 1; }
+                done <"$FLATPAK_STATE/system-remotes.tsv"
+              fi
+              if [ -s "$FLATPAK_STATE/user-remotes.tsv" ]; then
+                while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
+                  [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
+                  actual_url=$(sudo -H -u "$DESKTOP_USERNAME" flatpak remotes --user --columns=name,url 2>/dev/null | awk -F '\t' -v n="$remote_name" '$1 == n {print $2; exit}')
+                  [ -n "$actual_url" ] || { echo "::error::Flatpak user remote trust metadata was not restored: $remote_name"; exit 1; }
+                  [ "$actual_url" = "$remote_url" ] || { echo "::error::Flatpak user remote URL mismatch for $remote_name"; exit 1; }
+                done <"$FLATPAK_STATE/user-remotes.tsv"
+              fi
+              if [ -s "$FLATPAK_STATE/system-refs.tsv" ]; then
+                while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
+                  [ -n "$ref" ] && [ -n "$origin" ] || continue
+                  flatpak list --system --columns=ref 2>/dev/null | grep -Fxq "$ref" \
+                    || sudo flatpak install -y --noninteractive --system "$origin" "$ref"
+                  flatpak list --system --columns=ref 2>/dev/null | grep -Fxq "$ref" \
+                    || { echo "::error::Flatpak system ref verification failed: $ref"; exit 1; }
+                done <"$FLATPAK_STATE/system-refs.tsv"
+              fi
+              if [ -s "$FLATPAK_STATE/user-refs.tsv" ]; then
+                while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
+                  [ -n "$ref" ] && [ -n "$origin" ] || continue
+                  sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref 2>/dev/null | grep -Fxq "$ref" \
+                    || sudo -H -u "$DESKTOP_USERNAME" flatpak install -y --noninteractive --user "$origin" "$ref"
+                  sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref 2>/dev/null | grep -Fxq "$ref" \
+                    || { echo "::error::Flatpak user ref verification failed: $ref"; exit 1; }
+                done <"$FLATPAK_STATE/user-refs.tsv"
+              fi
+              echo 'MANAGED_UBUNTU_FLATPAK_RESTORE_APPLIED'
+            fi
 
             CRON_STATE=/tmp/managed-desktop-backup/cron
             if command -v crontab >/dev/null 2>&1 && [ -d "$CRON_STATE" ]; then
@@ -640,12 +660,21 @@ jobs:
               done </tmp/managed-ubuntu-added-snaps.txt
             fi
 
-            # Flatpak state is small metadata and can be replayed from configured remotes.
+            # Flatpak state: remote/ref inventory plus system OSTree metadata that
+            # contains the remote GPG trust configuration. User OSTree metadata is
+            # already covered by the Home backup under ~/.local/share/flatpak.
             if command -v flatpak >/dev/null 2>&1; then
               flatpak remotes --system --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/system-remotes.tsv || true
               flatpak list --system --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/system-refs.tsv || true
               sudo -H -u "$DESKTOP_USERNAME" flatpak remotes --user --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-remotes.tsv || true
               sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-refs.tsv || true
+              if [ -d /var/lib/flatpak/repo ]; then
+                sudo tar --acls --xattrs -cpf /tmp/managed-desktop-backup/flatpak/system-repo-meta.tar \
+                  --exclude='var/lib/flatpak/repo/objects' \
+                  --exclude='var/lib/flatpak/repo/tmp' \
+                  --exclude='var/lib/flatpak/repo/state' \
+                  -C / var/lib/flatpak/repo
+              fi
             fi
 
             # Root and desktop-user crontabs are outside the normal /etc tree.
