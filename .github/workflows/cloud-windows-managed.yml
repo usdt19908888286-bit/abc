@@ -1301,30 +1301,84 @@ jobs:
                   $regImportExit = $LASTEXITCODE
                   if ($regImportExit -ne 0) {
                     # PnP can create/load the driver before this generic delta pass.
-                    # The service key's Enum/Security branches are then OS-managed and
-                    # can reject an otherwise valid full .reg import. Retry only the
-                    # stable installer-owned branches; dynamic bindings are verified by
-                    # the PnP verifier separately.
+                    # A loaded service key may be protected against writes. Materialize
+                    # the saved stable registry tree under a writable probe location,
+                    # excluding only OS-owned dynamic Enum/Security branches, then
+                    # recursively prove that every saved stable value/subkey already
+                    # exists identically in the live driver key.
                     $driverName = [string]$driver.name
                     $rootReg = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$driverName"
-                    $escapedRoot = [regex]::Escape($rootReg)
-                    $sanitizedReg = Join-Path $env:RUNNER_TEMP ("managed-driver-{0}.reg" -f ([guid]::NewGuid().ToString('N')))
+                    $probeId = [guid]::NewGuid().ToString('N')
+                    $probeRootReg = "HKEY_LOCAL_MACHINE\SOFTWARE\ManagedRestoreDriverVerify\$probeId"
+                    $probeRootProvider = "HKLM:\SOFTWARE\ManagedRestoreDriverVerify\$probeId"
+                    $probeRegFile = Join-Path $env:RUNNER_TEMP ("managed-driver-probe-{0}.reg" -f $probeId)
                     $lines = @(Get-Content -LiteralPath $regFile -ErrorAction Stop)
                     $outputLines = [System.Collections.Generic.List[string]]::new()
                     $skipSection = $false
                     foreach ($line in $lines) {
                       if ($line -match '^\[(.+)\]\s*$') {
                         $section = [string]$matches[1]
-                        $skipSection = ($section -match "^${escapedRoot}\\(Enum|Security)(\\|$)")
+                        if ($section.Equals($rootReg,[System.StringComparison]::OrdinalIgnoreCase) -or $section.StartsWith("$rootReg\",[System.StringComparison]::OrdinalIgnoreCase)) {
+                          $relativeSection = $section.Substring($rootReg.Length)
+                          $skipSection = ($relativeSection -match '^(?i)\\(Enum|Security)(\\|$)')
+                          if (-not $skipSection) { [void]$outputLines.Add("[$probeRootReg$relativeSection]") }
+                        } else {
+                          $skipSection = $true
+                        }
+                        continue
                       }
                       if (-not $skipSection) { [void]$outputLines.Add([string]$line) }
                     }
-                    Set-Content -LiteralPath $sanitizedReg -Value $outputLines -Encoding Unicode
-                    & reg.exe import $sanitizedReg | Out-Null
-                    $sanitizedExit = $LASTEXITCODE
-                    Remove-Item -LiteralPath $sanitizedReg -Force -ErrorAction SilentlyContinue
-                    if ($sanitizedExit -ne 0) { throw "driver stable registry import exited $sanitizedExit after full import exit=$regImportExit" }
-                    Write-Host "MANAGED_WINDOWS_DRIVER_REGISTRY_SANITIZED_RESTORED name=$driverName"
+                    Set-Content -LiteralPath $probeRegFile -Value $outputLines -Encoding Unicode
+                    New-Item -ItemType Directory -Path 'HKLM:\SOFTWARE\ManagedRestoreDriverVerify' -Force | Out-Null
+                    & reg.exe import $probeRegFile | Out-Null
+                    $probeImportExit = $LASTEXITCODE
+                    Remove-Item -LiteralPath $probeRegFile -Force -ErrorAction SilentlyContinue
+                    if ($probeImportExit -ne 0 -or -not (Test-Path -LiteralPath $probeRootProvider)) {
+                      throw "driver registry probe import failed exit=$probeImportExit after live import exit=$regImportExit"
+                    }
+
+                    function Test-ManagedRegistryExpectedTree {
+                      param([Parameter(Mandatory=$true)][string]$ExpectedPath,[Parameter(Mandatory=$true)][string]$ActualPath)
+                      if (-not (Test-Path -LiteralPath $ActualPath)) { Write-Warning "Driver registry live subkey missing: $ActualPath"; return $false }
+                      $expectedKey = Get-Item -LiteralPath $ExpectedPath -ErrorAction Stop
+                      $actualKey = Get-Item -LiteralPath $ActualPath -ErrorAction Stop
+                      $actualValueNames = @($actualKey.GetValueNames())
+                      foreach ($valueName in @($expectedKey.GetValueNames())) {
+                        if (-not ($actualValueNames -icontains $valueName)) { Write-Warning "Driver registry live value missing key=$ActualPath value=$valueName"; return $false }
+                        $expectedKind = $expectedKey.GetValueKind($valueName)
+                        $actualKind = $actualKey.GetValueKind($valueName)
+                        if ($expectedKind -ne $actualKind) { Write-Warning "Driver registry value kind mismatch key=$ActualPath value=$valueName expected=$expectedKind actual=$actualKind"; return $false }
+                        $expectedValue = $expectedKey.GetValue($valueName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                        $actualValue = $actualKey.GetValue($valueName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                        $same = $false
+                        if ($expectedValue -is [byte[]]) {
+                          $same = ($actualValue -is [byte[]]) -and ([Convert]::ToBase64String($expectedValue) -ceq [Convert]::ToBase64String($actualValue))
+                        } elseif ($expectedValue -is [string[]]) {
+                          if ($actualValue -is [string[]] -and $expectedValue.Count -eq $actualValue.Count) {
+                            $same = $true
+                            for ($i = 0; $i -lt $expectedValue.Count; $i++) { if (-not ([string]$expectedValue[$i]).Equals([string]$actualValue[$i],[System.StringComparison]::Ordinal)) { $same = $false; break } }
+                          }
+                        } else {
+                          $same = ([string]$expectedValue).Equals([string]$actualValue,[System.StringComparison]::Ordinal)
+                        }
+                        if (-not $same) { Write-Warning "Driver registry value mismatch key=$ActualPath value=$valueName"; return $false }
+                      }
+                      foreach ($subName in @($expectedKey.GetSubKeyNames())) {
+                        if (-not (Test-ManagedRegistryExpectedTree -ExpectedPath (Join-Path $ExpectedPath $subName) -ActualPath (Join-Path $ActualPath $subName))) { return $false }
+                      }
+                      return $true
+                    }
+
+                    $liveRootProvider = "HKLM:\SYSTEM\CurrentControlSet\Services\$driverName"
+                    try {
+                      if (-not (Test-ManagedRegistryExpectedTree -ExpectedPath $probeRootProvider -ActualPath $liveRootProvider)) {
+                        throw 'saved stable registry tree does not match live PnP-restored tree'
+                      }
+                      Write-Host "MANAGED_WINDOWS_DRIVER_REGISTRY_LIVE_TREE_MATCH name=$driverName"
+                    } finally {
+                      Remove-Item -LiteralPath $probeRootProvider -Recurse -Force -ErrorAction SilentlyContinue
+                    }
                   }
 
                   $driverKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$([string]$driver.name)"
