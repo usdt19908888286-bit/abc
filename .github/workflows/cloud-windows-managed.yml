@@ -3596,6 +3596,35 @@ jobs:
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
+          function Ensure-ManagedConsoleSession {
+            # UU/other console-capture tools need the logged-on desktop to remain
+            # attached to the physical console. Closing an RDP client leaves the
+            # same user session in Disc state; move that disconnected session back
+            # to console instead of logging it off or creating another session.
+            try {
+              $rows = @(& quser.exe $env:DESKTOP_USERNAME 2>$null | Select-Object -Skip 1)
+              foreach ($row in $rows) {
+                $clean = (($row -replace '^\s*>?','').Trim())
+                if (-not $clean) { continue }
+                if ($clean -notmatch '^(?<user>\S+)\s+(?:(?<session>\S+)\s+)?(?<id>\d+)\s+(?<state>Active|Disc)\b') { continue }
+                if ([string]$matches.user -ne [string]$env:DESKTOP_USERNAME) { continue }
+                if ([string]$matches.state -ne 'Disc') { continue }
+                $sessionId = [int]$matches.id
+                Write-Host "MANAGED_RDP_DISCONNECTED session=$sessionId; reattaching to console"
+                & tscon.exe $sessionId /dest:console 2>&1 | Out-Host
+                if ($LASTEXITCODE -eq 0) {
+                  Write-Host "MANAGED_RDP_CONSOLE_REATTACHED session=$sessionId"
+                  Start-Sleep -Milliseconds 500
+                  return $true
+                }
+                Write-Warning "RDP console reattach failed session=$sessionId exit=$LASTEXITCODE"
+              }
+            } catch {
+              Write-Warning "RDP console reattach skipped: $($_.Exception.Message)"
+            }
+            return $false
+          }
+
           $commandTitle = "Cloud Windows Command $env:MACHINE_ID"
           while ($true) {
             $issue = $null
@@ -3634,6 +3663,7 @@ jobs:
               }
             }
 
+            [void](Ensure-ManagedConsoleSession)
             Hide-ManagedRunnerWindows
             [void](Ensure-ManagedRdpClipboard)
             Start-Sleep -Seconds 10
