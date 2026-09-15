@@ -260,9 +260,6 @@ jobs:
           PY
 
           if [ "$MACHINE_MODE" = 'restore' ]; then
-            [ -f /tmp/managed-desktop-backup/metadata.json ] || { echo '::error::Restore mode requested, but no managed Ubuntu backup was found.'; exit 1; }
-            [ -d /tmp/managed-desktop-backup/home ] || { echo '::error::Ubuntu backup home directory is missing.'; exit 1; }
-
             APT_STATE=/tmp/managed-desktop-backup/apt
             if [ -s "$APT_STATE/config.tar" ]; then
               sudo tar --acls --xattrs -xpf "$APT_STATE/config.tar" -C /
@@ -284,25 +281,29 @@ jobs:
                   sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}" || true
                 fi
 
-                MISSING_APT_PACKAGES=()
+                NEED_DEB_APT_PACKAGES=()
                 for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
-                  if ! dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
-                    MISSING_APT_PACKAGES+=("$pkg")
+                  saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
+                  actual_status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)
+                  actual_version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+                  if [ "$actual_status" != installed ] || { [ -n "$saved_version" ] && [ "$actual_version" != "$saved_version" ]; }; then
+                    NEED_DEB_APT_PACKAGES+=("$pkg")
                   fi
                 done
-                if [ "${#MISSING_APT_PACKAGES[@]}" -gt 0 ]; then
+                if [ "${#NEED_DEB_APT_PACKAGES[@]}" -gt 0 ]; then
                   shopt -s nullglob
                   RESTORE_DEBS=("$APT_STATE"/debs/*.deb)
                   shopt -u nullglob
                   if [ "${#RESTORE_DEBS[@]}" -gt 0 ]; then
-                    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${RESTORE_DEBS[@]}" || true
+                    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "${RESTORE_DEBS[@]}" || true
                   fi
                 fi
 
                 UNRESTORED_APT_PACKAGES=()
                 VERSION_MISMATCH_APT_PACKAGES=()
                 for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
-                  if ! dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+                  actual_status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)
+                  if [ "$actual_status" != installed ]; then
                     UNRESTORED_APT_PACKAGES+=("$pkg")
                     continue
                   fi
@@ -317,7 +318,11 @@ jobs:
                   exit 1
                 fi
                 if [ "${#VERSION_MISMATCH_APT_PACKAGES[@]}" -gt 0 ]; then
-                  printf '::warning::Exact saved apt version unavailable for: %s\n' "${VERSION_MISMATCH_APT_PACKAGES[*]}"
+                  printf '::error::Exact saved apt version restore failed for: %s\n' "${VERSION_MISMATCH_APT_PACKAGES[*]}"
+                  exit 1
+                fi
+                if [ "${#RESTORE_APT_MANUAL[@]}" -gt 0 ]; then
+                  sudo apt-mark manual "${RESTORE_APT_MANUAL[@]}" >/dev/null 2>&1 || true
                 fi
                 if [ "${#RESTORE_APT_MANUAL[@]}" -gt 0 ]; then
                   sudo apt-mark manual "${RESTORE_APT_MANUAL[@]}" >/dev/null 2>&1 || true
