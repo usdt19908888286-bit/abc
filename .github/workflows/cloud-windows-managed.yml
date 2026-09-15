@@ -749,26 +749,61 @@ jobs:
             $checked = 0
             $skippedVolatile = 0
             $skippedNonByteStable = 0
+            $repairedLive = 0
             $missing = 0
             $mismatch = 0
             $missingDetails = [System.Collections.Generic.List[string]]::new()
             $mismatchDetails = [System.Collections.Generic.List[string]]::new()
+
+            function Repair-ManagedProfileFileExact {
+              param(
+                [Parameter(Mandatory=$true)][string]$Source,
+                [Parameter(Mandatory=$true)][string]$Target,
+                [Parameter(Mandatory=$true)][string]$Relative
+              )
+              $lastError = ''
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                  $parent = [IO.Path]::GetDirectoryName($Target)
+                  if ($parent) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+                  Copy-Item -LiteralPath $Source -Destination $Target -Force -ErrorAction Stop
+                  if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) { throw 'target disappeared immediately after targeted replay' }
+                  $sourceLength = (Get-Item -LiteralPath $Source -Force -ErrorAction Stop).Length
+                  $targetLength = (Get-Item -LiteralPath $Target -Force -ErrorAction Stop).Length
+                  if ($sourceLength -ne $targetLength) { throw "length mismatch source=$sourceLength target=$targetLength" }
+                  $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256 -ErrorAction Stop).Hash
+                  $targetHash = (Get-FileHash -LiteralPath $Target -Algorithm SHA256 -ErrorAction Stop).Hash
+                  if ($sourceHash -ne $targetHash) { throw 'SHA256 mismatch immediately after targeted replay' }
+                  Write-Host "MANAGED_WINDOWS_PROFILE_TARGETED_REPLAY_OK relative=$Relative attempt=$attempt sha256=$sourceHash"
+                  return $true
+                } catch {
+                  $lastError = $_.Exception.Message
+                  Start-Sleep -Milliseconds 150
+                }
+              }
+              Write-Warning "MANAGED_WINDOWS_PROFILE_TARGETED_REPLAY_FAILED relative=$Relative error=$lastError"
+              return $false
+            }
+
             Get-ChildItem -LiteralPath $restoreProfile -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-              $relative = $_.FullName.Substring($restoreProfile.Length).TrimStart('\')
+              $source = $_.FullName
+              $relative = $source.Substring($restoreProfile.Length).TrimStart('\')
               if (Test-ManagedVolatilePath -Relative $relative) { $skippedVolatile++; return }
               $target = Join-Path $profileRoot $relative
               $checked++
-              if (-not (Test-Path -LiteralPath $target)) {
-                $missing++
-                if ($missingDetails.Count -lt 20) { [void]$missingDetails.Add($relative) }
-                return
-              }
               if (Test-ManagedNonByteStableVerifyPath -Relative $relative) {
                 $skippedNonByteStable++
                 return
               }
+              if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                if (Repair-ManagedProfileFileExact -Source $source -Target $target -Relative $relative) { $repairedLive++; return }
+                $missing++
+                if ($missingDetails.Count -lt 20) { [void]$missingDetails.Add($relative) }
+                return
+              }
               $targetLength = (Get-Item -LiteralPath $target -Force).Length
               if ($targetLength -ne $_.Length) {
+                if (Repair-ManagedProfileFileExact -Source $source -Target $target -Relative $relative) { $repairedLive++; return }
                 $mismatch++
                 if ($mismatchDetails.Count -lt 20) {
                   [void]$mismatchDetails.Add("$relative sourceBytes=$($_.Length) targetBytes=$targetLength")
@@ -778,9 +813,10 @@ jobs:
             foreach ($detail in $missingDetails) { Write-Warning "MANAGED_WINDOWS_PROFILE_VERIFY_MISSING $detail" }
             foreach ($detail in $mismatchDetails) { Write-Warning "MANAGED_WINDOWS_PROFILE_VERIFY_MISMATCH $detail" }
             if ($missing -gt 0 -or $mismatch -gt 0) {
-              throw "Windows profile restore verification failed: checked=$checked skippedVolatile=$skippedVolatile skippedNonByteStable=$skippedNonByteStable missing=$missing sizeMismatch=$mismatch"
+              throw "Windows profile restore verification failed: checked=$checked skippedVolatile=$skippedVolatile skippedNonByteStable=$skippedNonByteStable repairedLive=$repairedLive missing=$missing sizeMismatch=$mismatch"
             }
-            Write-Host "MANAGED_WINDOWS_PROFILE_VERIFY_OK files=$checked skippedVolatile=$skippedVolatile skippedNonByteStable=$skippedNonByteStable"
+            Write-Host "MANAGED_WINDOWS_PROFILE_VERIFY_OK files=$checked skippedVolatile=$skippedVolatile skippedNonByteStable=$skippedNonByteStable repairedLive=$repairedLive"
+            Write-Host 'MANAGED_DESKTOP_RESTORE_APPLIED'
             Write-Host 'MANAGED_DESKTOP_RESTORE_APPLIED'
           } else {
             Write-Host 'MANAGED_DESKTOP_FRESH_START'
