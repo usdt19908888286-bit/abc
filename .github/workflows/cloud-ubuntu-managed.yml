@@ -73,7 +73,7 @@ jobs:
           BODY=$(printf '{"instanceKey":"%s","repository":"%s","runId":%s}' "$INSTANCE_KEY" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           WEB_URL="${WEB_URL%/}"
           case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare control URL is invalid'; exit 1 ;; esac
-          curl -fsS --retry 3 -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/bootstrap" -o /tmp/cloud-bootstrap.json
+          curl -fsS --connect-timeout 10 --max-time 75 --retry 1 --retry-delay 2 -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/bootstrap" -o /tmp/cloud-bootstrap.json
           TS_CLIENT_ID=$(jq -r '.tailscaleClientId // empty' /tmp/cloud-bootstrap.json)
           TS_CLIENT_SECRET=$(jq -r '.tailscaleClientSecret // empty' /tmp/cloud-bootstrap.json)
           CLOUD_PASSWORD=$(jq -r '.desktopPassword // empty' /tmp/cloud-bootstrap.json)
@@ -585,8 +585,8 @@ jobs:
           [ -n "$SOCKS5_HASH" ] || { echo '::error::Unable to hash Ubuntu SOCKS5 password'; exit 1; }
           sudo install -d -m 0755 /etc/cloud-manager
           printf '%s:%s\n' "$UBUNTU_SOCKS5_USERNAME" "$SOCKS5_HASH" | sudo tee /etc/cloud-manager/socks5.passwd >/dev/null
-          sudo chown root:proxy /etc/cloud-manager/socks5.passwd
-          sudo chmod 640 /etc/cloud-manager/socks5.passwd
+          sudo chown root:root /etc/cloud-manager/socks5.passwd
+          sudo chmod 600 /etc/cloud-manager/socks5.passwd
           sudo tee /etc/pam.d/cloud-manager-socks5 >/dev/null <<'EOF'
           auth required pam_pwdfile.so pwdfile=/etc/cloud-manager/socks5.passwd nodelay
           account required pam_permit.so
@@ -602,8 +602,7 @@ jobs:
           external: ${EXT_IF}
           clientmethod: none
           socksmethod: pam.username
-          pam.servicename: cloud-manager-socks5
-          user.privileged: proxy
+          user.privileged: root
           user.unprivileged: nobody
           client pass {
             from: 127.0.0.1/32 to: 0.0.0.0/0
@@ -612,14 +611,30 @@ jobs:
           socks pass {
             from: 127.0.0.1/32 to: 0.0.0.0/0
             command: connect bind udpassociate
+            socksmethod: pam.username
+            pam.servicename: cloud-manager-socks5
             log: error
           }
           EOF
           sudo systemctl enable danted >/dev/null 2>&1 || true
           sudo systemctl restart danted
-          sudo systemctl is-active --quiet danted || { sudo journalctl -u danted -n 80 --no-pager || true; exit 1; }
-          ss -ltn | grep -Eq "127\\.0\\.0\\.1:${UBUNTU_SOCKS5_PORT}[[:space:]]" || { echo '::error::Ubuntu SOCKS5 listener is not ready'; exit 1; }
-          curl -fsS --max-time 20 --socks5-hostname "127.0.0.1:${UBUNTU_SOCKS5_PORT}" --proxy-user "${UBUNTU_SOCKS5_USERNAME}:${UBUNTU_SOCKS5_PASSWORD}" https://www.cloudflare.com/cdn-cgi/trace -o /tmp/cloud-manager-socks5-selftest
+          SOCKS5_LISTENER_READY=0
+          for _ in $(seq 1 20); do
+            if ss -ltnH | grep -Eq "127\\.0\\.0\\.1:${UBUNTU_SOCKS5_PORT}[[:space:]]"; then
+              SOCKS5_LISTENER_READY=1
+              break
+            fi
+            sudo systemctl is-active --quiet danted || break
+            sleep 0.5
+          done
+          if [ "$SOCKS5_LISTENER_READY" != '1' ]; then
+            echo '::error::Ubuntu SOCKS5 listener is not ready'
+            sudo systemctl status danted --no-pager || true
+            sudo journalctl -u danted -n 120 --no-pager || true
+            ss -ltnp || true
+            exit 1
+          fi
+          curl -fsS --connect-timeout 8 --max-time 20 --socks5-hostname "127.0.0.1:${UBUNTU_SOCKS5_PORT}" --proxy-user "${UBUNTU_SOCKS5_USERNAME}:${UBUNTU_SOCKS5_PASSWORD}" https://www.cloudflare.com/cdn-cgi/trace -o /tmp/cloud-manager-socks5-selftest
           grep -q '^ip=' /tmp/cloud-manager-socks5-selftest || { echo '::error::Ubuntu SOCKS5 authentication/egress self-test failed'; exit 1; }
           rm -f /tmp/cloud-manager-socks5-selftest
           echo "UBUNTU_SOCKS5_READY=127.0.0.1:${UBUNTU_SOCKS5_PORT}"
