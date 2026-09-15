@@ -151,17 +151,17 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y openssh-server rsync jq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server rsync jq dpkg-repack acl
 
-          # Capture the clean runner's manually-installed package baseline after
-          # workflow dependencies are present. Backup stores only packages added
-          # later by the user, so restore does not replay the whole runner image.
+          # V3 uses a clean-runner baseline. Installer/package state is replayed by
+          # package managers where possible; non-package filesystem changes are
+          # captured separately and restored only after package replay.
           apt-mark showmanual | LC_ALL=C sort -u >/tmp/managed-ubuntu-baseline-manual.txt
+          dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort -u \
+            >/tmp/managed-ubuntu-baseline-packages.tsv
 
           if ! id "$DESKTOP_USERNAME" >/dev/null 2>&1; then
             if getent group "$DESKTOP_USERNAME" >/dev/null 2>&1; then
-              # GitHub Ubuntu images already contain some system groups (notably "admin").
-              # Reuse an existing same-name group instead of asking useradd to create it again.
               sudo useradd -m -s /bin/bash -g "$DESKTOP_USERNAME" "$DESKTOP_USERNAME"
             else
               sudo useradd -m -s /bin/bash "$DESKTOP_USERNAME"
@@ -170,22 +170,118 @@ jobs:
           printf '%s:%s\n' "$DESKTOP_USERNAME" "$CLOUD_PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo "$DESKTOP_USERNAME"
 
+          (systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null || true) \
+            | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
+            >/tmp/managed-ubuntu-baseline-systemd-enabled.txt
+          (systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true) \
+            | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
+            >/tmp/managed-ubuntu-baseline-systemd-running.txt
+          if command -v snap >/dev/null 2>&1; then
+            (snap list 2>/dev/null || true) | awk 'NR>1 {print $1}' | LC_ALL=C sort -u \
+              >/tmp/managed-ubuntu-baseline-snaps.txt
+          else
+            : >/tmp/managed-ubuntu-baseline-snaps.txt
+          fi
+
+          # Record a metadata baseline for installer-owned system locations. The
+          # manifest uses lstat metadata (not file contents) to keep startup fast;
+          # backup hashes every changed regular file and restore verifies those hashes.
+          sudo python3 - <<'PY' >/tmp/managed-ubuntu-baseline-files.json
+          import fnmatch
+          import json
+          import os
+          import stat
+
+          ROOTS = [
+              '/etc', '/opt', '/usr/local', '/usr/bin', '/usr/sbin', '/usr/lib',
+              '/usr/libexec', '/usr/share', '/usr/src', '/var/lib', '/var/opt',
+              '/var/snap', '/var/www', '/srv', '/root',
+          ]
+          EXCLUDES = [
+              '/etc/apt', '/usr/share/keyrings', '/etc/hostname', '/etc/hosts',
+              '/etc/resolv.conf', '/etc/machine-id', '/etc/fstab', '/etc/crypttab',
+              '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow',
+              '/etc/subuid', '/etc/subgid', '/etc/netplan', '/etc/network',
+              '/etc/cloud', '/etc/ssh/ssh_host_*',
+              '/etc/ssh/sshd_config.d/99-managed-cloud.conf', '/var/lib/apt',
+              '/var/lib/dpkg', '/var/lib/systemd', '/var/lib/cloud',
+              '/var/lib/snapd', '/var/lib/flatpak', '/var/lib/tailscale',
+              '/var/lib/NetworkManager', '/var/lib/dbus', '/var/lib/waagent',
+              '/var/lib/private', '/root/.cache',
+          ]
+
+          def excluded(path):
+              path = os.path.normpath(path)
+              for pattern in EXCLUDES:
+                  if '*' in pattern:
+                      if fnmatch.fnmatch(path, pattern):
+                          return True
+                  else:
+                      pattern = os.path.normpath(pattern)
+                      if path == pattern or path.startswith(pattern + os.sep):
+                          return True
+              return False
+
+          def fingerprint(path):
+              st = os.lstat(path)
+              mode = st.st_mode
+              if stat.S_ISREG(mode): kind = 'f'
+              elif stat.S_ISDIR(mode): kind = 'd'
+              elif stat.S_ISLNK(mode): kind = 'l'
+              else: kind = 'o'
+              return [
+                  kind, stat.S_IMODE(mode), st.st_uid, st.st_gid,
+                  st.st_size, st.st_mtime_ns,
+                  os.readlink(path) if kind == 'l' else '',
+              ]
+
+          result = {}
+          stack = [root for root in ROOTS if os.path.lexists(root)]
+          while stack:
+              path = stack.pop()
+              if excluded(path):
+                  continue
+              try:
+                  fp = fingerprint(path)
+              except OSError:
+                  continue
+              result[path] = fp
+              if fp[0] != 'd':
+                  continue
+              try:
+                  with os.scandir(path) as it:
+                      for entry in it:
+                          child = entry.path
+                          if not excluded(child):
+                              stack.append(child)
+              except OSError:
+                  pass
+          print(json.dumps(result, separators=(',', ':'), sort_keys=True))
+          PY
+
           if [ "$MACHINE_MODE" = 'restore' ]; then
             [ -f /tmp/managed-desktop-backup/metadata.json ] || { echo '::error::Restore mode requested, but no managed Ubuntu backup was found.'; exit 1; }
             [ -d /tmp/managed-desktop-backup/home ] || { echo '::error::Ubuntu backup home directory is missing.'; exit 1; }
 
-            # V2 backups include the apt packages that were manually installed
-            # after the clean runner baseline. Reinstall by package name first so
-            # normal repositories can provide a compatible current build. Cached
-            # .deb payloads are a fallback for packages no longer resolvable by name.
             APT_STATE=/tmp/managed-desktop-backup/apt
-            if [ -s "$APT_STATE/manual-added.txt" ]; then
-              mapfile -t RESTORE_APT_PACKAGES < <(sed '/^[[:space:]]*$/d' "$APT_STATE/manual-added.txt" | LC_ALL=C sort -u)
+            if [ -s "$APT_STATE/config.tar" ]; then
+              sudo tar --acls --xattrs -xpf "$APT_STATE/config.tar" -C /
+              echo 'MANAGED_UBUNTU_APT_CONFIG_RESTORE_APPLIED'
+            fi
+
+            if [ -s "$APT_STATE/restore-packages.txt" ]; then
+              mapfile -t RESTORE_APT_PACKAGES < <(sed '/^[[:space:]]*$/d' "$APT_STATE/restore-packages.txt" | LC_ALL=C sort -u)
+              mapfile -t RESTORE_APT_MANUAL < <(sed '/^[[:space:]]*$/d' "$APT_STATE/manual-added.txt" 2>/dev/null | LC_ALL=C sort -u)
               if [ "${#RESTORE_APT_PACKAGES[@]}" -gt 0 ]; then
                 echo "MANAGED_UBUNTU_APT_RESTORE_COUNT=${#RESTORE_APT_PACKAGES[@]}"
-                sudo apt-get update -qq
-                if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}"; then
-                  echo '::warning::Some saved apt packages were not directly resolvable; trying cached .deb payloads.'
+                sudo apt-get update -qq || echo '::warning::apt update failed; cached .deb fallback will be attempted.'
+                RESTORE_APT_SPECS=()
+                for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
+                  saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
+                  if [ -n "$saved_version" ]; then RESTORE_APT_SPECS+=("${pkg}=${saved_version}"); else RESTORE_APT_SPECS+=("$pkg"); fi
+                done
+                if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_SPECS[@]}"; then
+                  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}" || true
                 fi
 
                 MISSING_APT_PACKAGES=()
@@ -194,7 +290,6 @@ jobs:
                     MISSING_APT_PACKAGES+=("$pkg")
                   fi
                 done
-
                 if [ "${#MISSING_APT_PACKAGES[@]}" -gt 0 ]; then
                   shopt -s nullglob
                   RESTORE_DEBS=("$APT_STATE"/debs/*.deb)
@@ -205,24 +300,169 @@ jobs:
                 fi
 
                 UNRESTORED_APT_PACKAGES=()
+                VERSION_MISMATCH_APT_PACKAGES=()
                 for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
                   if ! dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
                     UNRESTORED_APT_PACKAGES+=("$pkg")
+                    continue
+                  fi
+                  saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
+                  actual_version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+                  if [ -n "$saved_version" ] && [ "$actual_version" != "$saved_version" ]; then
+                    VERSION_MISMATCH_APT_PACKAGES+=("${pkg}:${actual_version}->${saved_version}")
                   fi
                 done
                 if [ "${#UNRESTORED_APT_PACKAGES[@]}" -gt 0 ]; then
                   printf '::error::Ubuntu package restore failed for: %s\n' "${UNRESTORED_APT_PACKAGES[*]}"
                   exit 1
                 fi
-                sudo apt-mark manual "${RESTORE_APT_PACKAGES[@]}" >/dev/null 2>&1 || true
+                if [ "${#VERSION_MISMATCH_APT_PACKAGES[@]}" -gt 0 ]; then
+                  printf '::warning::Exact saved apt version unavailable for: %s\n' "${VERSION_MISMATCH_APT_PACKAGES[*]}"
+                fi
+                if [ "${#RESTORE_APT_MANUAL[@]}" -gt 0 ]; then
+                  sudo apt-mark manual "${RESTORE_APT_MANUAL[@]}" >/dev/null 2>&1 || true
+                fi
                 echo 'MANAGED_UBUNTU_APT_RESTORE_APPLIED'
+              fi
+            elif [ -s "$APT_STATE/manual-added.txt" ]; then
+              # Backward compatibility with V2 backups.
+              mapfile -t RESTORE_APT_PACKAGES < <(sed '/^[[:space:]]*$/d' "$APT_STATE/manual-added.txt" | LC_ALL=C sort -u)
+              if [ "${#RESTORE_APT_PACKAGES[@]}" -gt 0 ]; then
+                sudo apt-get update -qq || true
+                sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}" || true
+                for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
+                  dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed \
+                    || { echo "::error::Ubuntu V2 package restore failed for $pkg"; exit 1; }
+                done
+                sudo apt-mark manual "${RESTORE_APT_PACKAGES[@]}" >/dev/null 2>&1 || true
+                echo 'MANAGED_UBUNTU_APT_RESTORE_APPLIED_V2'
               fi
             else
               echo 'MANAGED_UBUNTU_APT_RESTORE_LEGACY_BACKUP'
             fi
 
-            sudo rsync -a /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
+            SNAP_STATE=/tmp/managed-desktop-backup/snap
+            if [ -s "$SNAP_STATE/added.tsv" ]; then
+              command -v snap >/dev/null 2>&1 || { echo '::error::Snap backup exists but snap is unavailable after package restore.'; exit 1; }
+              sudo systemctl start snapd.socket >/dev/null 2>&1 || true
+              while IFS=$'\t' read -r snap_name snap_rev snap_channel snap_notes || [ -n "$snap_name" ]; do
+                [ -n "$snap_name" ] || continue
+                if snap list "$snap_name" >/dev/null 2>&1; then continue; fi
+                SNAP_ARGS=(install "$snap_name")
+                [ -z "$snap_channel" ] || [ "$snap_channel" = '-' ] || SNAP_ARGS+=("--channel=$snap_channel")
+                [[ "$snap_notes" == *classic* ]] && SNAP_ARGS+=(--classic)
+                if ! sudo snap "${SNAP_ARGS[@]}"; then
+                  cached_snap=$(find "$SNAP_STATE/files" -maxdepth 1 -type f -name "${snap_name}_${snap_rev}.snap" -print -quit 2>/dev/null || true)
+                  [ -n "$cached_snap" ] || { echo "::error::Snap restore failed for $snap_name"; exit 1; }
+                  LOCAL_SNAP_ARGS=(install "$cached_snap" --dangerous)
+                  [[ "$snap_notes" == *classic* ]] && LOCAL_SNAP_ARGS+=(--classic)
+                  sudo snap "${LOCAL_SNAP_ARGS[@]}"
+                fi
+                snap list "$snap_name" >/dev/null 2>&1 || { echo "::error::Snap verification failed for $snap_name"; exit 1; }
+              done <"$SNAP_STATE/added.tsv"
+              echo 'MANAGED_UBUNTU_SNAP_RESTORE_APPLIED'
+            fi
+
+            FLATPAK_STATE=/tmp/managed-desktop-backup/flatpak
+            if [ -d "$FLATPAK_STATE" ] && { [ -s "$FLATPAK_STATE/system-refs.tsv" ] || [ -s "$FLATPAK_STATE/user-refs.tsv" ]; }; then
+              command -v flatpak >/dev/null 2>&1 || { echo '::error::Flatpak backup exists but flatpak is unavailable after package restore.'; exit 1; }
+              if [ -s "$FLATPAK_STATE/system-remotes.tsv" ]; then
+                while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
+                  [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
+                  sudo flatpak remote-add --system --if-not-exists "$remote_name" "$remote_url"
+                done <"$FLATPAK_STATE/system-remotes.tsv"
+              fi
+              if [ -s "$FLATPAK_STATE/user-remotes.tsv" ]; then
+                while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
+                  [ -n "$remote_name" ] && [ -n "$remote_url" ] || continue
+                  sudo -H -u "$DESKTOP_USERNAME" flatpak remote-add --user --if-not-exists "$remote_name" "$remote_url"
+                done <"$FLATPAK_STATE/user-remotes.tsv"
+              fi
+              if [ -s "$FLATPAK_STATE/system-refs.tsv" ]; then
+                while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
+                  [ -n "$ref" ] && [ -n "$origin" ] || continue
+                  sudo flatpak install -y --noninteractive --system "$origin" "$ref"
+                done <"$FLATPAK_STATE/system-refs.tsv"
+              fi
+              if [ -s "$FLATPAK_STATE/user-refs.tsv" ]; then
+                while IFS=$'\t' read -r ref origin || [ -n "$ref" ]; do
+                  [ -n "$ref" ] && [ -n "$origin" ] || continue
+                  sudo -H -u "$DESKTOP_USERNAME" flatpak install -y --noninteractive --user "$origin" "$ref"
+                done <"$FLATPAK_STATE/user-refs.tsv"
+              fi
+              echo 'MANAGED_UBUNTU_FLATPAK_RESTORE_APPLIED'
+            fi
+
+            SYSTEM_STATE=/tmp/managed-desktop-backup/system
+            if [ -s "$SYSTEM_STATE/delta.tar" ]; then
+              sudo tar --acls --xattrs -xpf "$SYSTEM_STATE/delta.tar" -C /
+              sudo python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          state = json.load(open('/tmp/managed-desktop-backup/system/verify.json', encoding='utf-8'))
+          errors = []
+          for rel, expected in state.get('files', {}).items():
+              path = '/' + rel.lstrip('/')
+              try:
+                  h = hashlib.sha256()
+                  with open(path, 'rb') as f:
+                      for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                          h.update(chunk)
+                  if h.hexdigest() != expected:
+                      errors.append(f'hash:{path}')
+              except Exception:
+                  errors.append(f'missing:{path}')
+          for rel, expected in state.get('links', {}).items():
+              path = '/' + rel.lstrip('/')
+              try:
+                  if not os.path.islink(path) or os.readlink(path) != expected:
+                      errors.append(f'link:{path}')
+              except Exception:
+                  errors.append(f'missing-link:{path}')
+          if errors:
+              print('::error::Ubuntu system delta verification failed: ' + ', '.join(errors[:20]))
+              sys.exit(1)
+          print('MANAGED_UBUNTU_SYSTEM_DELTA_VERIFIED')
+          PY
+              sudo ldconfig >/dev/null 2>&1 || true
+              echo 'MANAGED_UBUNTU_SYSTEM_DELTA_RESTORE_APPLIED'
+            fi
+
+            sudo rsync -aHAX /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
             sudo chown -R "${DESKTOP_USERNAME}:${DESKTOP_USERNAME}" "/home/${DESKTOP_USERNAME}"
+
+            CRON_STATE=/tmp/managed-desktop-backup/cron
+            if command -v crontab >/dev/null 2>&1 && [ -d "$CRON_STATE" ]; then
+              [ ! -f "$CRON_STATE/root.cron" ] || sudo crontab "$CRON_STATE/root.cron"
+              [ ! -f "$CRON_STATE/user.cron" ] || sudo -u "$DESKTOP_USERNAME" crontab "$CRON_STATE/user.cron"
+              echo 'MANAGED_UBUNTU_CRON_RESTORE_APPLIED'
+            fi
+
+            SYSTEMD_STATE=/tmp/managed-desktop-backup/systemd
+            sudo systemctl daemon-reload
+            if [ -s "$SYSTEMD_STATE/enabled-removed.txt" ]; then
+              while IFS= read -r unit || [ -n "$unit" ]; do
+                [ -n "$unit" ] || continue
+                case "$unit" in ssh.service|ssh.socket|tailscaled.service|systemd-networkd.service|NetworkManager.service) continue ;; esac
+                sudo systemctl disable "$unit" >/dev/null 2>&1 || true
+              done <"$SYSTEMD_STATE/enabled-removed.txt"
+            fi
+            if [ -s "$SYSTEMD_STATE/enabled-added.txt" ]; then
+              while IFS= read -r unit || [ -n "$unit" ]; do
+                [ -n "$unit" ] || continue
+                sudo systemctl enable "$unit" >/dev/null 2>&1 || { echo "::error::Failed to enable restored unit $unit"; exit 1; }
+              done <"$SYSTEMD_STATE/enabled-added.txt"
+            fi
+            if [ -s "$SYSTEMD_STATE/running-added.txt" ]; then
+              while IFS= read -r unit || [ -n "$unit" ]; do
+                [ -n "$unit" ] || continue
+                case "$unit" in ssh.service|tailscaled.service) continue ;; esac
+                sudo systemctl start "$unit" || { echo "::error::Failed to start restored unit $unit"; exit 1; }
+                systemctl is-active --quiet "$unit" || { echo "::error::Restored unit is not active: $unit"; exit 1; }
+              done <"$SYSTEMD_STATE/running-added.txt"
+            fi
             echo 'MANAGED_DESKTOP_RESTORE_APPLIED'
           else
             echo 'MANAGED_DESKTOP_FRESH_START'
@@ -311,45 +551,245 @@ jobs:
             sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
             sleep 2
             rm -rf /tmp/managed-desktop-backup
-            mkdir -p /tmp/managed-desktop-backup/home /tmp/managed-desktop-backup/apt/debs
-            sudo rsync -a --delete --exclude='.cache/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
+            mkdir -p \
+              /tmp/managed-desktop-backup/home \
+              /tmp/managed-desktop-backup/apt/debs \
+              /tmp/managed-desktop-backup/snap/files \
+              /tmp/managed-desktop-backup/flatpak \
+              /tmp/managed-desktop-backup/systemd \
+              /tmp/managed-desktop-backup/cron \
+              /tmp/managed-desktop-backup/system
 
+            # Capture desired service state before stopping user-added services for
+            # a more consistent filesystem/data snapshot.
+            (systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null || true) \
+              | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
+              >/tmp/managed-ubuntu-current-systemd-enabled.txt
+            (systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true) \
+              | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
+              >/tmp/managed-ubuntu-current-systemd-running.txt
+            comm -13 /tmp/managed-ubuntu-baseline-systemd-enabled.txt /tmp/managed-ubuntu-current-systemd-enabled.txt \
+              >/tmp/managed-desktop-backup/systemd/enabled-added.txt
+            comm -23 /tmp/managed-ubuntu-baseline-systemd-enabled.txt /tmp/managed-ubuntu-current-systemd-enabled.txt \
+              >/tmp/managed-desktop-backup/systemd/enabled-removed.txt
+            comm -13 /tmp/managed-ubuntu-baseline-systemd-running.txt /tmp/managed-ubuntu-current-systemd-running.txt \
+              >/tmp/managed-desktop-backup/systemd/running-added.txt
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              case "$unit" in ssh.service|tailscaled.service|systemd-networkd.service|NetworkManager.service) continue ;; esac
+              sudo systemctl stop "$unit" >/dev/null 2>&1 || echo "::warning::Could not stop $unit before backup"
+            done </tmp/managed-desktop-backup/systemd/running-added.txt
+
+            sudo rsync -aHAX --delete --exclude='.cache/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
+
+            # Package-manager state: sources/keys, manual package delta, package
+            # version delta, plus exact .deb payloads where possible.
+            sudo tar --acls --xattrs -cpf /tmp/managed-desktop-backup/apt/config.tar -C / etc/apt usr/share/keyrings
             apt-mark showmanual | LC_ALL=C sort -u >/tmp/managed-ubuntu-current-manual.txt
-            if [ -s /tmp/managed-ubuntu-baseline-manual.txt ]; then
-              comm -13 /tmp/managed-ubuntu-baseline-manual.txt /tmp/managed-ubuntu-current-manual.txt \
-                >/tmp/managed-desktop-backup/apt/manual-added.txt
-            else
-              cp /tmp/managed-ubuntu-current-manual.txt /tmp/managed-desktop-backup/apt/manual-added.txt
-            fi
-
-            : >/tmp/managed-desktop-backup/apt/versions.tsv
+            comm -13 /tmp/managed-ubuntu-baseline-manual.txt /tmp/managed-ubuntu-current-manual.txt \
+              >/tmp/managed-desktop-backup/apt/manual-added.txt
+            dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort -u \
+              >/tmp/managed-ubuntu-current-packages.tsv
+            python3 - <<'PY'
+          from pathlib import Path
+          def read(path):
+              out = {}
+              for line in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+                  if '\t' not in line:
+                      continue
+                  name, version = line.split('\t', 1)
+                  out[name] = version
+              return out
+          baseline = read('/tmp/managed-ubuntu-baseline-packages.tsv')
+          current = read('/tmp/managed-ubuntu-current-packages.tsv')
+          changed = sorted((name, version) for name, version in current.items() if baseline.get(name) != version)
+          dest = Path('/tmp/managed-desktop-backup/apt/version-changed.tsv')
+          dest.write_text(''.join(f'{name}\t{version}\n' for name, version in changed), encoding='utf-8')
+          manual = set(Path('/tmp/managed-desktop-backup/apt/manual-added.txt').read_text(encoding='utf-8').split())
+          restore = sorted(manual | {name for name, _ in changed})
+          Path('/tmp/managed-desktop-backup/apt/restore-packages.txt').write_text(''.join(f'{name}\n' for name in restore), encoding='utf-8')
+          Path('/tmp/managed-desktop-backup/apt/versions.tsv').write_text(''.join(f'{name}\t{current[name]}\n' for name in restore if name in current), encoding='utf-8')
+          PY
             while IFS= read -r pkg || [ -n "$pkg" ]; do
               [ -n "$pkg" ] || continue
-              version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+              version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' /tmp/managed-desktop-backup/apt/versions.tsv)
               [ -n "$version" ] || continue
-              printf '%s\t%s\n' "$pkg" "$version" >>/tmp/managed-desktop-backup/apt/versions.tsv
               (
                 cd /tmp/managed-desktop-backup/apt/debs
-                apt-get download "${pkg}=${version}" >/dev/null 2>&1 || apt-get download "$pkg" >/dev/null 2>&1 || true
+                apt-get download "${pkg}=${version}" >/dev/null 2>&1 \
+                  || apt-get download "$pkg" >/dev/null 2>&1 \
+                  || sudo dpkg-repack "$pkg" >/dev/null 2>&1 \
+                  || true
               )
-            done </tmp/managed-desktop-backup/apt/manual-added.txt
-            echo "MANAGED_UBUNTU_APT_BACKUP_COUNT=$(wc -l </tmp/managed-desktop-backup/apt/manual-added.txt | tr -d ' ')"
+            done </tmp/managed-desktop-backup/apt/restore-packages.txt
+            echo "MANAGED_UBUNTU_APT_BACKUP_COUNT=$(wc -l </tmp/managed-desktop-backup/apt/restore-packages.txt | tr -d ' ')"
+
+            # Snap installer-state with cached snap payload fallback.
+            if command -v snap >/dev/null 2>&1; then
+              (snap list 2>/dev/null || true) | awk 'NR>1 {print $1}' | LC_ALL=C sort -u >/tmp/managed-ubuntu-current-snaps.txt
+              comm -13 /tmp/managed-ubuntu-baseline-snaps.txt /tmp/managed-ubuntu-current-snaps.txt >/tmp/managed-ubuntu-added-snaps.txt
+              : >/tmp/managed-desktop-backup/snap/added.tsv
+              while IFS= read -r snap_name || [ -n "$snap_name" ]; do
+                [ -n "$snap_name" ] || continue
+                snap_line=$(snap list "$snap_name" 2>/dev/null | awk 'NR == 2 {print $1 "\t" $3 "\t" $4 "\t" $6}')
+                [ -n "$snap_line" ] || continue
+                printf '%s\n' "$snap_line" >>/tmp/managed-desktop-backup/snap/added.tsv
+                snap_rev=$(printf '%s\n' "$snap_line" | cut -f2)
+                snap_file="/var/lib/snapd/snaps/${snap_name}_${snap_rev}.snap"
+                [ ! -f "$snap_file" ] || sudo cp -a "$snap_file" /tmp/managed-desktop-backup/snap/files/
+              done </tmp/managed-ubuntu-added-snaps.txt
+            fi
+
+            # Flatpak state is small metadata and can be replayed from configured remotes.
+            if command -v flatpak >/dev/null 2>&1; then
+              flatpak remotes --system --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/system-remotes.tsv || true
+              flatpak list --system --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/system-refs.tsv || true
+              sudo -H -u "$DESKTOP_USERNAME" flatpak remotes --user --columns=name,url 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-remotes.tsv || true
+              sudo -H -u "$DESKTOP_USERNAME" flatpak list --user --columns=ref,origin 2>/dev/null >/tmp/managed-desktop-backup/flatpak/user-refs.tsv || true
+            fi
+
+            # Root and desktop-user crontabs are outside the normal /etc tree.
+            if command -v crontab >/dev/null 2>&1; then
+              sudo crontab -l 2>/dev/null >/tmp/managed-desktop-backup/cron/root.cron || :
+              sudo -u "$DESKTOP_USERNAME" crontab -l 2>/dev/null >/tmp/managed-desktop-backup/cron/user.cron || :
+            fi
+
+            # Generic installer/filesystem delta. Newly installed dpkg-owned /usr
+            # files are skipped because APT owns them; changes to baseline package
+            # files are still captured, as are manual installers and app data.
+            sudo python3 - <<'PY'
+          import fnmatch
+          import glob
+          import hashlib
+          import json
+          import os
+          import stat
+          from pathlib import Path
+
+          ROOTS = [
+              '/etc', '/opt', '/usr/local', '/usr/bin', '/usr/sbin', '/usr/lib',
+              '/usr/libexec', '/usr/share', '/usr/src', '/var/lib', '/var/opt',
+              '/var/snap', '/var/www', '/srv', '/root',
+          ]
+          EXCLUDES = [
+              '/etc/apt', '/usr/share/keyrings', '/etc/hostname', '/etc/hosts',
+              '/etc/resolv.conf', '/etc/machine-id', '/etc/fstab', '/etc/crypttab',
+              '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow',
+              '/etc/subuid', '/etc/subgid', '/etc/netplan', '/etc/network',
+              '/etc/cloud', '/etc/ssh/ssh_host_*',
+              '/etc/ssh/sshd_config.d/99-managed-cloud.conf', '/var/lib/apt',
+              '/var/lib/dpkg', '/var/lib/systemd', '/var/lib/cloud',
+              '/var/lib/snapd', '/var/lib/flatpak', '/var/lib/tailscale',
+              '/var/lib/NetworkManager', '/var/lib/dbus', '/var/lib/waagent',
+              '/var/lib/private', '/root/.cache',
+          ]
+
+          def excluded(path):
+              path = os.path.normpath(path)
+              for pattern in EXCLUDES:
+                  if '*' in pattern:
+                      if fnmatch.fnmatch(path, pattern):
+                          return True
+                  else:
+                      pattern = os.path.normpath(pattern)
+                      if path == pattern or path.startswith(pattern + os.sep):
+                          return True
+              return False
+
+          def fingerprint(path):
+              st = os.lstat(path)
+              mode = st.st_mode
+              if stat.S_ISREG(mode): kind = 'f'
+              elif stat.S_ISDIR(mode): kind = 'd'
+              elif stat.S_ISLNK(mode): kind = 'l'
+              else: kind = 'o'
+              return [kind, stat.S_IMODE(mode), st.st_uid, st.st_gid, st.st_size, st.st_mtime_ns, os.readlink(path) if kind == 'l' else '']
+
+          def scan():
+              out = {}
+              stack = [root for root in ROOTS if os.path.lexists(root)]
+              while stack:
+                  path = stack.pop()
+                  if excluded(path):
+                      continue
+                  try:
+                      fp = fingerprint(path)
+                  except OSError:
+                      continue
+                  out[path] = fp
+                  if fp[0] != 'd':
+                      continue
+                  try:
+                      with os.scandir(path) as it:
+                          for entry in it:
+                              if not excluded(entry.path):
+                                  stack.append(entry.path)
+                  except OSError:
+                      pass
+              return out
+
+          baseline = json.load(open('/tmp/managed-ubuntu-baseline-files.json', encoding='utf-8'))
+          current = scan()
+          dpkg_owned = set()
+          for filename in glob.glob('/var/lib/dpkg/info/*.list'):
+              try:
+                  for raw in Path(filename).read_text(encoding='utf-8', errors='replace').splitlines():
+                      if raw.startswith('/'):
+                          dpkg_owned.add(os.path.normpath(raw))
+              except OSError:
+                  pass
+
+          changed = []
+          verify = {'files': {}, 'links': {}}
+          for path in sorted(current):
+              fp = current[path]
+              if baseline.get(path) == fp or fp[0] == 'o':
+                  continue
+              if path.startswith('/usr/') and path in dpkg_owned and path not in baseline:
+                  continue
+              rel = path.lstrip('/')
+              changed.append(rel)
+              if fp[0] == 'f':
+                  h = hashlib.sha256()
+                  try:
+                      with open(path, 'rb') as f:
+                          for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                              h.update(chunk)
+                      verify['files'][rel] = h.hexdigest()
+                  except OSError:
+                      pass
+              elif fp[0] == 'l':
+                  verify['links'][rel] = fp[6]
+
+          out = Path('/tmp/managed-desktop-backup/system')
+          payload = b''.join(item.encode('utf-8', errors='surrogateescape') + b'\0' for item in changed)
+          (out / 'changed-paths.bin').write_bytes(payload)
+          (out / 'verify.json').write_text(json.dumps(verify, separators=(',', ':'), sort_keys=True), encoding='utf-8')
+          (out / 'summary.json').write_text(json.dumps({'changed_paths': len(changed), 'verified_files': len(verify['files']), 'verified_links': len(verify['links'])}, separators=(',', ':')), encoding='utf-8')
+          PY
+            if [ -s /tmp/managed-desktop-backup/system/changed-paths.bin ]; then
+              sudo tar --acls --xattrs --no-recursion --null \
+                -C / -cpf /tmp/managed-desktop-backup/system/delta.tar \
+                -T /tmp/managed-desktop-backup/system/changed-paths.bin
+            fi
 
             sudo chown -R "$USER:$USER" /tmp/managed-desktop-backup
             python3 - <<'PY' >/tmp/managed-desktop-backup/metadata.json
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 2,
+              'version': 3,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-user-home-plus-apt-manual-delta-without-dot-cache',
+              'scope': 'managed-home-plus-installer-state-v3-without-dot-cache',
+              'features': ['apt','apt-config','snap','flatpak','system-delta','systemd','cron'],
           }, separators=(',', ':')))
           PY
+            echo 'MANAGED_UBUNTU_V3_BACKUP_STAGED'
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
@@ -380,7 +820,7 @@ jobs:
           done
 
 
-      - name: Save Ubuntu user and apt-state backup to GitHub Actions Cache
+      - name: Save Ubuntu comprehensive state backup to GitHub Actions Cache
         if: steps.session.outputs.should_save == 'true'
         uses: actions/cache/save@v5
         with:
