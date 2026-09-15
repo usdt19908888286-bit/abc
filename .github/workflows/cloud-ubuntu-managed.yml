@@ -364,7 +364,7 @@ jobs:
             fi
 
             FLATPAK_STATE=/tmp/managed-desktop-backup/flatpak
-            if [ -d "$FLATPAK_STATE" ] && { [ -s "$FLATPAK_STATE/system-refs.tsv" ] || [ -s "$FLATPAK_STATE/user-refs.tsv" ]; }; then
+            if [ -d "$FLATPAK_STATE" ] && { [ -s "$FLATPAK_STATE/system-remotes.tsv" ] || [ -s "$FLATPAK_STATE/user-remotes.tsv" ] || [ -s "$FLATPAK_STATE/system-refs.tsv" ] || [ -s "$FLATPAK_STATE/user-refs.tsv" ]; }; then
               command -v flatpak >/dev/null 2>&1 || { echo '::error::Flatpak backup exists but flatpak is unavailable after package restore.'; exit 1; }
               if [ -s "$FLATPAK_STATE/system-remotes.tsv" ]; then
                 while IFS=$'\t' read -r remote_name remote_url || [ -n "$remote_name" ]; do
