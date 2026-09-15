@@ -53,7 +53,7 @@ concurrency:
 jobs:
   desktop:
     runs-on: ${{ inputs.runner_image }}
-    timeout-minutes: 330
+    timeout-minutes: 360
     env:
       MACHINE_ID: ${{ inputs.machine_id || '001' }}
       MACHINE_NAME: ${{ inputs.machine_name || 'UBUNTU-001' }}
@@ -279,7 +279,7 @@ jobs:
           }
 
           COMMAND_TITLE="Cloud Ubuntu Command ${MACHINE_ID}"
-          for _ in $(seq 1 1800); do
+          while true; do
             ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
               --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | .number" \
               2>/dev/null | head -n1 || true)
@@ -304,9 +304,6 @@ jobs:
             systemctl is-active --quiet ssh || sudo systemctl restart ssh
           done
 
-          echo 'SESSION_TIMEOUT_AUTO_BACKUP'
-          stage_backup
-          echo 'should_save=true' >> "$GITHUB_OUTPUT"
 
       - name: Save Ubuntu user backup to GitHub Actions Cache
         if: steps.session.outputs.should_save == 'true'
