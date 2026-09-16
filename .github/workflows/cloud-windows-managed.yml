@@ -190,6 +190,27 @@ jobs:
           $baselineApps = @(Get-InstalledAppInventory)
           ConvertTo-Json -InputObject $baselineApps -Depth 6 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installed-apps.json') -Encoding UTF8
 
+          function Get-ManagedAppxInventory {
+            $items = [System.Collections.Generic.List[object]]::new()
+            try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
+            catch { $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue) }
+            foreach ($pkg in $packages) {
+              $family = [string]$pkg.PackageFamilyName
+              if ([string]::IsNullOrWhiteSpace($family)) { continue }
+              [void]$items.Add([pscustomobject]@{
+                family_name=$family; name=[string]$pkg.Name; full_name=[string]$pkg.PackageFullName;
+                version=[string]$pkg.Version; architecture=[string]$pkg.Architecture;
+                publisher=[string]$pkg.Publisher; publisher_id=[string]$pkg.PublisherId;
+                install_location=[string]$pkg.InstallLocation; is_framework=[bool]$pkg.IsFramework;
+                is_resource=[bool]$pkg.IsResourcePackage; non_removable=[bool]$pkg.NonRemovable;
+                signature_kind=[string]$pkg.SignatureKind
+              })
+            }
+            return @($items | Sort-Object family_name,name,architecture,full_name -Unique)
+          }
+          $baselineAppx = @(Get-ManagedAppxInventory)
+          ConvertTo-Json -InputObject $baselineAppx -Depth 6 | Set-Content -LiteralPath (Join-Path $baselineRoot 'appx-packages.json') -Encoding UTF8
+
           # Snapshot shallow Program Files directory topology. Some installers (including
           # per-user uninstall registrations) omit InstallLocation/DisplayIcon paths, so
           # backup also detects directories created after this pristine runner baseline.
@@ -582,6 +603,12 @@ jobs:
           }
 
           $restoredRoots = 0
+          $packageStoreSkipped = 0
+          function Test-ManagedPackageStoreRelative {
+            param([string]$Relative)
+            if ([string]::IsNullOrWhiteSpace($Relative)) { return $false }
+            return [bool]($Relative.TrimStart('\') -match '(?i)(^|\\)(WindowsApps|ModifiableWindowsApps|WpSystem)(\\|$)')
+          }
           $manifestEntries = @(Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json)
           $backupVersion = 1
           $metadataPath = Join-Path $restoreRoot 'metadata.json'
@@ -597,6 +624,13 @@ jobs:
             $relative = ([string]$entry.relative).TrimStart('\')
             if ($volume -notmatch '^[A-Z]:$' -or -not $fixedVolumes.Contains($volume)) { throw "Software restore volume is unavailable/unsafe: $volume" }
             if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') { throw "Unsafe software restore relative path: $relative" }
+            if (Test-ManagedPackageStoreRelative -Relative $relative) {
+              # Legacy V9-V11 backups could accidentally record Windows package repositories as
+              # ordinary software roots. Never recreate those protected stores with robocopy.
+              $packageStoreSkipped++
+              Write-Host "MANAGED_WINDOWS_PACKAGE_STORE_LEGACY_ROOT_SKIPPED volume=$volume relative=$relative"
+              continue
+            }
             $volumeKey = $volume.TrimEnd(':')
             $source = Join-Path (Join-Path $softwareRoot $volumeKey) $relative
             if (-not (Test-Path -LiteralPath $source -PathType Container)) { Write-Warning "Software backup root missing: $volume/$relative"; continue }
@@ -608,10 +642,10 @@ jobs:
             $restoredRoots++
             Write-Host "MANAGED_WINDOWS_SOFTWARE_ROOT_RESTORED volume=$volume relative=$relative exit=$copyExit"
           }
-          if ($backupVersion -ge 9 -and $restoredRoots -lt @($manifestEntries).Count) {
-            throw "V9 software-root restore incomplete expected=$(@($manifestEntries).Count) actual=$restoredRoots"
+          if ($backupVersion -ge 9 -and ($restoredRoots + $packageStoreSkipped) -lt @($manifestEntries).Count) {
+            throw "V$backupVersion software-root restore incomplete expected=$(@($manifestEntries).Count) actual=$restoredRoots packageStoreSkipped=$packageStoreSkipped"
           }
-          Write-Host "MANAGED_WINDOWS_SOFTWARE_FILES_RESTORED roots=$restoredRoots"
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_FILES_RESTORED roots=$restoredRoots packageStoreSkipped=$packageStoreSkipped"
           # Robocopy uses exit codes 1-7 for successful copies. GitHub's pwsh wrapper
           # propagates the last native exit code unless we normalize it explicitly.
           exit 0
@@ -940,7 +974,45 @@ jobs:
               if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "scoop import exited $LASTEXITCODE" }
             } catch { $softwareFailed++; Write-Warning "scoop import failed: $($_.Exception.Message)" }
           }
-          Write-Host "MANAGED_WINDOWS_SOFTWARE_REHYDRATE packagesOk=$softwareOk packagesFailed=$softwareFailed"
+
+          # V12 package-aware restore. WinGet/other package managers above are the primary
+          # installation channel. AppX metadata verifies the package identity and, when the
+          # payload is already present on the runner for another user, registers it for this SID.
+          $appxRequiredRestored = 0
+          $appxRequiredMissing = 0
+          $appxOptionalPresent = 0
+          $appxManifestPath = Join-Path $stateRoot 'appx-packages.json'
+          if (Test-Path -LiteralPath $appxManifestPath) {
+            foreach ($pkg in @(Get-Content -LiteralPath $appxManifestPath -Raw | ConvertFrom-Json)) {
+              $family = ([string]$pkg.family_name).Trim()
+              if (-not $family) { continue }
+              $required = [bool]$pkg.restore_required
+              $present = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { ([string]$_.PackageFamilyName).Equals($family,[System.StringComparison]::OrdinalIgnoreCase) })
+              if (-not $present.Count) {
+                $available = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { ([string]$_.PackageFamilyName).Equals($family,[System.StringComparison]::OrdinalIgnoreCase) })
+                foreach ($candidate in $available) {
+                  $manifest = if ($candidate.InstallLocation) { Join-Path ([string]$candidate.InstallLocation) 'AppxManifest.xml' } else { '' }
+                  if (-not $manifest -or -not (Test-Path -LiteralPath $manifest -PathType Leaf)) { continue }
+                  try {
+                    Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
+                    Write-Host "MANAGED_WINDOWS_APPX_REGISTERED family=$family manifest=$manifest"
+                    break
+                  } catch { Write-Warning "AppX register failed family=${family}: $($_.Exception.Message)" }
+                }
+                $present = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { ([string]$_.PackageFamilyName).Equals($family,[System.StringComparison]::OrdinalIgnoreCase) })
+              }
+              if ($present.Count) {
+                if ($required) { $appxRequiredRestored++ } else { $appxOptionalPresent++ }
+                Write-Host "MANAGED_WINDOWS_APPX_RESTORE_OK family=$family required=$required count=$($present.Count)"
+              } elseif ($required) {
+                $appxRequiredMissing++
+                Write-Warning "MANAGED_WINDOWS_APPX_RESTORE_MISSING family=$family name=$($pkg.name) version=$($pkg.version)"
+              } else {
+                Write-Host "MANAGED_WINDOWS_APPX_OPTIONAL_ABSENT family=$family change=$($pkg.change)"
+              }
+            }
+          }
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_REHYDRATE packagesOk=$softwareOk packagesFailed=$softwareFailed appxRequiredRestored=$appxRequiredRestored appxRequiredMissing=$appxRequiredMissing appxOptionalPresent=$appxOptionalPresent"
 
           $uninstallRegistryRestored = 0
           $uninstallRegistryManifestPath = Join-Path $stateRoot 'uninstall-registry.json'
@@ -1039,12 +1111,18 @@ jobs:
 
           $softwareAclRestored = 0
           $softwareAclVolatileSkipped = 0
+          $softwareAclPackageStoreSkipped = 0
           $softwareAclManifestPath = Join-Path $stateRoot 'software-acl.json'
           if (Test-Path -LiteralPath $softwareAclManifestPath) {
             foreach ($entry in @(Get-Content -LiteralPath $softwareAclManifestPath -Raw | ConvertFrom-Json)) {
               $volume = ([string]$entry.volume).ToUpperInvariant()
               $relative = ([string]$entry.relative).TrimStart('\')
               if ($volume -notmatch '^[A-Z]:$' -or -not $relative) { throw "Invalid software ACL target volume=$volume relative=$relative" }
+              if ($relative -match '(?i)(^|\\)(WindowsApps|ModifiableWindowsApps|WpSystem)(\\|$)') {
+                $softwareAclPackageStoreSkipped++
+                Write-Host "MANAGED_WINDOWS_PACKAGE_STORE_LEGACY_ACL_SKIPPED volume=$volume relative=$relative"
+                continue
+              }
               $volumeRootForAcl = "$volume\"
               $aclFile = Join-Path (Join-Path $stateRoot 'software-acl') ([string]$entry.file)
               if (-not (Test-Path -LiteralPath $aclFile -PathType Leaf)) { throw "Software ACL payload missing: $($entry.file)" }
@@ -1082,7 +1160,7 @@ jobs:
               $softwareAclRestored++
             }
           }
-          Write-Host "MANAGED_WINDOWS_SOFTWARE_ACL_RESTORED count=$softwareAclRestored volatileSkipped=$softwareAclVolatileSkipped"
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_ACL_RESTORED count=$softwareAclRestored volatileSkipped=$softwareAclVolatileSkipped packageStoreSkipped=$softwareAclPackageStoreSkipped"
 
           # Reinstall exported PnP driver packages before restoring explicit driver service
           # registrations. pnputil may assign a different oem*.inf name on the new runner;
@@ -1684,13 +1762,19 @@ jobs:
             $expectedInstallerCache = if ($null -eq $metadata.installer_cache_delta_count) { 0 } else { [int]$metadata.installer_cache_delta_count }
             if ($serviceDeltaRestored -lt $expectedServices -or $serviceDeltaFailed -gt 0) { throw "V11 service restore incomplete expected=$expectedServices actual=$serviceDeltaRestored failed=$serviceDeltaFailed" }
             if ($pnpDevicesRestored -lt $expectedPnpDevices -or $pnpDevicesFailed -gt 0) { throw "V11 PnP restore incomplete expected=$expectedPnpDevices actual=$pnpDevicesRestored failed=$pnpDevicesFailed" }
-            if ($softwareAclRestored -lt $expectedSoftwareAcl) { throw "V11 software ACL restore incomplete expected=$expectedSoftwareAcl actual=$softwareAclRestored" }
+            if (($softwareAclRestored + $softwareAclPackageStoreSkipped) -lt $expectedSoftwareAcl) { throw "V11 software ACL restore incomplete expected=$expectedSoftwareAcl actual=$softwareAclRestored packageStoreSkipped=$softwareAclPackageStoreSkipped" }
             if ($installerValuesRestored -lt $expectedInstallerValues) { throw "V11 installer registry-value restore incomplete expected=$expectedInstallerValues actual=$installerValuesRestored" }
             if ($installerTreesRestored -lt $expectedInstallerTrees) { throw "V11 installer registry-tree restore incomplete expected=$expectedInstallerTrees actual=$installerTreesRestored" }
             if ($installerCacheRestored -lt $expectedInstallerCache) { throw "V11 installer cache restore incomplete expected=$expectedInstallerCache actual=$installerCacheRestored" }
           }
+          if ($version -ge 12) {
+            $expectedAppxRequired = if ($null -eq $metadata.appx_restore_required_count) { 0 } else { [int]$metadata.appx_restore_required_count }
+            if ($appxRequiredRestored -lt $expectedAppxRequired -or $appxRequiredMissing -gt 0) {
+              throw "V12 AppX/MSIX restore incomplete expected=$expectedAppxRequired actual=$appxRequiredRestored missing=$appxRequiredMissing"
+            }
+          }
           Write-ManagedRdpProbe -Stage 'step11-end'
-          Write-Host "MANAGED_WINDOWS_STATE_RESTORED version=$version registry=$registryRestored appRegistry=$appRegistryRestored uninstallRegistry=$uninstallRegistryRestored installerValues=$installerValuesRestored installerTrees=$installerTreesRestored installerCache=$installerCacheRestored softwareAcl=$softwareAclRestored startup=$startupRestored startupApproved=$startupApprovedRestored commonStartup=$commonStartupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored serviceFailed=$serviceDeltaFailed drivers=$driversRestored driverFailed=$driversFailed driverPackages=$driverPackagesRestored driverPackageFailed=$driverPackagesFailed pnpDevices=$pnpDevicesRestored pnpFailed=$pnpDevicesFailed softwarePackagesFailed=$softwareFailed"
+          Write-Host "MANAGED_WINDOWS_STATE_RESTORED version=$version registry=$registryRestored appRegistry=$appRegistryRestored uninstallRegistry=$uninstallRegistryRestored installerValues=$installerValuesRestored installerTrees=$installerTreesRestored installerCache=$installerCacheRestored softwareAcl=$softwareAclRestored softwareAclPackageStoreSkipped=$softwareAclPackageStoreSkipped appxRequiredRestored=$appxRequiredRestored appxRequiredMissing=$appxRequiredMissing startup=$startupRestored startupApproved=$startupApprovedRestored commonStartup=$commonStartupRestored tasks=$taskRestored services=$serviceRestored serviceDelta=$serviceDeltaRestored serviceFailed=$serviceDeltaFailed drivers=$driversRestored driverFailed=$driversFailed driverPackages=$driverPackagesRestored driverPackageFailed=$driverPackagesFailed pnpDevices=$pnpDevicesRestored pnpFailed=$pnpDevicesFailed softwarePackagesFailed=$softwareFailed"
 
       - name: Verify restored Windows application delta
         if: ${{ inputs.mode == 'restore' }}
@@ -2504,6 +2588,60 @@ jobs:
               Write-Host "MANAGED_WINDOWS_APP_DELTA name=$deltaName version=$deltaVersion registry=$deltaRegistry install=$deltaInstall"
             }
 
+            function Get-ManagedAppxInventory {
+              $items = [System.Collections.Generic.List[object]]::new()
+              try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
+              catch { $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue) }
+              foreach ($pkg in $packages) {
+                $family = [string]$pkg.PackageFamilyName
+                if ([string]::IsNullOrWhiteSpace($family)) { continue }
+                [void]$items.Add([pscustomobject]@{
+                  family_name=$family; name=[string]$pkg.Name; full_name=[string]$pkg.PackageFullName;
+                  version=[string]$pkg.Version; architecture=[string]$pkg.Architecture;
+                  publisher=[string]$pkg.Publisher; publisher_id=[string]$pkg.PublisherId;
+                  install_location=[string]$pkg.InstallLocation; is_framework=[bool]$pkg.IsFramework;
+                  is_resource=[bool]$pkg.IsResourcePackage; non_removable=[bool]$pkg.NonRemovable;
+                  signature_kind=[string]$pkg.SignatureKind
+                })
+              }
+              return @($items | Sort-Object family_name,name,architecture,full_name -Unique)
+            }
+            function Get-ManagedAppxIdentityKey {
+              param([Parameter(Mandatory=$true)]$Package)
+              return "$([string]$Package.family_name)|$([string]$Package.name)|$([string]$Package.architecture)|$([bool]$Package.is_framework)|$([bool]$Package.is_resource)".ToLowerInvariant()
+            }
+            $baselineAppxMap = @{}
+            $baselineAppxPath = Join-Path $baselineRoot 'appx-packages.json'
+            if (Test-Path -LiteralPath $baselineAppxPath) {
+              foreach ($pkg in @(Get-Content -LiteralPath $baselineAppxPath -Raw | ConvertFrom-Json)) {
+                if (-not $pkg.family_name) { continue }
+                $baselineAppxMap[(Get-ManagedAppxIdentityKey -Package $pkg)] = $pkg
+              }
+            }
+            $currentAppx = @(Get-ManagedAppxInventory)
+            $appxDelta = [System.Collections.Generic.List[object]]::new()
+            foreach ($pkg in $currentAppx) {
+              $key = Get-ManagedAppxIdentityKey -Package $pkg
+              $before = if ($baselineAppxMap.ContainsKey($key)) { $baselineAppxMap[$key] } else { $null }
+              $isAdded = ($null -eq $before)
+              $changed = $isAdded -or [string]$before.version -ne [string]$pkg.version -or [string]$before.full_name -ne [string]$pkg.full_name
+              if (-not $changed) { continue }
+              # A newly added main user package must exist again after restore. Framework,
+              # resource and non-removable packages are OS dependencies and are inventory-only.
+              $restoreRequired = $isAdded -and -not [bool]$pkg.is_framework -and -not [bool]$pkg.is_resource -and -not [bool]$pkg.non_removable
+              [void]$appxDelta.Add([pscustomobject]@{
+                family_name=[string]$pkg.family_name; name=[string]$pkg.name; full_name=[string]$pkg.full_name;
+                version=[string]$pkg.version; architecture=[string]$pkg.architecture;
+                publisher=[string]$pkg.publisher; publisher_id=[string]$pkg.publisher_id;
+                install_location=[string]$pkg.install_location; is_framework=[bool]$pkg.is_framework;
+                is_resource=[bool]$pkg.is_resource; non_removable=[bool]$pkg.non_removable;
+                signature_kind=[string]$pkg.signature_kind; change=if ($isAdded) { 'added' } else { 'updated' };
+                restore_required=[bool]$restoreRequired
+              })
+              Write-Host "MANAGED_WINDOWS_APPX_DELTA family=$($pkg.family_name) name=$($pkg.name) version=$($pkg.version) change=$(if ($isAdded) {'added'} else {'updated'}) required=$restoreRequired"
+            }
+            ConvertTo-Json -InputObject @($appxDelta) -Depth 7 | Set-Content -LiteralPath (Join-Path $stateRoot 'appx-packages.json') -Encoding UTF8
+
             $fixedVolumes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID } | ForEach-Object {
               [void]$fixedVolumes.Add(([string]$_.DeviceID).ToUpperInvariant())
@@ -2530,9 +2668,19 @@ jobs:
               try { [void]$softwareExcludePrefixes.Add([IO.Path]::GetFullPath($candidate).TrimEnd('\')) } catch { }
             }
 
+            function Test-ManagedPackageStorePath {
+              param([string]$Path)
+              if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+              try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $false }
+              # WindowsApps/WpSystem are managed package repositories. Their files, ACLs,
+              # registrations and dependencies cannot be safely reconstructed by robocopy.
+              return [bool]($full -match '(?i)(^|\\)(WindowsApps|ModifiableWindowsApps|WpSystem)(\\|$)')
+            }
+
             function Test-ManagedSoftwareExcludedPath {
               param([Parameter(Mandatory=$true)][string]$Path)
               try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $true }
+              if (Test-ManagedPackageStorePath -Path $full) { return $true }
               foreach ($prefix in $softwareExcludePrefixes) {
                 if ($full.Equals($prefix,[System.StringComparison]::OrdinalIgnoreCase) -or
                     $full.StartsWith("$prefix\",[System.StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -2686,19 +2834,23 @@ jobs:
                       if ($identityToken.Length -ge 4) { [void]$appIdentityTokens.Add($identityToken) }
                     }
                     Add-SoftwareRootCandidate -Path $payloadPath -Reason "registry-identity:$($app.name)"
-                    if (-not ($softwareCandidates | Where-Object { ([string]$_.source).Equals($payloadPath,[System.StringComparison]::OrdinalIgnoreCase) })) {
-                      [void]$softwareCandidates.Add([pscustomobject]@{ volume=$payloadVolume; relative=$payloadRelative; source=$payloadPath; reason="registry-identity-direct:$($app.name)" })
-                      Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_DIRECT app=$($app.name) path=$payloadPath"
+                    if (-not (Test-ManagedSoftwareExcludedPath -Path $payloadPath)) {
+                      if (-not ($softwareCandidates | Where-Object { ([string]$_.source).Equals($payloadPath,[System.StringComparison]::OrdinalIgnoreCase) })) {
+                        [void]$softwareCandidates.Add([pscustomobject]@{ volume=$payloadVolume; relative=$payloadRelative; source=$payloadPath; reason="registry-identity-direct:$($app.name)" })
+                        Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_DIRECT app=$($app.name) path=$payloadPath"
+                      }
+                      [void]$appPayloadEvidence.Add([pscustomobject]@{
+                        registry_path = [string]$app.registry_path
+                        name = [string]$app.name
+                        path = $payloadPath
+                        volume = $payloadVolume
+                        relative = $payloadRelative
+                        evidence = 'registry-identity'
+                      })
+                      Write-Host "MANAGED_WINDOWS_APP_DIRECTORY_MATCH app=$($app.name) registryLeaf=$registryLeaf path=$payloadPath"
+                    } else {
+                      Write-Host "MANAGED_WINDOWS_APP_PACKAGE_STORE_RAW_PAYLOAD_SKIPPED app=$($app.name) path=$payloadPath"
                     }
-                    [void]$appPayloadEvidence.Add([pscustomobject]@{
-                      registry_path = [string]$app.registry_path
-                      name = [string]$app.name
-                      path = $payloadPath
-                      volume = $payloadVolume
-                      relative = $payloadRelative
-                      evidence = 'registry-identity'
-                    })
-                    Write-Host "MANAGED_WINDOWS_APP_DIRECTORY_MATCH app=$($app.name) registryLeaf=$registryLeaf path=$payloadPath"
                     break
                   }
                 }
@@ -2744,6 +2896,19 @@ jobs:
               }
             }
             $appProfileEvidence = [System.Collections.Generic.List[object]]::new()
+            # Store/MSIX application binaries are rehydrated through the package manager, while
+            # per-user package state remains portable profile data under AppData\Local\Packages.
+            foreach ($pkg in @($appxDelta | Where-Object { [bool]$_.restore_required })) {
+              $family = ([string]$pkg.family_name).Trim()
+              if (-not $family -or $family -match '[\\/:*?"<>|]') { continue }
+              $relative = "AppData\Local\Packages\$family"
+              $currentDir = Join-Path $profileRoot $relative
+              if (-not (Test-Path -LiteralPath $currentDir -PathType Container)) { continue }
+              $measure = Get-ChildItem -LiteralPath $currentDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+              $dirBytes = if ($null -eq $measure.Sum) { [int64]0 } else { [int64]$measure.Sum }
+              [void]$appProfileEvidence.Add([pscustomobject]@{ relative=$relative; file_count=[int64]$measure.Count; bytes=$dirBytes; kind='appx-user-data'; family_name=$family })
+              Write-Host "MANAGED_WINDOWS_APPX_USER_DATA_MATCH family=$family relative=$relative files=$([int64]$measure.Count) bytes=$dirBytes"
+            }
             foreach ($appDataRoot in @([Environment]::GetFolderPath('ApplicationData'), [Environment]::GetFolderPath('LocalApplicationData'))) {
               if ([string]::IsNullOrWhiteSpace($appDataRoot) -or -not (Test-Path -LiteralPath $appDataRoot -PathType Container)) { continue }
               Get-ChildItem -LiteralPath $appDataRoot -Directory -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -3630,7 +3795,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 11
+              version = 12
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -3638,7 +3803,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v11-installer-delta-services-drivers-pnp'
+              scope = 'managed-windows-state-v12-package-aware-installer-delta-services-drivers-pnp'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -3647,6 +3812,8 @@ jobs:
               software_root_count = @($softwareRoots).Count
               software_app_delta_count = @($appDelta).Count
               software_app_payload_evidence_count = @($appPayloadEvidence).Count
+              appx_delta_count = @($appxDelta).Count
+              appx_restore_required_count = @($appxDelta | Where-Object { [bool]$_.restore_required }).Count
               software_service_delta_count = @($serviceDelta).Count
               uninstall_registry_count = @($uninstallRegistryManifest).Count
               app_registry_count = @($appRegistryManifest).Count
@@ -3673,7 +3840,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V11_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V12_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appxDelta=$(@($appxDelta).Count) appxRequired=$(@($appxDelta | Where-Object { [bool]$_.restore_required }).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
@@ -3801,4 +3968,3 @@ jobs:
             status = 'failure'
           } | ConvertTo-Json -Compress
           try { Invoke-RestMethod -Method Post -Uri "$webUrl/api/runner/report" -Headers @{ 'X-Bootstrap-Ticket' = $env:BOOTSTRAP_TICKET } -ContentType 'application/json' -Body $payload | Out-Null } catch { Write-Warning $_.Exception.Message }
-
