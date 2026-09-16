@@ -1099,8 +1099,20 @@ jobs:
               if (-not $infFiles.Count) { $driverPackagesFailed++; Write-Warning "Driver package backup has no INF: $($package.published_name)"; continue }
               $packageOk = $true
               foreach ($inf in $infFiles) {
-                & pnputil.exe /add-driver $inf.FullName /install | Out-Host
-                if ($LASTEXITCODE -ne 0) { $packageOk = $false }
+                $pnputilOutput = @(& pnputil.exe /add-driver $inf.FullName /install 2>&1)
+                $pnputilExit = $LASTEXITCODE
+                $pnputilOutput | Out-Host
+                $pnputilText = ($pnputilOutput | ForEach-Object { [string]$_ }) -join "`n"
+                $pnputilAccepted = ($pnputilExit -eq 0) -or
+                  ($pnputilText -match '(?i)Driver package added successfully') -or
+                  ($pnputilText -match '(?i)Already exists in the system') -or
+                  ($pnputilText -match '(?i)Driver package is up-to-date on device')
+                if (-not $pnputilAccepted) {
+                  $packageOk = $false
+                  Write-Warning "Driver package staging failed inf=$($inf.Name) exit=$pnputilExit"
+                } elseif ($pnputilExit -ne 0) {
+                  Write-Host "MANAGED_WINDOWS_DRIVER_PACKAGE_IDEMPOTENT_SUCCESS inf=$($inf.Name) exit=$pnputilExit"
+                }
               }
               if ($packageOk) { $driverPackagesRestored++; Write-Host "MANAGED_WINDOWS_DRIVER_PACKAGE_RESTORED source=$($package.published_name)" }
               else { $driverPackagesFailed++; Write-Warning "Driver package restore failed: $($package.published_name)" }
@@ -3666,7 +3678,7 @@ jobs:
           }
 
           function Ensure-ManagedConsoleSession {
-            # UU/other console-capture tools need the logged-on desktop to remain
+            # Console-capture / virtual-display software needs the logged-on desktop to remain
             # attached to the physical console. Closing an RDP client leaves the
             # same user session in Disc state; move that disconnected session back
             # to console instead of logging it off or creating another session.
