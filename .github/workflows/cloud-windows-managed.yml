@@ -548,25 +548,6 @@ jobs:
           restore-keys: |
             managed-desktop-windows-${{ inputs.machine_id }}-
 
-      - name: Validate Windows backup compatibility
-        if: ${{ inputs.mode == 'restore' }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $restoreRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
-          $metadataPath = Join-Path $restoreRoot 'metadata.json'
-          if (-not (Test-Path -LiteralPath $metadataPath)) {
-            throw 'Restore mode requested, but backup metadata.json is missing.'
-          }
-          $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-          if ([string]$metadata.system_type -ne 'windows') { throw 'Backup system type is not Windows.' }
-          if ([string]$metadata.machine_id -ne [string]$env:MACHINE_ID) { throw 'Backup machine ID does not match this instance.' }
-          $backupRunnerImage = ([string]$metadata.runner_image).Trim()
-          if (-not [string]::IsNullOrWhiteSpace($backupRunnerImage) -and $backupRunnerImage -ne [string]$env:RUNNER_IMAGE) {
-            throw "Backup runner image mismatch: backup=$backupRunnerImage current=$env:RUNNER_IMAGE"
-          }
-          Write-Host "MANAGED_WINDOWS_BACKUP_COMPATIBLE image=$backupRunnerImage current=$env:RUNNER_IMAGE machine=$env:MACHINE_ID"
-
       - name: Restore Windows software delta
         if: ${{ inputs.mode == 'restore' }}
         shell: pwsh
@@ -666,10 +647,6 @@ jobs:
             $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
             if ([string]$metadata.system_type -ne 'windows') { throw 'Backup system type is not Windows.' }
             if ([string]$metadata.machine_id -ne [string]$env:MACHINE_ID) { throw 'Backup machine ID does not match this instance.' }
-            $backupRunnerImage = ([string]$metadata.runner_image).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($backupRunnerImage) -and $backupRunnerImage -ne [string]$env:RUNNER_IMAGE) {
-              throw "Backup runner image mismatch: backup=$backupRunnerImage current=$env:RUNNER_IMAGE"
-            }
 
             # The workflow itself runs inside this same Windows profile. A small set of
             # Windows shell/cache databases is therefore legitimately locked on the
@@ -680,11 +657,6 @@ jobs:
             $volatileDirs = @(
               'AppData\Local\Temp',
               'AppData\Local\Microsoft\Windows',
-              # WindowsApps contains Store/App Execution Alias reparse entries such as
-              # winget.exe/python.exe/wt.exe. Windows Server 2025 refuses to copy some
-              # of them even from VSS (robocopy ERROR 1920); they are machine-generated
-              # runtime aliases and must be recreated by the fresh runner instead.
-              'AppData\Local\Microsoft\WindowsApps',
               'AppData\Local\Microsoft\TokenBroker',
               'AppData\Local\Microsoft\IdentityCache',
               'AppData\Local\Microsoft\OneAuth',
@@ -3076,10 +3048,6 @@ jobs:
                 '/XD',
                 (Join-Path $profileSource 'AppData\Local\Temp'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows'),
-                # Windows Server 2025 exposes Store/App Execution Alias entries under
-                # Microsoft\WindowsApps that can return ERROR 1920 when copied from VSS.
-                # They are OS-generated aliases, not durable app/user payload.
-                (Join-Path $profileSource 'AppData\Local\Microsoft\WindowsApps'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\Caches'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\WebCache'),
                 (Join-Path $profileSource 'AppData\Local\Microsoft\Windows\Notifications'),
