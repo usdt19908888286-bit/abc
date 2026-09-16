@@ -1901,9 +1901,23 @@ jobs:
               $target = Join-Path $profileRoot $relative
               if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw "V9 app profile/cache directory is missing: $relative" }
               $actualMeasure = Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object
+              $actualFiles = [int64]$actualMeasure.Count
               $expectedFiles = if ($null -eq $entry.file_count) { 0 } else { [int64]$entry.file_count }
-              if ([int64]$actualMeasure.Count -lt $expectedFiles) { throw "V9 app profile/cache file count is incomplete path=$relative expected=$expectedFiles actual=$([int64]$actualMeasure.Count)" }
-              Write-Host "MANAGED_WINDOWS_APP_PROFILE_RESTORE_OK relative=$relative files=$([int64]$actualMeasure.Count)"
+              if ($actualFiles -lt $expectedFiles) {
+                $missingFiles = $expectedFiles - $actualFiles
+                $legacyV12Tolerance = [int64][math]::Max(5, [math]::Ceiling($expectedFiles * 0.02))
+                $isAppxUserData = ([string]$entry.kind).Equals('appx-user-data',[System.StringComparison]::OrdinalIgnoreCase)
+                if ($backupVersion -eq 12 -and -not $isAppxUserData -and $actualFiles -gt 0 -and $missingFiles -le $legacyV12Tolerance) {
+                  # The first V12 build measured active profile folders before the VSS snapshot.
+                  # A file created/deleted between that measurement and the snapshot can make the
+                  # manifest differ slightly from the bytes that were actually cached. V13 fixes
+                  # the source of truth; tolerate only a small V12-only drift here.
+                  Write-Warning "MANAGED_WINDOWS_APP_PROFILE_V12_LIVE_COUNT_DRIFT relative=$relative expected=$expectedFiles actual=$actualFiles missing=$missingFiles tolerance=$legacyV12Tolerance"
+                } else {
+                  throw "V9 app profile/cache file count is incomplete path=$relative expected=$expectedFiles actual=$actualFiles"
+                }
+              }
+              Write-Host "MANAGED_WINDOWS_APP_PROFILE_RESTORE_OK relative=$relative files=$actualFiles expected=$expectedFiles version=$backupVersion"
             }
 
             $protectedStatePath = Join-Path $stateRoot 'protected-user-state.json'
@@ -3329,6 +3343,42 @@ jobs:
               }
             }
 
+            # V13: make app-profile verification metadata describe the bytes that actually entered
+            # the backup, not a live directory measured before VSS creation. This removes races
+            # from active application log/cache/config files while keeping restore verification strict.
+            $stagedAppProfileEvidence = [System.Collections.Generic.List[object]]::new()
+            foreach ($evidenceGroup in @($appProfileEvidence | Group-Object relative)) {
+              $entries = @($evidenceGroup.Group)
+              $entry = @($entries | Where-Object { ([string]$_.kind).Equals('appx-user-data',[System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)[0]
+              if ($null -eq $entry) { $entry = $entries[0] }
+              $relative = ([string]$entry.relative).TrimStart('\')
+              if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') {
+                throw "Unsafe staged app-profile evidence path: $relative"
+              }
+              $stagedDir = Join-Path $backupProfile $relative
+              if (-not (Test-Path -LiteralPath $stagedDir -PathType Container)) {
+                if (([string]$entry.kind).Equals('appx-user-data',[System.StringComparison]::OrdinalIgnoreCase)) {
+                  throw "Required AppX user-data directory was not captured in VSS profile backup: $relative"
+                }
+                Write-Host "MANAGED_WINDOWS_APP_PROFILE_SNAPSHOT_EVIDENCE_SKIPPED relative=$relative reason=not-in-staged-profile"
+                continue
+              }
+              $stagedMeasure = Get-ChildItem -LiteralPath $stagedDir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+              $stagedBytes = if ($null -eq $stagedMeasure.Sum) { [int64]0 } else { [int64]$stagedMeasure.Sum }
+              $record = [ordered]@{
+                relative = $relative
+                file_count = [int64]$stagedMeasure.Count
+                bytes = $stagedBytes
+                evidence_source = 'staged-vss-profile'
+              }
+              if (-not [string]::IsNullOrWhiteSpace([string]$entry.kind)) { $record.kind = [string]$entry.kind }
+              if (-not [string]::IsNullOrWhiteSpace([string]$entry.family_name)) { $record.family_name = [string]$entry.family_name }
+              [void]$stagedAppProfileEvidence.Add([pscustomobject]$record)
+              Write-Host "MANAGED_WINDOWS_APP_PROFILE_SNAPSHOT_EVIDENCE relative=$relative files=$([int64]$stagedMeasure.Count) bytes=$stagedBytes kind=$([string]$entry.kind)"
+            }
+            $appProfileEvidence = $stagedAppProfileEvidence
+            ConvertTo-Json -InputObject @($appProfileEvidence | Sort-Object relative -Unique) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'app-profile-evidence.json') -Encoding UTF8
+
             # Copy only software roots discovered from explicit installation/service evidence.
             # Each fixed volume gets its own VSS snapshot; if VSS is unavailable for a volume,
             # fall back to live copy and still fail on real robocopy errors.
@@ -3795,7 +3845,7 @@ jobs:
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
 
             @{
-              version = 12
+              version = 13
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -3803,7 +3853,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v12-package-aware-installer-delta-services-drivers-pnp'
+              scope = 'managed-windows-state-v13-snapshot-verified-package-aware-installer-delta-services-drivers-pnp'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -3840,7 +3890,7 @@ jobs:
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V12_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appxDelta=$(@($appxDelta).Count) appxRequired=$(@($appxDelta | Where-Object { [bool]$_.restore_required }).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V13_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appxDelta=$(@($appxDelta).Count) appxRequired=$(@($appxDelta | Where-Object { [bool]$_.restore_required }).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
