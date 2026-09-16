@@ -86,6 +86,7 @@ jobs:
           UBUNTU_SOCKS5_USERNAME=$(jq -r '.ubuntuSocks5Username // "cloudproxy"' /tmp/cloud-bootstrap.json)
           UBUNTU_SOCKS5_PASSWORD=$(jq -r '.ubuntuSocks5Password // empty' /tmp/cloud-bootstrap.json)
           UBUNTU_SOCKS5_HOSTNAME=$(jq -r '.ubuntuSocks5Hostname // empty' /tmp/cloud-bootstrap.json)
+          FANOUT_ENABLED=$(jq -r 'if .fanoutEnabled then "true" else "false" end' /tmp/cloud-bootstrap.json)
           [ -n "$TS_CLIENT_ID" ] && [ -n "$TS_CLIENT_SECRET" ] || { echo '::error::Cloudflare Tailscale configuration is incomplete'; exit 1; }
           [ -n "$CLOUD_PASSWORD" ] || { echo '::error::Cloudflare desktop password is empty'; exit 1; }
           if [ "$TUNNEL_MODE" = 'cloudflare' ] || [ "$TUNNEL_MODE" = 'dual' ]; then
@@ -96,8 +97,8 @@ jobs:
             [ -n "$UBUNTU_SOCKS5_HOSTNAME" ] && [ -n "$CF_TUNNEL_TOKEN" ] || { echo '::error::Ubuntu SOCKS5 Cloudflare bootstrap is incomplete'; exit 1; }
           fi
           for value in "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_PASSWORD"; do [ -z "$value" ] || echo "::add-mask::$value"; done
-          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\nUBUNTU_SOCKS5_ENABLED=%s\nUBUNTU_SOCKS5_PORT=%s\nUBUNTU_SOCKS5_USERNAME=%s\nUBUNTU_SOCKS5_PASSWORD=%s\nUBUNTU_SOCKS5_HOSTNAME=%s\n' \
-            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_ENABLED" "$UBUNTU_SOCKS5_PORT" "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" "$UBUNTU_SOCKS5_HOSTNAME" >> "$GITHUB_ENV"
+          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\nUBUNTU_SOCKS5_ENABLED=%s\nUBUNTU_SOCKS5_PORT=%s\nUBUNTU_SOCKS5_USERNAME=%s\nUBUNTU_SOCKS5_PASSWORD=%s\nUBUNTU_SOCKS5_HOSTNAME=%s\nFANOUT_ENABLED=%s\n' \
+            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_ENABLED" "$UBUNTU_SOCKS5_PORT" "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" "$UBUNTU_SOCKS5_HOSTNAME" "$FANOUT_ENABLED" >> "$GITHUB_ENV"
           rm -f /tmp/cloud-bootstrap.json
           echo 'CLOUDFLARE_BOOTSTRAP_OK'
 
@@ -639,8 +640,8 @@ jobs:
           rm -f /tmp/cloud-manager-socks5-selftest
           echo "UBUNTU_SOCKS5_READY=127.0.0.1:${UBUNTU_SOCKS5_PORT}"
 
-      - name: Start Cloudflare TCP tunnel
-        if: ${{ env.TUNNEL_MODE == 'cloudflare' || env.TUNNEL_MODE == 'dual' || env.UBUNTU_SOCKS5_ENABLED == 'true' }}
+      - name: Start Cloudflare tunnel
+        if: ${{ env.TUNNEL_MODE == 'cloudflare' || env.TUNNEL_MODE == 'dual' || env.UBUNTU_SOCKS5_ENABLED == 'true' || env.FANOUT_ENABLED == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
