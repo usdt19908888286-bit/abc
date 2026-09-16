@@ -157,9 +157,26 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: /tmp/managed-desktop-backup
-          key: managed-desktop-ubuntu-${{ inputs.machine_id }}-restore-${{ github.run_id }}
+          key: managed-desktop-ubuntu-${{ inputs.machine_id }}-${{ inputs.runner_image }}-restore-${{ github.run_id }}
           restore-keys: |
+            managed-desktop-ubuntu-${{ inputs.machine_id }}-${{ inputs.runner_image }}-
             managed-desktop-ubuntu-${{ inputs.machine_id }}-
+
+      - name: Validate Ubuntu backup compatibility
+        if: ${{ inputs.mode == 'restore' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata=/tmp/managed-desktop-backup/metadata.json
+          [ -s "$metadata" ] || { echo '::error::Ubuntu backup metadata.json is missing'; exit 1; }
+          backup_system=$(jq -r '.system_type // empty' "$metadata")
+          backup_machine=$(jq -r '.machine_id // empty' "$metadata")
+          backup_image=$(jq -r '.runner_image // empty' "$metadata")
+          [ "$backup_system" = 'ubuntu' ] || { echo "::error::Backup system type is not Ubuntu: $backup_system"; exit 1; }
+          [ "$backup_machine" = "$MACHINE_ID" ] || { echo "::error::Ubuntu backup machine ID mismatch: backup=$backup_machine current=$MACHINE_ID"; exit 1; }
+          [ -n "$backup_image" ] || { echo '::error::Ubuntu backup does not record runner_image; cross-version safety cannot be verified'; exit 1; }
+          [ "$backup_image" = "$RUNNER_IMAGE" ] || { echo "::error::Ubuntu backup version mismatch: backup=$backup_image current=$RUNNER_IMAGE"; exit 1; }
+          echo "MANAGED_UBUNTU_BACKUP_COMPATIBILITY_OK image=$backup_image machine=$backup_machine"
 
       - name: Enable private SSH session and restore data
         shell: bash
@@ -996,7 +1013,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: /tmp/managed-desktop-backup
-          key: managed-desktop-ubuntu-${{ inputs.machine_id }}-${{ github.run_id }}
+          key: managed-desktop-ubuntu-${{ inputs.machine_id }}-${{ inputs.runner_image }}-${{ github.run_id }}
 
       - name: Close consumed Ubuntu backup command
         if: steps.session.outputs.should_save == 'true'
