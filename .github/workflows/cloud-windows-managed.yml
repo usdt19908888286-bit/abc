@@ -1038,6 +1038,7 @@ jobs:
           Write-Host "MANAGED_WINDOWS_INSTALLER_STATE_RESTORED cache=$installerCacheRestored registryTrees=$installerTreesRestored registryValues=$installerValuesRestored"
 
           $softwareAclRestored = 0
+          $softwareAclVolatileSkipped = 0
           $softwareAclManifestPath = Join-Path $stateRoot 'software-acl.json'
           if (Test-Path -LiteralPath $softwareAclManifestPath) {
             foreach ($entry in @(Get-Content -LiteralPath $softwareAclManifestPath -Raw | ConvertFrom-Json)) {
@@ -1059,13 +1060,29 @@ jobs:
               $aclOutput = @(& icacls.exe @args 2>&1)
               $aclExit = $LASTEXITCODE
               $aclOutput | Out-Host
-              if ($aclExit -ne 0) { throw "icacls restore failed exit=$aclExit base=$aclBase target=$aclTarget" }
               $failedAclLine = $aclOutput | Where-Object { [string]$_ -match '(?i)Failed processing\s+[1-9][0-9]*\s+files?' } | Select-Object -First 1
-              if ($failedAclLine) { throw "icacls restore reported failed files base=$aclBase detail=$failedAclLine" }
+              $failedAclCount = 0
+              if ($failedAclLine) {
+                $failedAclMatch = [regex]::Match([string]$failedAclLine, '(?i)Failed processing\s+([1-9][0-9]*)\s+files?')
+                if ($failedAclMatch.Success) { $failedAclCount = [int]$failedAclMatch.Groups[1].Value }
+              }
+              $missingAclLines = @($aclOutput | Where-Object { [string]$_ -match '(?i)The system cannot find the (?:file|path) specified' })
+              $persistentAclMissing = @($missingAclLines | Where-Object {
+                [string]$_ -notmatch '(?i)[\\/](?:log|logs|cache|caches|temp|tmp|crash|crashes|sentry)[\\/]|\.run(?:[\\/]|\.lock|:|$)|\.lock(?:[\\/]|:|$)'
+              })
+              $volatileOnly = $failedAclCount -gt 0 -and $missingAclLines.Count -eq $failedAclCount -and $persistentAclMissing.Count -eq 0
+              if ($aclExit -ne 0 -or $failedAclCount -gt 0) {
+                if ($volatileOnly) {
+                  $softwareAclVolatileSkipped += $failedAclCount
+                  Write-Warning "Software ACL restore ignored $failedAclCount vanished runtime paths under $aclTarget"
+                } else {
+                  throw "icacls restore failed exit=$aclExit failed=$failedAclCount persistentMissing=$($persistentAclMissing.Count) base=$aclBase target=$aclTarget"
+                }
+              }
               $softwareAclRestored++
             }
           }
-          Write-Host "MANAGED_WINDOWS_SOFTWARE_ACL_RESTORED count=$softwareAclRestored"
+          Write-Host "MANAGED_WINDOWS_SOFTWARE_ACL_RESTORED count=$softwareAclRestored volatileSkipped=$softwareAclVolatileSkipped"
 
           # Reinstall exported PnP driver packages before restoring explicit driver service
           # registrations. pnputil may assign a different oem*.inf name on the new runner;
@@ -2835,8 +2852,28 @@ jobs:
               $aclDestination = Join-Path $softwareAclRoot $aclFile
               Push-Location $volumeRootForAcl
               try {
-                & icacls.exe $relative /save $aclDestination /t /c /q | Out-Null
-                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $aclDestination)) { throw "icacls save failed exit=$LASTEXITCODE root=$liveRootForAcl" }
+                $aclOutput = @(& icacls.exe $relative /save $aclDestination /t /c /q 2>&1)
+                $aclExit = $LASTEXITCODE
+                $aclOutput | Out-Host
+                $failedAclLine = $aclOutput | Where-Object { [string]$_ -match '(?i)Failed processing\s+[1-9][0-9]*\s+files?' } | Select-Object -First 1
+                $failedAclCount = 0
+                if ($failedAclLine) {
+                  $failedAclMatch = [regex]::Match([string]$failedAclLine, '(?i)Failed processing\s+([1-9][0-9]*)\s+files?')
+                  if ($failedAclMatch.Success) { $failedAclCount = [int]$failedAclMatch.Groups[1].Value }
+                }
+                $missingAclLines = @($aclOutput | Where-Object { [string]$_ -match '(?i)The system cannot find the (?:file|path) specified' })
+                $persistentAclMissing = @($missingAclLines | Where-Object {
+                  [string]$_ -notmatch '(?i)[\\/](?:log|logs|cache|caches|temp|tmp|crash|crashes|sentry)[\\/]|\.run(?:[\\/]|\.lock|:|$)|\.lock(?:[\\/]|:|$)'
+                })
+                $volatileOnly = $failedAclCount -gt 0 -and $missingAclLines.Count -eq $failedAclCount -and $persistentAclMissing.Count -eq 0
+                if ($aclExit -ne 0 -or $failedAclCount -gt 0) {
+                  if ($volatileOnly) {
+                    Write-Warning "Software ACL save skipped $failedAclCount vanished runtime paths under $liveRootForAcl"
+                  } else {
+                    throw "icacls save failed exit=$aclExit failed=$failedAclCount persistentMissing=$($persistentAclMissing.Count) root=$liveRootForAcl"
+                  }
+                }
+                if (-not (Test-Path -LiteralPath $aclDestination)) { throw "Software ACL payload was not created: $aclDestination" }
               } finally { Pop-Location }
               [void]$softwareAclManifest.Add([pscustomobject]@{ volume=$volume; relative=$relative; file=$aclFile })
             }
