@@ -569,26 +569,21 @@ jobs:
           foreach ($root in $valueRoots) { foreach ($entry in @(Get-RegistryValueInventory -Path $root)) { [void]$values.Add($entry) } }
           ConvertTo-Json -InputObject @($values) -Depth 8 | Set-Content -LiteralPath (Join-Path $baselineRoot 'installer-registry-values.json') -Encoding UTF8
 
-          function Get-ManagedTaskXmlHash {
-            param([Parameter(Mandatory=$true)][string]$Xml)
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            try {
-              $bytes = [System.Text.Encoding]::UTF8.GetBytes($Xml)
-              return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
-            } finally { $sha.Dispose() }
-          }
+          # ScheduledTasks cmdlets can return an incomplete view under pwsh on hosted runners.
+          # Hash the scheduler's on-disk task definitions instead; these are the authoritative XML
+          # definitions persisted by Task Scheduler and are stable for delta comparison.
+          $scheduledTaskFsRoot = Join-Path $env:WINDIR 'System32\Tasks'
           $scheduledTaskBaseline = [System.Collections.Generic.List[object]]::new()
-          Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
-            $task = $_
-            if ([string]$task.TaskPath -like '\Microsoft\*') { return }
-            try {
-              $xml = [string](Export-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop)
-              [void]$scheduledTaskBaseline.Add([pscustomobject]@{
-                name = [string]$task.TaskName
-                path = [string]$task.TaskPath
-                sha256 = Get-ManagedTaskXmlHash -Xml $xml
-              })
-            } catch { Write-Warning "scheduled task baseline skipped name=$($task.TaskName) path=$($task.TaskPath): $($_.Exception.Message)" }
+          if (Test-Path -LiteralPath $scheduledTaskFsRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $scheduledTaskFsRoot -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              $taskFile = $_
+              try {
+                $relative = $taskFile.FullName.Substring($scheduledTaskFsRoot.Length).TrimStart('\')
+                if ([string]::IsNullOrWhiteSpace($relative) -or $relative -like 'Microsoft\*') { return }
+                $hash = ([string](Get-FileHash -LiteralPath $taskFile.FullName -Algorithm SHA256 -ErrorAction Stop).Hash).ToLowerInvariant()
+                [void]$scheduledTaskBaseline.Add([pscustomobject]@{ relative=$relative; sha256=$hash })
+              } catch { Write-Warning "scheduled task file baseline skipped path=$($taskFile.FullName): $($_.Exception.Message)" }
+            }
           }
           ConvertTo-Json -InputObject @($scheduledTaskBaseline) -Depth 5 | Set-Content -LiteralPath (Join-Path $baselineRoot 'scheduled-tasks.json') -Encoding UTF8
           Write-Host "MANAGED_WINDOWS_INSTALLER_BASELINE_FINAL services=$($baselineServices.Count) drivers=$($baselineDrivers.Count) pnp=$($pnpIds.Count) values=$($values.Count) tasks=$($scheduledTaskBaseline.Count)"
@@ -3738,40 +3733,39 @@ jobs:
             ConvertTo-Json -InputObject @($commonStartupManifest) -Depth 4 | Set-Content -LiteralPath (Join-Path $stateRoot 'common-startup.json') -Encoding UTF8
 
             # Back up scheduled-task DELTAS relative to the final initialized runner image.
-            # Comparing task XML avoids carrying hosted-runner/platform tasks into the backup while
-            # preserving tasks newly created or changed by installed applications/user state.
-            function Get-ManagedTaskXmlHash {
-              param([Parameter(Mandatory=$true)][string]$Xml)
-              $sha = [System.Security.Cryptography.SHA256]::Create()
-              try {
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($Xml)
-                return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
-              } finally { $sha.Dispose() }
-            }
+            # Use the scheduler's persisted task-definition files instead of ScheduledTasks cmdlets;
+            # pwsh on hosted runners can omit tasks that schtasks.exe has successfully created.
             $baselineTaskHashes = @{}
             $baselineTasksPath = Join-Path $baselineRoot 'scheduled-tasks.json'
             if (Test-Path -LiteralPath $baselineTasksPath) {
               foreach ($saved in @(Get-Content -LiteralPath $baselineTasksPath -Raw | ConvertFrom-Json)) {
-                $key = "$([string]$saved.path)|$([string]$saved.name)"
-                if (-not [string]::IsNullOrWhiteSpace($key)) { $baselineTaskHashes[$key] = [string]$saved.sha256 }
+                $relative = ([string]$saved.relative).Trim().TrimStart('\')
+                if ($relative) { $baselineTaskHashes[$relative] = [string]$saved.sha256 }
               }
             }
             $taskManifest = [System.Collections.Generic.List[object]]::new()
             $taskIndex = 0
-            Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
-              $task = $_
-              if ([string]$task.TaskPath -like '\Microsoft\*') { return }
-              try {
-                $xml = [string](Export-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop)
-                $hash = Get-ManagedTaskXmlHash -Xml $xml
-                $key = "$([string]$task.TaskPath)|$([string]$task.TaskName)"
-                if ($baselineTaskHashes.ContainsKey($key) -and [string]$baselineTaskHashes[$key] -eq $hash) { return }
-                $taskIndex++
-                $file = ('task-{0:D4}.xml' -f $taskIndex)
-                $xml | Set-Content -LiteralPath (Join-Path $taskRoot $file) -Encoding UTF8
-                [void]$taskManifest.Add([pscustomobject]@{ name=[string]$task.TaskName; path=[string]$task.TaskPath; file=$file; sha256=$hash })
-                Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_DELTA path=$($task.TaskPath) name=$($task.TaskName) sha256=$hash"
-              } catch { Write-Warning "scheduled task backup skipped name=$($task.TaskName) path=$($task.TaskPath): $($_.Exception.Message)" }
+            $scheduledTaskFsRoot = Join-Path $env:WINDIR 'System32\Tasks'
+            if (Test-Path -LiteralPath $scheduledTaskFsRoot -PathType Container) {
+              Get-ChildItem -LiteralPath $scheduledTaskFsRoot -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                $taskFile = $_
+                try {
+                  $relative = $taskFile.FullName.Substring($scheduledTaskFsRoot.Length).TrimStart('\')
+                  if ([string]::IsNullOrWhiteSpace($relative) -or $relative -like 'Microsoft\*') { return }
+                  $hash = ([string](Get-FileHash -LiteralPath $taskFile.FullName -Algorithm SHA256 -ErrorAction Stop).Hash).ToLowerInvariant()
+                  if ($baselineTaskHashes.ContainsKey($relative) -and [string]$baselineTaskHashes[$relative] -eq $hash) { return }
+
+                  $parts = @($relative -split '\\')
+                  $name = [string]$parts[-1]
+                  $taskPath = '\'
+                  if ($parts.Count -gt 1) { $taskPath = '\' + (($parts[0..($parts.Count-2)] -join '\')) + '\' }
+                  $taskIndex++
+                  $file = ('task-{0:D4}.xml' -f $taskIndex)
+                  Copy-Item -LiteralPath $taskFile.FullName -Destination (Join-Path $taskRoot $file) -Force
+                  [void]$taskManifest.Add([pscustomobject]@{ name=$name; path=$taskPath; relative=$relative; file=$file; sha256=$hash })
+                  Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_DELTA path=$taskPath name=$name relative=$relative sha256=$hash"
+                } catch { Write-Warning "scheduled task file backup skipped path=$($taskFile.FullName): $($_.Exception.Message)" }
+              }
             }
             ConvertTo-Json -InputObject @($taskManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'scheduled-tasks.json') -Encoding UTF8
 
