@@ -4095,7 +4095,7 @@ jobs:
                 $cmd.command -eq 'e2e_seed_state' -and
                 [string]$cmd.system_type -eq 'windows' -and
                 [string]$cmd.machine_id -eq $env:MACHINE_ID -and
-                [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID
+                (-not [string]$cmd.run_id -or [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID)
               ) {
                 if ([string]$env:MACHINE_NAME -notlike 'E2E-WIN*') {
                   throw "E2E seed command rejected for non-test machine: $env:MACHINE_NAME"
@@ -4181,18 +4181,37 @@ jobs:
                 }
                 $seed | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $markerPath -Encoding UTF8
 
-                $regPath = 'HKCU:\Software\CloudMultiSystemManagerE2E'
-                New-Item -Path $regPath -Force | Out-Null
-                Set-ItemProperty -Path $regPath -Name 'Marker' -Value 'CLOUD_MULTI_SYSTEM_MANAGER_E2E'
-                Set-ItemProperty -Path $regPath -Name 'Packages' -Value ($installed -join ',')
+                $managedSid = [string](Get-LocalUser -Name $env:DESKTOP_USERNAME -ErrorAction Stop).SID.Value
+                $regNativeRoot = "HKU\$managedSid"
+                $tempHiveName = ''
+                $loadedTempHive = $false
+                if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$managedSid")) {
+                  $ntUserPath = Join-Path $profileRoot 'NTUSER.DAT'
+                  if (-not (Test-Path -LiteralPath $ntUserPath)) { throw "Managed user hive is unavailable: $ntUserPath" }
+                  $tempHiveName = "E2E_MANAGED_$env:GITHUB_RUN_ID"
+                  & reg.exe load "HKU\$tempHiveName" $ntUserPath | Out-Host
+                  if ($LASTEXITCODE -ne 0) { throw "Failed to load managed user hive: exit=$LASTEXITCODE" }
+                  $regNativeRoot = "HKU\$tempHiveName"
+                  $loadedTempHive = $true
+                }
+                try {
+                  & reg.exe add "$regNativeRoot\Software\CloudMultiSystemManagerE2E" /v Marker /t REG_SZ /d 'CLOUD_MULTI_SYSTEM_MANAGER_E2E' /f | Out-Host
+                  if ($LASTEXITCODE -ne 0) { throw "Failed to write E2E registry marker: exit=$LASTEXITCODE" }
+                  & reg.exe add "$regNativeRoot\Software\CloudMultiSystemManagerE2E" /v Packages /t REG_SZ /d ($installed -join ',') /f | Out-Host
+                  if ($LASTEXITCODE -ne 0) { throw "Failed to write E2E registry package list: exit=$LASTEXITCODE" }
+                } finally {
+                  if ($loadedTempHive) {
+                    Start-Sleep -Milliseconds 300
+                    & reg.exe unload "HKU\$tempHiveName" 2>&1 | Out-Host
+                  }
+                }
 
-                $startupRoot = [Environment]::GetFolderPath('Startup')
-                if (-not $startupRoot) { $startupRoot = Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' }
+                $startupRoot = Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
                 New-Item -ItemType Directory -Path $startupRoot -Force | Out-Null
                 $startupPath = Join-Path $startupRoot 'E2E-Backup-Restore-Probe.cmd'
                 "@echo off`r`nexit /b 0`r`n" | Set-Content -LiteralPath $startupPath -Encoding ASCII
 
-                & schtasks.exe /Create /TN 'E2E-Backup-Restore-Probe' /TR 'cmd.exe /c exit 0' /SC ONLOGON /F | Out-Host
+                & schtasks.exe /Create /TN 'E2E-Backup-Restore-Probe' /TR 'cmd.exe /c exit 0' /SC ONLOGON /RU SYSTEM /F | Out-Host
                 if ($LASTEXITCODE -ne 0) { throw "Failed to create E2E scheduled task: exit=$LASTEXITCODE" }
 
                 Write-Host "E2E_WINDOWS_STATE_SEEDED packages=$($installed -join ',') marker=$markerPath startup=$startupPath"
@@ -4206,42 +4225,77 @@ jobs:
                 $cmd.command -eq 'e2e_verify_state' -and
                 [string]$cmd.system_type -eq 'windows' -and
                 [string]$cmd.machine_id -eq $env:MACHINE_ID -and
-                [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID
+                (-not [string]$cmd.run_id -or [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID)
               ) {
                 if ([string]$env:MACHINE_NAME -notlike 'E2E-WIN*') {
                   throw "E2E verify command rejected for non-test machine: $env:MACHINE_NAME"
                 }
-                $profileRoot = Get-ManagedUserProfilePath
-                $markerPath = Join-Path (Join-Path $profileRoot 'Desktop') 'E2E-WINDOWS-STATE.json'
-                if (-not (Test-Path -LiteralPath $markerPath)) { throw "E2E marker is missing: $markerPath" }
-                $seed = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
-                $expected = @($seed.packages | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ })
-                if ($expected.Count -lt 4) { throw "E2E marker package count is too small: $($expected.Count)" }
-
-                $current = @(& choco.exe list --local-only --limit-output 2>$null)
-                if ($LASTEXITCODE -ne 0) { $current = @(& choco.exe list --limit-output 2>$null) }
-                $present = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                foreach ($line in $current) {
-                  $parts = ([string]$line) -split '\|', 2
-                  if ($parts.Count -gt 0 -and $parts[0].Trim()) { [void]$present.Add($parts[0].Trim()) }
+                function Write-E2EVerifyProgress {
+                  param([Parameter(Mandatory=$true)][string]$Message)
+                  try { & gh api --method POST "/repos/$env:GITHUB_REPOSITORY/issues/$($issue.number)/comments" -f body=$Message 2>$null | Out-Null } catch { }
                 }
-                $missing = @($expected | Where-Object { -not $present.Contains($_) })
-                if ($missing.Count) { throw "E2E restored packages missing: $($missing -join ',')" }
 
-                $regPath = 'HKCU:\Software\CloudMultiSystemManagerE2E'
-                if (-not (Test-Path $regPath)) { throw 'E2E HKCU registry key is missing' }
-                $regMarker = [string](Get-ItemPropertyValue -Path $regPath -Name 'Marker' -ErrorAction Stop)
-                if ($regMarker -ne 'CLOUD_MULTI_SYSTEM_MANAGER_E2E') { throw "E2E registry marker mismatch: $regMarker" }
+                Write-E2EVerifyProgress 'verify-start'
+                try {
+                  $profileRoot = Get-ManagedUserProfilePath
+                  $markerPath = Join-Path (Join-Path $profileRoot 'Desktop') 'E2E-WINDOWS-STATE.json'
+                  if (-not (Test-Path -LiteralPath $markerPath)) { throw "E2E marker is missing: $markerPath" }
+                  $seed = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+                  $expected = @($seed.packages | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ })
+                  if ($expected.Count -lt 4) { throw "E2E marker package count is too small: $($expected.Count)" }
+                  Write-E2EVerifyProgress "marker-ok packages=$($expected -join ',')"
 
-                $startupRoot = [Environment]::GetFolderPath('Startup')
-                if (-not $startupRoot) { $startupRoot = Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' }
-                $startupPath = Join-Path $startupRoot 'E2E-Backup-Restore-Probe.cmd'
-                if (-not (Test-Path -LiteralPath $startupPath)) { throw "E2E startup item is missing: $startupPath" }
+                  $current = @(& choco.exe list --local-only --limit-output 2>$null)
+                  if ($LASTEXITCODE -ne 0) { $current = @(& choco.exe list --limit-output 2>$null) }
+                  $present = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                  foreach ($line in $current) {
+                    $parts = ([string]$line) -split '\|', 2
+                    if ($parts.Count -gt 0 -and $parts[0].Trim()) { [void]$present.Add($parts[0].Trim()) }
+                  }
+                  $missing = @($expected | Where-Object { -not $present.Contains($_) })
+                  if ($missing.Count) { throw "E2E restored packages missing: $($missing -join ',')" }
+                  Write-E2EVerifyProgress 'packages-ok'
 
-                & schtasks.exe /Query /TN 'E2E-Backup-Restore-Probe' 2>$null | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw 'E2E scheduled task is missing' }
+                  $managedSid = [string](Get-LocalUser -Name $env:DESKTOP_USERNAME -ErrorAction Stop).SID.Value
+                  $regNativeRoot = "HKU\$managedSid"
+                  $tempHiveName = ''
+                  $loadedTempHive = $false
+                  if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$managedSid")) {
+                    $ntUserPath = Join-Path $profileRoot 'NTUSER.DAT'
+                    if (-not (Test-Path -LiteralPath $ntUserPath)) { throw "Managed user hive is unavailable during verify: $ntUserPath" }
+                    $tempHiveName = "E2E_VERIFY_$env:GITHUB_RUN_ID"
+                    & reg.exe load "HKU\$tempHiveName" $ntUserPath | Out-Host
+                    if ($LASTEXITCODE -ne 0) { throw "Failed to load managed user hive during verify: exit=$LASTEXITCODE" }
+                    $regNativeRoot = "HKU\$tempHiveName"
+                    $loadedTempHive = $true
+                  }
+                  try {
+                    $regOut = @(& reg.exe query "$regNativeRoot\Software\CloudMultiSystemManagerE2E" /v Marker 2>&1)
+                    if ($LASTEXITCODE -ne 0 -or (($regOut -join "`n") -notmatch 'CLOUD_MULTI_SYSTEM_MANAGER_E2E')) { throw 'E2E managed-user registry marker is missing or invalid' }
+                  } finally {
+                    if ($loadedTempHive) {
+                      Start-Sleep -Milliseconds 300
+                      & reg.exe unload "HKU\$tempHiveName" 2>&1 | Out-Host
+                    }
+                  }
+                  Write-E2EVerifyProgress 'registry-ok'
 
-                Write-Host "E2E_WINDOWS_STATE_VERIFY_OK packages=$($expected -join ',') marker=$markerPath registry=ok startup=ok task=ok"
+                  $startupRoot = Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+                  $startupPath = Join-Path $startupRoot 'E2E-Backup-Restore-Probe.cmd'
+                  if (-not (Test-Path -LiteralPath $startupPath)) { throw "E2E startup item is missing: $startupPath" }
+                  Write-E2EVerifyProgress 'startup-ok'
+
+                  & schtasks.exe /Query /TN 'E2E-Backup-Restore-Probe' 2>$null | Out-Null
+                  if ($LASTEXITCODE -ne 0) { throw 'E2E scheduled task is missing' }
+                  Write-E2EVerifyProgress 'task-ok'
+
+                  Write-Host "E2E_WINDOWS_STATE_VERIFY_OK packages=$($expected -join ',') marker=$markerPath registry=ok startup=ok task=ok"
+                  Write-E2EVerifyProgress 'verify-ok'
+                } catch {
+                  $verifyError = [string]$_.Exception.Message
+                  Write-E2EVerifyProgress "verify-failed error=$verifyError"
+                  throw
+                }
                 try { & gh api --method PATCH "/repos/$env:GITHUB_REPOSITORY/issues/$($issue.number)" -f state=closed 2>$null | Out-Null } catch { }
                 Start-Sleep -Seconds 2
                 continue
