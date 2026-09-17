@@ -4168,15 +4168,21 @@ jobs:
                   throw "E2E seed requires at least 4 newly installed packages; installed=$($installed.Count) packages=$($installed -join ',')"
                 }
 
+                $registryIdentity = [string](@($installed | Where-Object { ([string]$_).Trim().Length -ge 4 }) | Select-Object -First 1)
+                if ([string]::IsNullOrWhiteSpace($registryIdentity)) { throw 'E2E seed could not select an application registry identity' }
+                $registryIdentity = $registryIdentity.Trim()
+                $registrySubPath = "Software\$registryIdentity\CloudMultiSystemManagerE2E"
+
                 $profileRoot = Get-ManagedUserProfilePath
                 $desktopRoot = Join-Path $profileRoot 'Desktop'
                 New-Item -ItemType Directory -Path $desktopRoot -Force | Out-Null
                 $markerPath = Join-Path $desktopRoot 'E2E-WINDOWS-STATE.json'
                 $seed = [ordered]@{
-                  schema = 1
+                  schema = 2
                   source_run_id = [string]$env:GITHUB_RUN_ID
                   runner_image = [string]$env:RUNNER_IMAGE
                   packages = @($installed)
+                  registry_identity = $registryIdentity
                   marker = 'CLOUD_MULTI_SYSTEM_MANAGER_E2E'
                 }
                 $seed | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $markerPath -Encoding UTF8
@@ -4195,10 +4201,10 @@ jobs:
                   $loadedTempHive = $true
                 }
                 try {
-                  & reg.exe add "$regNativeRoot\Software\CloudMultiSystemManagerE2E" /v Marker /t REG_SZ /d 'CLOUD_MULTI_SYSTEM_MANAGER_E2E' /f | Out-Host
-                  if ($LASTEXITCODE -ne 0) { throw "Failed to write E2E registry marker: exit=$LASTEXITCODE" }
-                  & reg.exe add "$regNativeRoot\Software\CloudMultiSystemManagerE2E" /v Packages /t REG_SZ /d ($installed -join ',') /f | Out-Host
-                  if ($LASTEXITCODE -ne 0) { throw "Failed to write E2E registry package list: exit=$LASTEXITCODE" }
+                  & reg.exe add "$regNativeRoot\$registrySubPath" /v Marker /t REG_SZ /d 'CLOUD_MULTI_SYSTEM_MANAGER_E2E' /f | Out-Host
+                  if ($LASTEXITCODE -ne 0) { throw "Failed to write E2E application registry marker: exit=$LASTEXITCODE path=$registrySubPath" }
+                  & reg.exe add "$regNativeRoot\$registrySubPath" /v Packages /t REG_SZ /d ($installed -join ',') /f | Out-Host
+                  if ($LASTEXITCODE -ne 0) { throw "Failed to write E2E application registry package list: exit=$LASTEXITCODE path=$registrySubPath" }
                 } finally {
                   if ($loadedTempHive) {
                     Start-Sleep -Milliseconds 300
@@ -4214,7 +4220,7 @@ jobs:
                 & schtasks.exe /Create /TN 'E2E-Backup-Restore-Probe' /TR 'cmd.exe /c exit 0' /SC ONLOGON /RU SYSTEM /F | Out-Host
                 if ($LASTEXITCODE -ne 0) { throw "Failed to create E2E scheduled task: exit=$LASTEXITCODE" }
 
-                Write-Host "E2E_WINDOWS_STATE_SEEDED packages=$($installed -join ',') marker=$markerPath startup=$startupPath"
+                Write-Host "E2E_WINDOWS_STATE_SEEDED packages=$($installed -join ',') marker=$markerPath registry=$registrySubPath startup=$startupPath"
                 try { & gh api --method PATCH "/repos/$env:GITHUB_REPOSITORY/issues/$($issue.number)" -f state=closed 2>$null | Out-Null } catch { }
                 Start-Sleep -Seconds 2
                 continue
@@ -4243,7 +4249,10 @@ jobs:
                   $seed = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
                   $expected = @($seed.packages | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ })
                   if ($expected.Count -lt 4) { throw "E2E marker package count is too small: $($expected.Count)" }
-                  Write-E2EVerifyProgress "marker-ok packages=$($expected -join ',')"
+                  $registryIdentity = ([string]$seed.registry_identity).Trim()
+                  if ([string]::IsNullOrWhiteSpace($registryIdentity) -or $registryIdentity.Length -lt 4) { throw "E2E marker registry identity is invalid: $registryIdentity" }
+                  $registrySubPath = "Software\$registryIdentity\CloudMultiSystemManagerE2E"
+                  Write-E2EVerifyProgress "marker-ok packages=$($expected -join ',') registry=$registrySubPath"
 
                   $current = @(& choco.exe list --local-only --limit-output 2>$null)
                   if ($LASTEXITCODE -ne 0) { $current = @(& choco.exe list --limit-output 2>$null) }
@@ -4270,8 +4279,8 @@ jobs:
                     $loadedTempHive = $true
                   }
                   try {
-                    $regOut = @(& reg.exe query "$regNativeRoot\Software\CloudMultiSystemManagerE2E" /v Marker 2>&1)
-                    if ($LASTEXITCODE -ne 0 -or (($regOut -join "`n") -notmatch 'CLOUD_MULTI_SYSTEM_MANAGER_E2E')) { throw 'E2E managed-user registry marker is missing or invalid' }
+                    $regOut = @(& reg.exe query "$regNativeRoot\$registrySubPath" /v Marker 2>&1)
+                    if ($LASTEXITCODE -ne 0 -or (($regOut -join "`n") -notmatch 'CLOUD_MULTI_SYSTEM_MANAGER_E2E')) { throw "E2E application registry marker is missing or invalid: $registrySubPath" }
                   } finally {
                     if ($loadedTempHive) {
                       Start-Sleep -Milliseconds 300
