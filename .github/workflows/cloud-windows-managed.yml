@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091705
+# csm-managed-workflow-version: 2026091706
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -3102,7 +3102,7 @@ jobs:
             function Add-AppPayloadEvidence {
               param(
                 [Parameter(Mandatory=$true)]$App,
-                [Parameter(Mandatory=$true)][string]$Path,
+                [AllowEmptyString()][string]$Path = '',
                 [Parameter(Mandatory=$true)][string]$Evidence
               )
               if ([string]::IsNullOrWhiteSpace($Path)) { return }
@@ -3111,7 +3111,24 @@ jobs:
                 if (-not [IO.Path]::IsPathRooted($expanded)) { return }
                 $full = [IO.Path]::GetFullPath($expanded).TrimEnd('\')
                 if (-not (Test-Path -LiteralPath $full -PathType Container)) { return }
-                if (Test-ManagedSoftwareExcludedPath -Path $full) { return }
+
+                # A per-user application under the managed profile is already carried by the
+                # VSS profile snapshot. Count that as complete software-payload coverage without
+                # duplicating the same bytes into backup\software. Other excluded/runtime paths
+                # remain ineligible as durable application payload.
+                $storage = 'software'
+                $profileFull = [IO.Path]::GetFullPath($profileRoot).TrimEnd('\')
+                $insideProfile = $full.StartsWith($profileFull + '\',[System.StringComparison]::OrdinalIgnoreCase)
+                if (Test-ManagedSoftwareExcludedPath -Path $full) {
+                  if (-not $insideProfile) { return }
+                  $relativeProfile = $full.Substring($profileFull.Length).TrimStart('\')
+                  if ($relativeProfile.Equals('AppData\Local\Temp',[System.StringComparison]::OrdinalIgnoreCase) -or
+                      $relativeProfile.StartsWith('AppData\Local\Temp\',[System.StringComparison]::OrdinalIgnoreCase) -or
+                      $relativeProfile.Equals('AppData\Local\Microsoft\Windows',[System.StringComparison]::OrdinalIgnoreCase) -or
+                      $relativeProfile.StartsWith('AppData\Local\Microsoft\Windows\',[System.StringComparison]::OrdinalIgnoreCase)) { return }
+                  $storage = 'profile'
+                }
+
                 $volumeRoot = [IO.Path]::GetPathRoot($full)
                 if ([string]::IsNullOrWhiteSpace($volumeRoot)) { return }
                 $volume = $volumeRoot.TrimEnd('\').ToUpperInvariant()
@@ -3124,9 +3141,9 @@ jobs:
                 if ($null -ne $already) { return }
                 [void]$appPayloadEvidence.Add([pscustomobject]@{
                   registry_path=$registryPath; name=[string]$App.name; version=[string]$App.version;
-                  path=$full; volume=$volume; relative=$relative; evidence=$Evidence
+                  path=$full; volume=$volume; relative=$relative; evidence=$Evidence; storage=$storage
                 })
-                Write-Host "MANAGED_WINDOWS_APP_PAYLOAD_EVIDENCE app=$($App.name) path=$full evidence=$Evidence"
+                Write-Host "MANAGED_WINDOWS_APP_PAYLOAD_EVIDENCE app=$($App.name) path=$full evidence=$Evidence storage=$storage"
               } catch {
                 Write-Warning "MANAGED_WINDOWS_APP_PAYLOAD_EVIDENCE_SKIPPED app=$($App.name) path=$Path evidence=$Evidence reason=$($_.Exception.Message)"
               }
@@ -4331,7 +4348,7 @@ jobs:
                 }
 
                 $candidates = @(
-                  'everything','grepwin','keepass','greenshot','peazip','geany','wiztree','lockhunter',
+                  'everything','keepass','greenshot','peazip','geany','wiztree','grepwin','lockhunter',
                   'sharex','irfanview','foobar2000','mpv','heidisql','sqlitebrowser','jpegview','nomacs',
                   'mediainfo','windirstat','cpu-z','hwinfo','rufus','mremoteng','handbrake','audacity'
                 )

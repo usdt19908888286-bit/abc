@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091704
+# csm-managed-support-version: 2026091705
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -323,9 +323,13 @@ function New-ManagedSoftwareRehydrationPlan {
   }
 
   $applicationPlan = [System.Collections.Generic.List[object]]::new()
+  $selectedPackages = [System.Collections.Generic.List[object]]::new()
+  $selectedPackageKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($app in @($AppDelta)) {
     $package = Find-ManagedPackageForApplication -Application $app -PackagePlan @($packages)
     if ($null -ne $package) {
+      $packageKey = "$([string]$package.manager)|$([string]$package.package_id)"
+      if ($selectedPackageKeys.Add($packageKey)) { [void]$selectedPackages.Add($package) }
       [void]$applicationPlan.Add([pscustomobject]@{
         registry_path=[string]$app.registry_path; app_name=[string]$app.name; app_version=[string]$app.version;
         strategy='rehydrate'; manager=[string]$package.manager; package_id=[string]$package.package_id; package_version=[string]$package.version
@@ -340,12 +344,15 @@ function New-ManagedSoftwareRehydrationPlan {
     }
   }
 
-  ConvertTo-Json -InputObject @($packages) -Depth 7 | Set-Content -LiteralPath (Join-Path $StateRoot 'rehydration-plan.json') -Encoding UTF8
+  # Only keep one preferred reconstruction source per installed application. A complete
+  # software capsule is still authoritative, so duplicating the same app through winget
+  # and Chocolatey only adds restore time and can perturb installer state.
+  ConvertTo-Json -InputObject @($selectedPackages) -Depth 7 | Set-Content -LiteralPath (Join-Path $StateRoot 'rehydration-plan.json') -Encoding UTF8
   ConvertTo-Json -InputObject @($applicationPlan) -Depth 7 | Set-Content -LiteralPath (Join-Path $StateRoot 'application-plan.json') -Encoding UTF8
   $fallbackCount = @($applicationPlan | Where-Object { [string]$_.strategy -eq 'payload' }).Count
   $rehydrateCount = @($applicationPlan | Where-Object { [string]$_.strategy -eq 'rehydrate' }).Count
-  Write-Host "MANAGED_WINDOWS_REHYDRATION_PLAN packages=$($packages.Count) apps=$($applicationPlan.Count) rehydrateApps=$rehydrateCount fallbackApps=$fallbackCount"
-  return [pscustomobject]@{ packages=@($packages); applications=@($applicationPlan); rehydrate_apps=$rehydrateCount; fallback_apps=$fallbackCount }
+  Write-Host "MANAGED_WINDOWS_REHYDRATION_PLAN candidates=$($packages.Count) selected=$($selectedPackages.Count) apps=$($applicationPlan.Count) rehydrateApps=$rehydrateCount fallbackApps=$fallbackCount"
+  return [pscustomobject]@{ packages=@($selectedPackages); applications=@($applicationPlan); rehydrate_apps=$rehydrateCount; fallback_apps=$fallbackCount }
 }
 
 function Invoke-ManagedSoftwareRehydrate {
