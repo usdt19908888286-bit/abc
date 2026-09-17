@@ -1154,6 +1154,75 @@ jobs:
           $softwareAclRestored = 0
           $softwareAclVolatileSkipped = 0
           $softwareAclPackageStoreSkipped = 0
+
+          # icacls /save stores raw SIDs. GitHub-hosted Windows runners are fresh VMs,
+          # so machine-local SIDs change on every run even when the logical account name
+          # and RID (for example the built-in Administrator RID 500) stay the same.
+          # Build a portable SID substitution table before applying saved software ACLs.
+          $targetLocalSidByName = @{}
+          $targetLocalSidByRid = @{}
+          foreach ($localUser in @(Get-LocalUser -ErrorAction SilentlyContinue)) {
+            $localSid = [string]$localUser.SID.Value
+            $localName = [string]$localUser.Name
+            if ([string]::IsNullOrWhiteSpace($localSid)) { continue }
+            if (-not [string]::IsNullOrWhiteSpace($localName)) { $targetLocalSidByName[$localName] = $localSid }
+            $ridMatch = [regex]::Match($localSid, '-([0-9]+)$')
+            if ($ridMatch.Success) { $targetLocalSidByRid[$ridMatch.Groups[1].Value] = $localSid }
+          }
+
+          function Get-ManagedAclSidSubstitutions {
+            param([Parameter(Mandatory=$true)][string]$AclFile)
+            $pairs = [System.Collections.Generic.List[object]]::new()
+            $seenOld = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            function Add-ManagedAclSidPair {
+              param([string]$OldSid,[string]$NewSid,[string]$Reason)
+              if ([string]::IsNullOrWhiteSpace($OldSid) -or [string]::IsNullOrWhiteSpace($NewSid)) { return }
+              if ($OldSid.Equals($NewSid,[System.StringComparison]::OrdinalIgnoreCase)) { return }
+              if (-not $seenOld.Add($OldSid)) { return }
+              [void]$pairs.Add([pscustomobject]@{ old=$OldSid; new=$NewSid; reason=$Reason })
+            }
+
+            $sourceManagedSid = ([string]$metadata.source_sid).Trim()
+            if ($sourceManagedSid) { Add-ManagedAclSidPair -OldSid $sourceManagedSid -NewSid $sid -Reason 'managed-user' }
+
+            # Newer backups persist the source local account names/SIDs. Prefer account
+            # identity when available because it is stronger than a RID-only fallback.
+            if ($metadata.PSObject.Properties.Name -contains 'source_local_accounts' -and $null -ne $metadata.source_local_accounts) {
+              foreach ($savedAccount in @($metadata.source_local_accounts)) {
+                $oldSid = ([string]$savedAccount.sid).Trim()
+                $name = ([string]$savedAccount.name).Trim()
+                if ($oldSid -and $name -and $targetLocalSidByName.ContainsKey($name)) {
+                  Add-ManagedAclSidPair -OldSid $oldSid -NewSid ([string]$targetLocalSidByName[$name]) -Reason "local-name:$name"
+                }
+              }
+            }
+
+            # Compatibility for existing V13 caches: infer the source machine SID prefix
+            # from source_sid, then map any other source-machine local account by RID to
+            # the equivalent local account on the fresh runner. This fixes RID 500 ACLs
+            # without touching domain, BUILTIN, service, AppContainer or other stable SIDs.
+            $sourceMachinePrefix = ''
+            $sourcePrefixMatch = [regex]::Match($sourceManagedSid, '^(S-1-5-21-[0-9]+-[0-9]+-[0-9]+)-[0-9]+$')
+            if ($sourcePrefixMatch.Success) { $sourceMachinePrefix = $sourcePrefixMatch.Groups[1].Value }
+            if ($sourceMachinePrefix) {
+              $aclText = Get-Content -LiteralPath $AclFile -Raw
+              $machineSidPattern = [regex]::Escape($sourceMachinePrefix) + '-([0-9]+)'
+              foreach ($sidMatch in [regex]::Matches($aclText, $machineSidPattern)) {
+                $oldSid = $sidMatch.Value
+                $rid = $sidMatch.Groups[1].Value
+                if ($oldSid.Equals($sourceManagedSid,[System.StringComparison]::OrdinalIgnoreCase)) {
+                  Add-ManagedAclSidPair -OldSid $oldSid -NewSid $sid -Reason 'managed-user'
+                } elseif ($targetLocalSidByRid.ContainsKey($rid)) {
+                  Add-ManagedAclSidPair -OldSid $oldSid -NewSid ([string]$targetLocalSidByRid[$rid]) -Reason "local-rid:$rid"
+                } else {
+                  Write-Warning "MANAGED_WINDOWS_ACL_LOCAL_SID_UNMAPPED sid=$oldSid rid=$rid file=$([IO.Path]::GetFileName($AclFile))"
+                }
+              }
+            }
+            return @($pairs)
+          }
+
           $softwareAclManifestPath = Join-Path $stateRoot 'software-acl.json'
           if (Test-Path -LiteralPath $softwareAclManifestPath) {
             foreach ($entry in @(Get-Content -LiteralPath $softwareAclManifestPath -Raw | ConvertFrom-Json)) {
@@ -1173,11 +1242,34 @@ jobs:
               $relativeParent = [IO.Path]::GetDirectoryName($relative)
               $aclBase = if ([string]::IsNullOrWhiteSpace($relativeParent)) { $volumeRootForAcl } else { Join-Path $volumeRootForAcl $relativeParent }
               if (-not (Test-Path -LiteralPath $aclBase -PathType Container)) { throw "Software ACL restore base is missing: $aclBase" }
-              $args = @($aclBase,'/restore',$aclFile,'/c','/q')
-              if ($metadata.source_sid -and -not ([string]$metadata.source_sid).Equals($sid,[System.StringComparison]::OrdinalIgnoreCase)) {
-                $args += @('/substitute',[string]$metadata.source_sid,$sid)
+
+              $aclRestoreFile = $aclFile
+              $aclTempFile = ''
+              try {
+                $aclSidSubstitutions = @(Get-ManagedAclSidSubstitutions -AclFile $aclFile)
+                if ($aclSidSubstitutions.Count -gt 0) {
+                  $aclText = Get-Content -LiteralPath $aclFile -Raw
+                  $aclChanged = $false
+                  foreach ($pair in $aclSidSubstitutions) {
+                    $oldSid = [string]$pair.old
+                    $newSid = [string]$pair.new
+                    if ($aclText.Contains($oldSid)) {
+                      $aclText = $aclText.Replace($oldSid,$newSid)
+                      $aclChanged = $true
+                      Write-Host "MANAGED_WINDOWS_ACL_SID_REWRITE old=$oldSid new=$newSid reason=$($pair.reason)"
+                    }
+                  }
+                  if ($aclChanged) {
+                    $aclTempFile = Join-Path $env:RUNNER_TEMP "managed-acl-$([guid]::NewGuid().ToString('N')).txt"
+                    [IO.File]::WriteAllText($aclTempFile,$aclText,[Text.Encoding]::Unicode)
+                    $aclRestoreFile = $aclTempFile
+                  }
+                }
+                $args = @($aclBase,'/restore',$aclRestoreFile,'/c','/q')
+                $aclOutput = @(& icacls.exe @args 2>&1)
+              } finally {
+                if ($aclTempFile) { Remove-Item -LiteralPath $aclTempFile -Force -ErrorAction SilentlyContinue }
               }
-              $aclOutput = @(& icacls.exe @args 2>&1)
               $aclExit = $LASTEXITCODE
               $aclOutput | Out-Host
               $failedAclLine = $aclOutput | Where-Object { [string]$_ -match '(?i)Failed processing\s+[1-9][0-9]*\s+files?' } | Select-Object -First 1
@@ -3894,6 +3986,11 @@ jobs:
               throw "Strict app payload backup failed: evidence=$(@($appPayloadEvidence).Count) roots=$(@($softwareRoots).Count) files=$softwareFiles"
             }
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
+            $sourceLocalAccounts = @(
+              Get-LocalUser -ErrorAction SilentlyContinue |
+                Sort-Object Name |
+                ForEach-Object { [pscustomobject]@{ name=[string]$_.Name; sid=[string]$_.SID.Value } }
+            )
 
             @{
               version = 13
@@ -3901,6 +3998,7 @@ jobs:
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
               source_sid = $sid
+              source_local_accounts = $sourceLocalAccounts
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
@@ -3938,7 +4036,7 @@ jobs:
               winget_delta_count = $wingetDeltaCount
               choco_delta_count = $chocoDeltaCount
               scoop_delta_count = $scoopDeltaCount
-            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
             Write-Host "MANAGED_WINDOWS_BACKUP_V13_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appxDelta=$(@($appxDelta).Count) appxRequired=$(@($appxDelta | Where-Object { [bool]$_.restore_required }).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
