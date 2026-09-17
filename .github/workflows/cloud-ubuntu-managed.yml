@@ -182,10 +182,84 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          managed_keep_quiesce_unit() {
+            case "$1" in
+              ssh.service|ssh.socket|tailscaled.service|systemd-networkd.service|NetworkManager.service|systemd-resolved.service|networkd-dispatcher.service|systemd-journald.service|systemd-journald.socket|systemd-journald-dev-log.socket|systemd-udevd.service|systemd-udevd-control.socket|systemd-udevd-kernel.socket|systemd-logind.service|systemd-timesyncd.service|dbus.service|dbus.socket|polkit.service|waagent.service|walinuxagent.service|WALinuxAgent.service|actions.runner.*.service|github-actions-runner*.service)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          managed_capture_active_units() {
+            local dir="$1"
+            mkdir -p "$dir"
+            (systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true) \
+              | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$dir/services.txt"
+            for unit_type in socket timer path; do
+              (systemctl list-units --type="$unit_type" --state=active --no-legend --no-pager 2>/dev/null || true) \
+                | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$dir/${unit_type}s.txt"
+            done
+          }
+
+          managed_stop_unit_file() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              managed_keep_quiesce_unit "$unit" && continue
+              sudo systemctl stop "$unit" >/dev/null 2>&1 \
+                || echo "::warning::Could not stop $unit while quiescing Ubuntu state"
+            done <"$file"
+          }
+
+          managed_verify_unit_file_quiet() {
+            local file="$1"
+            local failed=0
+            [ -f "$file" ] || return 0
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              managed_keep_quiesce_unit "$unit" && continue
+              if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                echo "::error::Ubuntu snapshot is not quiescent; unit is still active: $unit"
+                failed=1
+              fi
+            done <"$file"
+            return "$failed"
+          }
+
+          managed_quiesce_from_dir() {
+            local dir="$1"
+            local failed=0
+            # Stop activators before services so timers/sockets/paths cannot race the snapshot.
+            for kind in timers paths sockets services; do
+              managed_stop_unit_file "$dir/${kind}.txt"
+            done
+            sync
+            for kind in timers paths sockets services; do
+              managed_verify_unit_file_quiet "$dir/${kind}.txt" || failed=1
+            done
+            [ "$failed" -eq 0 ] || exit 1
+          }
+
+          managed_start_unit_file() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              managed_keep_quiesce_unit "$unit" && continue
+              sudo systemctl start "$unit" >/dev/null 2>&1 \
+                || { echo "::error::Failed to restore active Ubuntu unit $unit"; exit 1; }
+              systemctl is-active --quiet "$unit" 2>/dev/null \
+                || { echo "::error::Restored Ubuntu unit is not active: $unit"; exit 1; }
+            done <"$file"
+          }
+
           sudo apt-get update -qq
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server rsync jq dpkg-repack acl
 
-          # V3 uses a clean-runner baseline. Installer/package state is replayed by
+          # V3/V4 use a clean-runner baseline. Installer/package state is replayed by
           # package managers where possible; non-package filesystem changes are
           # captured separately and restored only after package replay.
           apt-mark showmanual | LC_ALL=C sort -u >/tmp/managed-ubuntu-baseline-manual.txt
@@ -397,6 +471,19 @@ jobs:
               echo 'MANAGED_UBUNTU_SNAP_RESTORE_APPLIED'
             fi
 
+            # Package replay may auto-start daemons on a fresh runner. Freeze every
+            # non-infrastructure systemd writer before restoring filesystem state.
+            # Critical runner/network units stay alive only so this GitHub job can
+            # finish and report/upload; their mutable state paths are excluded from
+            # the managed snapshot.
+            RESTORE_QUIESCE_DIR=/tmp/managed-ubuntu-restore-active
+            rm -rf "$RESTORE_QUIESCE_DIR"
+            managed_capture_active_units "$RESTORE_QUIESCE_DIR"
+            sudo loginctl terminate-user "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
+            sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
+            sleep 2
+            managed_quiesce_from_dir "$RESTORE_QUIESCE_DIR"
+            echo 'MANAGED_UBUNTU_QUIESCED_FOR_RESTORE'
 
             SYSTEM_STATE=/tmp/managed-desktop-backup/system
             if [ -s "$SYSTEM_STATE/delta.tar" ]; then
@@ -551,14 +638,50 @@ jobs:
                 sudo systemctl enable "$unit" >/dev/null 2>&1 || { echo "::error::Failed to enable restored unit $unit"; exit 1; }
               done <"$SYSTEMD_STATE/enabled-added.txt"
             fi
-            if [ -s "$SYSTEMD_STATE/running-added.txt" ]; then
-              while IFS= read -r unit || [ -n "$unit" ]; do
-                [ -n "$unit" ] || continue
-                case "$unit" in ssh.service|tailscaled.service) continue ;; esac
-                sudo systemctl start "$unit" || { echo "::error::Failed to start restored unit $unit"; exit 1; }
-                systemctl is-active --quiet "$unit" || { echo "::error::Restored unit is not active: $unit"; exit 1; }
-              done <"$SYSTEMD_STATE/running-added.txt"
+            RESTORE_RUNTIME_DIR=/tmp/managed-ubuntu-runtime-restore
+            rm -rf "$RESTORE_RUNTIME_DIR"
+            mkdir -p "$RESTORE_RUNTIME_DIR"
+
+            if [ -s "$SYSTEMD_STATE/runtime-services.txt" ]; then
+              cp "$SYSTEMD_STATE/runtime-services.txt" "$RESTORE_RUNTIME_DIR/services.txt"
+            else
+              # Backward compatibility with V3 backups: preserve fresh-runner baseline
+              # services and add the user/application services that the old backup did
+              # explicitly record as running-added.
+              cat "$RESTORE_QUIESCE_DIR/services.txt" >"$RESTORE_RUNTIME_DIR/services.txt"
+              if [ -s "$SYSTEMD_STATE/running-added.txt" ]; then
+                cat "$SYSTEMD_STATE/running-added.txt" >>"$RESTORE_RUNTIME_DIR/services.txt"
+              fi
+              sed '/^[[:space:]]*$/d' "$RESTORE_RUNTIME_DIR/services.txt" | LC_ALL=C sort -u \
+                >"$RESTORE_RUNTIME_DIR/services.tmp"
+              mv "$RESTORE_RUNTIME_DIR/services.tmp" "$RESTORE_RUNTIME_DIR/services.txt"
             fi
+
+            for kind in sockets timers paths; do
+              if [ -s "$SYSTEMD_STATE/runtime-${kind}.txt" ]; then
+                cp "$SYSTEMD_STATE/runtime-${kind}.txt" "$RESTORE_RUNTIME_DIR/${kind}.txt"
+              else
+                cp "$RESTORE_QUIESCE_DIR/${kind}.txt" "$RESTORE_RUNTIME_DIR/${kind}.txt" 2>/dev/null || :
+                case "$kind" in
+                  sockets) suffix='\.socket$' ;;
+                  timers) suffix='\.timer$' ;;
+                  paths) suffix='\.path$' ;;
+                esac
+                if [ -s "$SYSTEMD_STATE/enabled-added.txt" ]; then
+                  { grep -E "$suffix" "$SYSTEMD_STATE/enabled-added.txt" 2>/dev/null || true; cat "$RESTORE_RUNTIME_DIR/${kind}.txt"; } \
+                    | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$RESTORE_RUNTIME_DIR/${kind}.tmp"
+                  mv "$RESTORE_RUNTIME_DIR/${kind}.tmp" "$RESTORE_RUNTIME_DIR/${kind}.txt"
+                fi
+              fi
+            done
+
+            # Services first so dependencies are available; activators follow and
+            # recover socket/timer/path driven application behavior.
+            managed_start_unit_file "$RESTORE_RUNTIME_DIR/services.txt"
+            managed_start_unit_file "$RESTORE_RUNTIME_DIR/sockets.txt"
+            managed_start_unit_file "$RESTORE_RUNTIME_DIR/paths.txt"
+            managed_start_unit_file "$RESTORE_RUNTIME_DIR/timers.txt"
+            echo 'MANAGED_UBUNTU_RUNTIME_STATE_RESTORED'
             echo 'MANAGED_DESKTOP_RESTORE_APPLIED'
           else
             echo 'MANAGED_DESKTOP_FRESH_START'
@@ -721,10 +844,67 @@ jobs:
         run: |
           set -euo pipefail
 
+          managed_keep_quiesce_unit() {
+            case "$1" in
+              ssh.service|ssh.socket|tailscaled.service|systemd-networkd.service|NetworkManager.service|systemd-resolved.service|networkd-dispatcher.service|systemd-journald.service|systemd-journald.socket|systemd-journald-dev-log.socket|systemd-udevd.service|systemd-udevd-control.socket|systemd-udevd-kernel.socket|systemd-logind.service|systemd-timesyncd.service|dbus.service|dbus.socket|polkit.service|waagent.service|walinuxagent.service|WALinuxAgent.service|actions.runner.*.service|github-actions-runner*.service)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          managed_capture_active_units() {
+            local dir="$1"
+            mkdir -p "$dir"
+            (systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true) \
+              | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$dir/services.txt"
+            for unit_type in socket timer path; do
+              (systemctl list-units --type="$unit_type" --state=active --no-legend --no-pager 2>/dev/null || true) \
+                | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$dir/${unit_type}s.txt"
+            done
+          }
+
+          managed_stop_unit_file() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              managed_keep_quiesce_unit "$unit" && continue
+              sudo systemctl stop "$unit" >/dev/null 2>&1 \
+                || echo "::warning::Could not stop $unit while quiescing Ubuntu state"
+            done <"$file"
+          }
+
+          managed_verify_unit_file_quiet() {
+            local file="$1"
+            local failed=0
+            [ -f "$file" ] || return 0
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              managed_keep_quiesce_unit "$unit" && continue
+              if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                echo "::error::Ubuntu snapshot is not quiescent; unit is still active: $unit"
+                failed=1
+              fi
+            done <"$file"
+            return "$failed"
+          }
+
+          managed_quiesce_from_dir() {
+            local dir="$1"
+            local failed=0
+            for kind in timers paths sockets services; do
+              managed_stop_unit_file "$dir/${kind}.txt"
+            done
+            sync
+            for kind in timers paths sockets services; do
+              managed_verify_unit_file_quiet "$dir/${kind}.txt" || failed=1
+            done
+            [ "$failed" -eq 0 ] || exit 1
+          }
+
           stage_backup() {
-            sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
-            sleep 2
-            rm -rf /tmp/managed-desktop-backup
+            rm -rf /tmp/managed-desktop-backup /tmp/managed-ubuntu-backup-active
             mkdir -p \
               /tmp/managed-desktop-backup/home \
               /tmp/managed-desktop-backup/apt/debs \
@@ -735,25 +915,116 @@ jobs:
               /tmp/managed-desktop-backup/cron \
               /tmp/managed-desktop-backup/system
 
-            # Capture desired service state before stopping user-added services for
-            # a more consistent filesystem/data snapshot.
+            # Capture exact desired runtime state before anything is stopped. New
+            # backups restore this state instead of assuming only newly-added services
+            # can write application data.
             (systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null || true) \
               | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
               >/tmp/managed-ubuntu-current-systemd-enabled.txt
-            (systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true) \
-              | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
-              >/tmp/managed-ubuntu-current-systemd-running.txt
+            managed_capture_active_units /tmp/managed-ubuntu-backup-active
+            cp /tmp/managed-ubuntu-backup-active/services.txt /tmp/managed-ubuntu-current-systemd-running.txt
+            cp /tmp/managed-ubuntu-backup-active/services.txt /tmp/managed-desktop-backup/systemd/runtime-services.txt
+            cp /tmp/managed-ubuntu-backup-active/sockets.txt /tmp/managed-desktop-backup/systemd/runtime-sockets.txt
+            cp /tmp/managed-ubuntu-backup-active/timers.txt /tmp/managed-desktop-backup/systemd/runtime-timers.txt
+            cp /tmp/managed-ubuntu-backup-active/paths.txt /tmp/managed-desktop-backup/systemd/runtime-paths.txt
             comm -13 /tmp/managed-ubuntu-baseline-systemd-enabled.txt /tmp/managed-ubuntu-current-systemd-enabled.txt \
               >/tmp/managed-desktop-backup/systemd/enabled-added.txt
             comm -23 /tmp/managed-ubuntu-baseline-systemd-enabled.txt /tmp/managed-ubuntu-current-systemd-enabled.txt \
               >/tmp/managed-desktop-backup/systemd/enabled-removed.txt
             comm -13 /tmp/managed-ubuntu-baseline-systemd-running.txt /tmp/managed-ubuntu-current-systemd-running.txt \
               >/tmp/managed-desktop-backup/systemd/running-added.txt
-            while IFS= read -r unit || [ -n "$unit" ]; do
-              [ -n "$unit" ] || continue
-              case "$unit" in ssh.service|tailscaled.service|systemd-networkd.service|NetworkManager.service) continue ;; esac
-              sudo systemctl stop "$unit" >/dev/null 2>&1 || echo "::warning::Could not stop $unit before backup"
-            done </tmp/managed-desktop-backup/systemd/running-added.txt
+
+            # snap list needs snapd; inventory it before quiescing, then copy the
+            # immutable .snap payloads only after snapd has been stopped.
+            if command -v snap >/dev/null 2>&1; then
+              (snap list 2>/dev/null || true) >/tmp/managed-ubuntu-current-snap-list.txt
+            else
+              : >/tmp/managed-ubuntu-current-snap-list.txt
+            fi
+
+            # End interactive/user workloads, disable systemd activators, then stop
+            # every non-infrastructure running service. This includes baseline Docker,
+            # containerd, cron, snapd and any future application daemon without having
+            # to know its name in advance.
+            sudo loginctl terminate-user "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
+            sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
+            sleep 2
+            managed_quiesce_from_dir /tmp/managed-ubuntu-backup-active
+
+            # Fail closed if an unknown surviving process still has a writable file
+            # descriptor inside the state we are about to snapshot. This catches
+            # daemons started outside systemd as well as future runner-image services.
+            sudo python3 - "$DESKTOP_USERNAME" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          desktop_user = sys.argv[1]
+          roots = [
+              '/etc', '/opt', '/usr/local', '/usr/bin', '/usr/sbin', '/usr/lib',
+              '/usr/libexec', '/usr/share', '/usr/src', '/var/lib', '/var/opt',
+              '/var/snap', '/var/www', '/srv', '/root', f'/home/{desktop_user}',
+          ]
+          excludes = [
+              '/etc/apt', '/usr/share/keyrings', '/etc/hostname', '/etc/hosts',
+              '/etc/resolv.conf', '/etc/machine-id', '/etc/fstab', '/etc/crypttab',
+              '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow',
+              '/etc/subuid', '/etc/subgid', '/etc/netplan', '/etc/network',
+              '/etc/cloud', '/var/lib/apt', '/var/lib/dpkg', '/var/lib/systemd',
+              '/var/lib/cloud', '/var/lib/snapd', '/var/lib/flatpak',
+              '/var/lib/tailscale', '/var/lib/NetworkManager', '/var/lib/dbus',
+              '/var/lib/waagent', '/var/lib/private', '/root/.cache',
+              f'/home/{desktop_user}/.cache',
+              f'/home/{desktop_user}/.local/share/flatpak/repo',
+          ]
+
+          def beneath(path, base):
+              return path == base or path.startswith(base + os.sep)
+
+          def managed(path):
+              path = os.path.normpath(path)
+              if not any(beneath(path, root) for root in roots):
+                  return False
+              return not any(beneath(path, item) for item in excludes)
+
+          writers = []
+          for proc in Path('/proc').iterdir():
+              if not proc.name.isdigit():
+                  continue
+              fd_dir = proc / 'fd'
+              try:
+                  fds = list(fd_dir.iterdir())
+              except OSError:
+                  continue
+              for fd in fds:
+                  try:
+                      target = os.readlink(fd)
+                      if target.endswith(' (deleted)'):
+                          target = target[:-10]
+                      if not target.startswith('/') or not managed(target):
+                          continue
+                      flags_text = (proc / 'fdinfo' / fd.name).read_text(errors='replace')
+                      flags_line = next((line for line in flags_text.splitlines() if line.startswith('flags:')), '')
+                      if not flags_line:
+                          continue
+                      flags = int(flags_line.split(':', 1)[1].strip(), 8)
+                      if (flags & os.O_ACCMODE) == os.O_RDONLY:
+                          continue
+                      try:
+                          cmd = (proc / 'cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+                      except OSError:
+                          cmd = ''
+                      writers.append((int(proc.name), target, cmd[:160]))
+                  except (OSError, ValueError, StopIteration):
+                      continue
+
+          if writers:
+              for pid, path, cmd in sorted(set(writers))[:20]:
+                  print(f'::error::Ubuntu snapshot still has writer pid={pid} path={path} cmd={cmd}')
+              sys.exit(1)
+          print('MANAGED_UBUNTU_SNAPSHOT_WRITERS_QUIET')
+          PY
+            echo 'MANAGED_UBUNTU_QUIESCED_FOR_BACKUP'
 
             sudo rsync -aHAX --delete --exclude='.cache/' --exclude='.local/share/flatpak/repo/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
 
@@ -799,14 +1070,15 @@ jobs:
             done </tmp/managed-desktop-backup/apt/restore-packages.txt
             echo "MANAGED_UBUNTU_APT_BACKUP_COUNT=$(wc -l </tmp/managed-desktop-backup/apt/restore-packages.txt | tr -d ' ')"
 
-            # Snap installer-state with cached snap payload fallback.
-            if command -v snap >/dev/null 2>&1; then
-              (snap list 2>/dev/null || true) | awk 'NR>1 {print $1}' | LC_ALL=C sort -u >/tmp/managed-ubuntu-current-snaps.txt
+            # Snap installer-state with cached snap payload fallback. The inventory
+            # was captured before quiescing because snapd is intentionally stopped now.
+            if [ -s /tmp/managed-ubuntu-current-snap-list.txt ]; then
+              awk 'NR>1 {print $1}' /tmp/managed-ubuntu-current-snap-list.txt | LC_ALL=C sort -u >/tmp/managed-ubuntu-current-snaps.txt
               comm -13 /tmp/managed-ubuntu-baseline-snaps.txt /tmp/managed-ubuntu-current-snaps.txt >/tmp/managed-ubuntu-added-snaps.txt
               : >/tmp/managed-desktop-backup/snap/added.tsv
               while IFS= read -r snap_name || [ -n "$snap_name" ]; do
                 [ -n "$snap_name" ] || continue
-                snap_line=$(snap list "$snap_name" 2>/dev/null | awk 'NR == 2 {print $1 "\t" $3 "\t" $4 "\t" $6}')
+                snap_line=$(awk -v n="$snap_name" '$1 == n {print $1 "\t" $3 "\t" $4 "\t" $6; exit}' /tmp/managed-ubuntu-current-snap-list.txt)
                 [ -n "$snap_line" ] || continue
                 printf '%s\n' "$snap_line" >>/tmp/managed-desktop-backup/snap/added.tsv
                 snap_rev=$(printf '%s\n' "$snap_line" | cut -f2)
@@ -966,18 +1238,18 @@ jobs:
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 3,
+              'version': 4,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-home-plus-installer-state-v3-without-dot-cache',
-              'features': ['apt','apt-config','snap','flatpak','system-delta','systemd','cron'],
+              'scope': 'managed-home-plus-installer-state-v4-quiesced-without-dot-cache',
+              'features': ['apt','apt-config','snap','flatpak','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state'],
           }, separators=(',', ':')))
           PY
-            echo 'MANAGED_UBUNTU_V3_BACKUP_STAGED'
+            echo 'MANAGED_UBUNTU_V4_BACKUP_STAGED'
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
