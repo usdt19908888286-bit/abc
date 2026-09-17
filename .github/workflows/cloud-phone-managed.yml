@@ -698,12 +698,50 @@ jobs:
           adb shell settings put global auto_update_system_apps 0 || true
 
           echo 'ADB_TCPIP_BOOTSTRAP_START'
-          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }
+          # Newer Android images can restart adbd so quickly that `adb tcpip`
+          # reports `error: closed` even though TCP mode was applied successfully.
+          # Treat the command result as provisional and verify both the host TCP
+          # endpoint and the emulator transport before deciding that bootstrap failed.
+          set +e
+          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1
+          ADB_TCPIP_RC=$?
+          set -e
+          cat /tmp/adb-tcpip.log || true
+          if [ "$ADB_TCPIP_RC" -ne 0 ] && ! grep -qiE 'error: closed|device offline|transport.*closed' /tmp/adb-tcpip.log; then
+            echo "::error::adb tcpip failed rc=${ADB_TCPIP_RC}"
+            exit "$ADB_TCPIP_RC"
+          fi
+          if [ "$ADB_TCPIP_RC" -ne 0 ]; then
+            echo "::warning::adb tcpip transport closed during adbd restart; verifying readiness"
+          fi
+
+          ADB_TCP_READY=0
           for _ in $(seq 1 30); do
-            nc -z 127.0.0.1 5555 && break
+            if nc -z 127.0.0.1 5555; then
+              ADB_TCP_READY=1
+              break
+            fi
             sleep 1
           done
-          nc -z 127.0.0.1 5555
+          if [ "$ADB_TCP_READY" -ne 1 ]; then
+            echo '::error::ADB TCP port 5555 did not become ready'
+            exit 1
+          fi
+
+          ADB_DEVICE_READY=0
+          for _ in $(seq 1 30); do
+            if adb -s emulator-5554 get-state 2>/dev/null | grep -qx 'device'; then
+              ADB_DEVICE_READY=1
+              break
+            fi
+            adb reconnect >/dev/null 2>&1 || true
+            sleep 1
+          done
+          if [ "$ADB_DEVICE_READY" -ne 1 ]; then
+            echo '::error::Emulator ADB transport did not recover after tcpip restart'
+            adb devices -l || true
+            exit 1
+          fi
           echo 'ADB_TCPIP_5555_READY'
 
           TS_IPV4=$(tailscale ip -4 | head -n1)
