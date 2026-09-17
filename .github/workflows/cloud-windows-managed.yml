@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091707
+# csm-managed-workflow-version: 2026091708
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -1142,6 +1142,11 @@ jobs:
               $regPathText = [string]$entry.registry_path
               $file = Join-Path (Join-Path $stateRoot 'app-registry') ([string]$entry.file)
               if (-not (Test-Path -LiteralPath $file)) { Write-Warning "Application registry backup missing: $regPathText"; continue }
+              if (Test-ManagedWindowsRuntimeRegistryPath -RegistryPath $regPathText) {
+                $appRegistryPortabilitySkipped++
+                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_RUNTIME_SKIPPED path=$regPathText policy=windows-runtime-cache"
+                continue
+              }
               & reg.exe import $file | Out-Null
               if ($LASTEXITCODE -eq 0) {
                 $appRegistryRestored++
@@ -1837,8 +1842,15 @@ jobs:
               foreach ($savedAccount in @($metadata.source_local_accounts)) {
                 $oldSid = ([string]$savedAccount.sid).Trim()
                 $accountName = ([string]$savedAccount.name).Trim()
-                if ($oldSid -and $accountName -and $taskTargetSidByName.ContainsKey($accountName)) {
-                  $taskSourceSidMap[$oldSid] = [string]$taskTargetSidByName[$accountName]
+                if ($oldSid -and $accountName) {
+                  if ($metadata.source_sid -and $oldSid.Equals([string]$metadata.source_sid,[System.StringComparison]::OrdinalIgnoreCase)) {
+                    # The managed account may be renamed between VMs (for example runneradmin -> admin).
+                    # Preserve the old account-name spelling as an alias to the new managed SID.
+                    $taskSourceSidMap[$oldSid] = $sid
+                    $taskTargetSidByName[$accountName] = $sid
+                  } elseif ($taskTargetSidByName.ContainsKey($accountName)) {
+                    $taskSourceSidMap[$oldSid] = [string]$taskTargetSidByName[$accountName]
+                  }
                 }
               }
             }
@@ -3510,6 +3522,10 @@ jobs:
                 ($candidate.EndsWith('\Elevation',[System.StringComparison]::OrdinalIgnoreCase) -or $candidate.IndexOf('\Elevation\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0)
               if ($protectedElevationCandidate) {
                 Write-Host "MANAGED_WINDOWS_APP_REGISTRY_PORTABILITY_SKIPPED path=$candidate policy=windows-owned-elevation"
+                continue
+              }
+              if (Test-ManagedWindowsRuntimeRegistryPath -RegistryPath $candidate) {
+                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_PORTABILITY_SKIPPED path=$candidate policy=windows-runtime-cache"
                 continue
               }
               $nested = $false

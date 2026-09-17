@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091706
+# csm-managed-support-version: 2026091707
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -21,6 +21,24 @@ function Test-ManagedWindowsOwnedRegistryPath {
 
   foreach ($part in $parts[1..($parts.Count - 1)]) {
     if (([string]$part).Equals('Elevation',[System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+  }
+  return $false
+}
+
+function Test-ManagedWindowsRuntimeRegistryPath {
+  [CmdletBinding()]
+  param([Parameter(Mandatory=$true)][string]$RegistryPath)
+
+  $text = $RegistryPath.Trim().Replace('/','\')
+  $runtimePrefixes = @(
+    'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\IdentityCRL\NegativeCache',
+    'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\IdentityCRL\ThrottleCache',
+    'HKEY_CURRENT_USER\SOFTWARE\Microsoft\RestartManager',
+    'HKEY_CURRENT_USER\SOFTWARE\Classes\Local Settings\MrtCache'
+  )
+  foreach ($prefix in $runtimePrefixes) {
+    if ($text.Equals($prefix,[System.StringComparison]::OrdinalIgnoreCase) -or
+        $text.StartsWith($prefix + '\',[System.StringComparison]::OrdinalIgnoreCase)) { return $true }
   }
   return $false
 }
@@ -581,6 +599,10 @@ function Register-ManagedScheduledTaskXml {
       $mapped = [string]$SourceSidMap[$original]
     } elseif ($original -match '^[^\\]+\\(?<name>[^\\]+)$' -and $TargetSidByName.ContainsKey($matches.name)) {
       $mapped = [string]$TargetSidByName[$matches.name]
+    } elseif ($TargetSidByName.ContainsKey($original)) {
+      # Export-ScheduledTask may persist a local principal as a bare user name.
+      # Map it to the target SID just like MACHINE\user so VM/account renames are portable.
+      $mapped = [string]$TargetSidByName[$original]
     }
     if ($mapped -and -not $original.Equals($mapped,[System.StringComparison]::OrdinalIgnoreCase)) {
       $node.InnerText = $mapped
