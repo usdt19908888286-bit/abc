@@ -56,7 +56,9 @@ jobs:
           $sourcePrefix='S-1-5-21-111111111-222222222-333333333'
           $aclText=[Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($aclFile))
           $aclText=$aclText.Replace($targetPrefix,$sourcePrefix)
+          if(-not $aclText.Contains($sourcePrefix)){ throw "failed to synthesize stale machine SID image=$image" }
           $targetByRid=@{}
+          $rewriteCount=0
           foreach($u in @(Get-LocalUser -ErrorAction SilentlyContinue)){
             $sid=[string]$u.SID.Value; $rm=[regex]::Match($sid,'-([0-9]+)$'); if($rm.Success){$targetByRid[$rm.Groups[1].Value]=$sid}
           }
@@ -65,9 +67,12 @@ jobs:
             if($targetByRid.ContainsKey($rid)){
               $new=[string]$targetByRid[$rid]
               $aclText=$aclText.Replace($old,$new)
+              $rewriteCount++
               Write-Host "FINAL_COMPAT_ACL_REWRITE image=$image old=$old new=$new rid=$rid"
             }
           }
+          if($rewriteCount -lt 1){ throw "no stale SID was rewritten image=$image" }
+          if($aclText.Contains($sourcePrefix)){ throw "stale source machine SID remained after rewrite image=$image" }
           [IO.File]::WriteAllBytes($rewriteFile,[Text.Encoding]::Unicode.GetBytes($aclText))
           $out=@(& icacls.exe $root /restore $rewriteFile /c /q 2>&1); $code=$LASTEXITCODE; $out | Out-Host
           if($code -ne 0){ throw "acl restore failed image=$image exit=$code" }
