@@ -4104,7 +4104,14 @@ jobs:
                   throw 'Chocolatey is unavailable for Windows E2E seed'
                 }
 
-                $candidates = @('vlc','winmerge','winscp','sumatrapdf','qbittorrent','filezilla')
+                function Write-E2EIssueProgress {
+                  param([Parameter(Mandatory=$true)][string]$Message)
+                  try {
+                    & gh api --method POST "/repos/$env:GITHUB_REPOSITORY/issues/$($issue.number)/comments" -f body=$Message 2>$null | Out-Null
+                  } catch { }
+                }
+
+                $candidates = @('vlc','winmerge','winscp','sumatrapdf','qbittorrent','filezilla','putty','everything','grepwin')
                 $current = @(& choco.exe list --local-only --limit-output 2>$null)
                 if ($LASTEXITCODE -ne 0) { $current = @(& choco.exe list --limit-output 2>$null) }
                 $present = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -4114,26 +4121,46 @@ jobs:
                 }
 
                 $installed = [System.Collections.Generic.List[string]]::new()
+                $chocoPath = [string](Get-Command choco.exe -ErrorAction Stop).Source
                 foreach ($packageId in $candidates) {
                   if ($present.Contains($packageId)) {
                     Write-Host "E2E_WINDOWS_APP_BASELINE_SKIP package=$packageId"
+                    Write-E2EIssueProgress "baseline-skip package=$packageId"
                     continue
                   }
-                  Write-Host "E2E_WINDOWS_APP_INSTALL_START package=$packageId manager=choco"
-                  & choco.exe install $packageId -y --no-progress
-                  $installExit = $LASTEXITCODE
+
+                  Write-Host "E2E_WINDOWS_APP_INSTALL_START package=$packageId manager=choco timeout=150s"
+                  Write-E2EIssueProgress "install-start package=$packageId installed=$($installed.Count)/4"
+                  $installExit = -999
+                  $timedOut = $false
+                  try {
+                    $proc = Start-Process -FilePath $chocoPath -ArgumentList @('install',$packageId,'-y','--no-progress','--execution-timeout=120') -PassThru -WindowStyle Hidden
+                    if (-not $proc.WaitForExit(150000)) {
+                      $timedOut = $true
+                      try { & taskkill.exe /PID $proc.Id /T /F 2>$null | Out-Null } catch { }
+                      Write-Warning "E2E_WINDOWS_APP_INSTALL_TIMEOUT package=$packageId pid=$($proc.Id)"
+                    } else {
+                      $installExit = [int]$proc.ExitCode
+                    }
+                  } catch {
+                    Write-Warning "E2E_WINDOWS_APP_INSTALL_EXCEPTION package=$packageId error=$($_.Exception.Message)"
+                  }
+
                   $after = @(& choco.exe list --local-only --limit-output 2>$null)
                   if ($LASTEXITCODE -ne 0) { $after = @(& choco.exe list --limit-output 2>$null) }
                   $found = @($after | Where-Object {
                     $p = ([string]$_) -split '\|', 2
                     $p.Count -gt 0 -and $p[0].Trim().Equals($packageId,[System.StringComparison]::OrdinalIgnoreCase)
                   }).Count -gt 0
-                  if ($installExit -eq 0 -and $found) {
+
+                  if (-not $timedOut -and $installExit -eq 0 -and $found) {
                     [void]$installed.Add($packageId)
                     [void]$present.Add($packageId)
-                    Write-Host "E2E_WINDOWS_APP_INSTALL_OK package=$packageId"
+                    Write-Host "E2E_WINDOWS_APP_INSTALL_OK package=$packageId count=$($installed.Count)"
+                    Write-E2EIssueProgress "install-ok package=$packageId installed=$($installed.Count)/4"
                   } else {
-                    Write-Warning "E2E_WINDOWS_APP_INSTALL_FAILED package=$packageId exit=$installExit found=$found"
+                    Write-Warning "E2E_WINDOWS_APP_INSTALL_FAILED package=$packageId exit=$installExit timeout=$timedOut found=$found"
+                    Write-E2EIssueProgress "install-failed package=$packageId exit=$installExit timeout=$timedOut found=$found"
                   }
                   if ($installed.Count -ge 4) { break }
                 }
