@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091703
+# csm-managed-workflow-version: 2026091704
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -3761,10 +3761,23 @@ jobs:
                 # Some installers briefly create a Run entry and later remove it once an
                 # Automatic service for the same executable becomes the durable startup
                 # mechanism. Persisting that transient duplicate makes restore fight the app.
-                $backingService = Get-ManagedStartupServiceBacking -StartupValue ([string]$entry.value) -Services @($serviceDelta)
+                $startupExe = Resolve-CommandExecutablePath -Value ([string]$entry.value)
+                $backingService = $null
+                if ($startupExe) {
+                  foreach ($candidateService in @($serviceDelta)) {
+                    if ($null -eq $candidateService) { continue }
+                    $candidateStart = -1
+                    try { $candidateStart = [int]$candidateService.start } catch { $candidateStart = -1 }
+                    if ($candidateStart -ne 2) { continue }
+                    $serviceExe = Resolve-CommandExecutablePath -Value ([string]$candidateService.path)
+                    if ($serviceExe -and $startupExe.Equals($serviceExe,[System.StringComparison]::OrdinalIgnoreCase)) {
+                      $backingService = $candidateService
+                      break
+                    }
+                  }
+                }
                 if ($null -ne $backingService) {
-                  $startupIdentity = ConvertTo-ManagedStartupCommandIdentity -Value ([string]$entry.value)
-                  Write-Host "MANAGED_WINDOWS_STARTUP_DELTA_SKIPPED_SERVICE_BACKED path=$($entry.path) name=$($entry.name) service=$($backingService.name) executable=$($startupIdentity.exe)"
+                  Write-Host "MANAGED_WINDOWS_STARTUP_DELTA_SKIPPED_SERVICE_BACKED path=$($entry.path) name=$($entry.name) service=$($backingService.name) executable=$startupExe"
                   continue
                 }
                 $startupEntries += $entry
