@@ -4163,7 +4163,7 @@ jobs:
                   } catch { }
                 }
 
-                $candidates = @('vlc','winmerge','winscp','sumatrapdf','qbittorrent','filezilla','putty','everything','grepwin')
+                $candidates = @('vlc','winscp','sumatrapdf','qbittorrent','filezilla','putty','everything','grepwin')
                 $current = @(& choco.exe list --local-only --limit-output 2>$null)
                 if ($LASTEXITCODE -ne 0) { $current = @(& choco.exe list --limit-output 2>$null) }
                 $present = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -4182,7 +4182,7 @@ jobs:
                   }
 
                   Write-Host "E2E_WINDOWS_APP_INSTALL_START package=$packageId manager=choco timeout=150s"
-                  Write-E2EIssueProgress "install-start package=$packageId installed=$($installed.Count)/4"
+                  Write-E2EIssueProgress "install-start package=$packageId installed=$($installed.Count)/6"
                   $installExit = -999
                   $timedOut = $false
                   try {
@@ -4209,15 +4209,15 @@ jobs:
                     [void]$installed.Add($packageId)
                     [void]$present.Add($packageId)
                     Write-Host "E2E_WINDOWS_APP_INSTALL_OK package=$packageId count=$($installed.Count)"
-                    Write-E2EIssueProgress "install-ok package=$packageId installed=$($installed.Count)/4"
+                    Write-E2EIssueProgress "install-ok package=$packageId installed=$($installed.Count)/6"
                   } else {
                     Write-Warning "E2E_WINDOWS_APP_INSTALL_FAILED package=$packageId exit=$installExit timeout=$timedOut found=$found"
                     Write-E2EIssueProgress "install-failed package=$packageId exit=$installExit timeout=$timedOut found=$found"
                   }
-                  if ($installed.Count -ge 4) { break }
+                  if ($installed.Count -ge 6) { break }
                 }
-                if ($installed.Count -lt 4) {
-                  throw "E2E seed requires at least 4 newly installed packages; installed=$($installed.Count) packages=$($installed -join ',')"
+                if ($installed.Count -lt 6) {
+                  throw "E2E seed requires at least 6 newly installed packages; installed=$($installed.Count) packages=$($installed -join ',')"
                 }
 
                 $registryIdentity = [string](@($installed | Where-Object { ([string]$_).Trim().Length -ge 4 }) | Select-Object -First 1)
@@ -4301,7 +4301,7 @@ jobs:
                   if (-not (Test-Path -LiteralPath $markerPath)) { throw "E2E marker is missing: $markerPath" }
                   $seed = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
                   $expected = @($seed.packages | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ })
-                  if ($expected.Count -lt 4) { throw "E2E marker package count is too small: $($expected.Count)" }
+                  if ($expected.Count -lt 6) { throw "E2E marker package count is too small: $($expected.Count)" }
                   $registryIdentity = ([string]$seed.registry_identity).Trim()
                   if ([string]::IsNullOrWhiteSpace($registryIdentity) -or $registryIdentity.Length -lt 4) { throw "E2E marker registry identity is invalid: $registryIdentity" }
                   $registrySubPath = "Software\$registryIdentity\CloudMultiSystemManagerE2E"
