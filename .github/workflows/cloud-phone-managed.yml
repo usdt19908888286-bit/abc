@@ -20,7 +20,7 @@ on:
       phone_name:
         description: Friendly phone name shown in GitHub and the local GUI
         required: false
-        default: 'BICOIN-001'
+        default: 'Android-001'
         type: string
       bootstrap_ticket:
         description: Cloudflare bootstrap ticket
@@ -109,7 +109,7 @@ env:
   DISPLAY: :99
   APK_URL: ${{ inputs.apk_url || 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk' }}
   PHONE_ID: ${{ inputs.phone_id || '001' }}
-  PHONE_NAME: ${{ inputs.phone_name || 'BICOIN-001' }}
+  PHONE_NAME: ${{ inputs.phone_name || 'Android-001' }}
   PACKAGE_NAME: ${{ inputs.package_name || 'com.temperaturecoin' }}
   AVD_NAME: managed-phone-${{ inputs.phone_id || '001' }}
   DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || '' }}
@@ -122,7 +122,7 @@ env:
 jobs:
   phone:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -757,7 +757,7 @@ jobs:
           rm -f /tmp/cloud-report.json
 
           COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"
-          for _ in $(seq 1 1800); do
+          while true; do
             ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
               --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | .number" \
               2>/dev/null | head -n1 || true)
@@ -785,14 +785,6 @@ jobs:
             sleep 10
           done
 
-          # End-of-life safety backup when the 5-hour session naturally expires.
-          if [ -n "${AVD_BACKUP_KEY:-}" ]; then
-            echo 'SESSION_TIMEOUT_AUTO_BACKUP'
-            touch /tmp/managed-backup-requested
-            adb shell sync || true
-          else
-            echo 'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY'
-          fi
           SCRIPT
           chmod +x /tmp/managed-phone.sh
           bash -n /tmp/managed-phone.sh
