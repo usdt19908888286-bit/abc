@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091701
+# csm-managed-support-version: 2026091702
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -71,7 +71,8 @@ function Restore-ManagedStartupEntries {
     [Parameter(Mandatory=$true)][string]$ManifestPath,
     [string]$Phase = 'restore',
     [ValidateRange(1,20)][int]$ReconcilePasses = 1,
-    [ValidateRange(0,30000)][int]$PassDelayMilliseconds = 0
+    [ValidateRange(0,30000)][int]$PassDelayMilliseconds = 0,
+    [switch]$SkipFinalVerification
   )
 
   if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { return 0 }
@@ -100,7 +101,10 @@ function Restore-ManagedStartupEntries {
     }
   }
 
-  # One last read-only check after the last write pass.
+  # One last read-only check after the last write pass. The early restore phase can
+  # deliberately defer this check because freshly installed applications may still be
+  # normalizing their own Run entries. The later final-stable phase remains strict.
+  $deferredUnstable = 0
   foreach ($entry in $validEntries) {
     $entryPath = [string]$entry.path
     $entryName = [string]$entry.name
@@ -108,8 +112,15 @@ function Restore-ManagedStartupEntries {
     $item = Get-Item -LiteralPath $entryPath -ErrorAction Stop
     $actual = [string]$item.GetValue($entryName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
     if ($actual -ne $entryValue) {
-      throw "Managed startup final verification failed phase=$Phase path=$entryPath name=$entryName expected=[$entryValue] actual=[$actual]"
+      if (-not $SkipFinalVerification) {
+        throw "Managed startup final verification failed phase=$Phase path=$entryPath name=$entryName expected=[$entryValue] actual=[$actual]"
+      }
+      $deferredUnstable++
+      Write-Warning "MANAGED_WINDOWS_STARTUP_FINAL_VERIFICATION_DEFERRED_ENTRY phase=$Phase path=$entryPath name=$entryName expected=[$entryValue] actual=[$actual]"
     }
+  }
+  if ($SkipFinalVerification) {
+    Write-Host "MANAGED_WINDOWS_STARTUP_FINAL_VERIFICATION_DEFERRED phase=$Phase unstable=$deferredUnstable total=$($validEntries.Count)"
   }
   return [int]$validEntries.Count
 }

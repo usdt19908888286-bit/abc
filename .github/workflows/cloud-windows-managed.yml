@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091701
+# csm-managed-workflow-version: 2026091702
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -1748,7 +1748,7 @@ jobs:
           Write-ManagedRdpProbe -Stage 'step11-clean-shell-hives-skipped'
 
           $startupPath = Join-Path $stateRoot 'machine-startup.json'
-          $startupRestored = Restore-ManagedStartupEntries -ManifestPath $startupPath -Phase 'initial' -ReconcilePasses 1
+          $startupRestored = Restore-ManagedStartupEntries -ManifestPath $startupPath -Phase 'initial' -ReconcilePasses 1 -SkipFinalVerification
 
           $startupApprovedRestored = 0
           $startupApprovedPath = Join-Path $stateRoot 'startup-approved.json'
