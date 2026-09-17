@@ -4100,22 +4100,24 @@ jobs:
                 if ([string]$env:MACHINE_NAME -notlike 'E2E-WIN*') {
                   throw "E2E install command rejected for non-test machine: $env:MACHINE_NAME"
                 }
-                $packageId = ([string]$cmd.package_id).Trim()
-                if ($packageId -ne 'VideoLAN.VLC') {
+                $packageId = ([string]$cmd.package_id).Trim().ToLowerInvariant()
+                if ($packageId -ne 'vlc') {
                   throw "E2E install package is not allowlisted: $packageId"
                 }
-                if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-                  throw 'winget.exe is unavailable for E2E install'
+                if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+                  throw 'choco.exe is unavailable for E2E install'
                 }
-                $before = @(& winget.exe list --id $packageId -e --accept-source-agreements 2>&1)
-                if (($before -join "`n") -match [regex]::Escape($packageId)) {
+                $before = @(& choco.exe list --local-only --limit-output 2>$null)
+                if ($LASTEXITCODE -ne 0) { $before = @(& choco.exe list --limit-output 2>$null) }
+                if (@($before | Where-Object { ([string]$_) -match '^vlc\|' }).Count -gt 0) {
                   throw "E2E package already exists in runner baseline: $packageId"
                 }
-                Write-Host "E2E_WINDOWS_APP_INSTALL_START package=$packageId issue=$($issue.number)"
-                & winget.exe install --id $packageId -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+                Write-Host "E2E_WINDOWS_APP_INSTALL_START package=$packageId manager=choco issue=$($issue.number)"
+                & choco.exe install $packageId -y --no-progress
                 $installExit = $LASTEXITCODE
-                $after = @(& winget.exe list --id $packageId -e --accept-source-agreements 2>&1)
-                if ($installExit -ne 0 -or ($after -join "`n") -notmatch [regex]::Escape($packageId)) {
+                $after = @(& choco.exe list --local-only --limit-output 2>$null)
+                if ($LASTEXITCODE -ne 0) { $after = @(& choco.exe list --limit-output 2>$null) }
+                if ($installExit -ne 0 -or @($after | Where-Object { ([string]$_) -match '^vlc\|' }).Count -eq 0) {
                   $after | Out-Host
                   throw "E2E package install verification failed: package=$packageId exit=$installExit"
                 }
