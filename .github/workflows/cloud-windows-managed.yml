@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091710
+# csm-managed-workflow-version: 2026091712
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 

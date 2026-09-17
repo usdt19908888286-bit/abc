@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091710
+# csm-managed-support-version: 2026091712
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -656,7 +656,8 @@ function Register-ManagedScheduledTaskXml {
     $primaryError = $_.Exception.Message
     $taskFullName = if ($TaskPath -eq '\') { "\$TaskName" } else { ($TaskPath.TrimEnd('\') + '\' + $TaskName) }
     if (-not $taskFullName.StartsWith('\')) { $taskFullName = '\' + $taskFullName }
-    $tempXml = Join-Path $env:RUNNER_TEMP ("managed-task-{0}.xml" -f [guid]::NewGuid().ToString('N'))
+    $taskTempRoot = if (-not [string]::IsNullOrWhiteSpace([string]$env:RUNNER_TEMP)) { [string]$env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+    $tempXml = Join-Path $taskTempRoot ("managed-task-{0}.xml" -f [guid]::NewGuid().ToString('N'))
     try {
       Set-Content -LiteralPath $tempXml -Value $normalizedXml -Encoding Unicode
       $schtasksArgs = @('/Create','/TN',$taskFullName,'/XML',$tempXml,'/F')
@@ -674,19 +675,36 @@ function Register-ManagedScheduledTaskXml {
   }
 
   $global:LASTEXITCODE = 0
-  $registered = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
-  if ($null -eq $registered) { throw "Scheduled task registration verification failed: $TaskPath$TaskName" }
-  if ($registrationUser) {
-    $actualPrincipal = ([string]$registered.Principal.UserId).Trim()
-    $expectedSid = switch ($registrationUser) {
-      'SYSTEM' { 'S-1-5-18' }
-      'LOCAL SERVICE' { 'S-1-5-19' }
-      'NETWORK SERVICE' { 'S-1-5-20' }
-      default { '' }
+  if ($registeredBy -eq 'schtasks') {
+    # The ScheduledTasks CIM provider can fail to deserialize/query a perfectly valid task
+    # when its source XML came from a machine whose creator account was later renamed.
+    # schtasks.exe created the task successfully, so verify through the same scheduler API
+    # instead of re-entering the provider that triggered the portability failure.
+    & schtasks.exe /Query /TN $taskFullName 2>$null | Out-Null
+    $queryExit = $LASTEXITCODE
+    $global:LASTEXITCODE = 0
+    if ($queryExit -ne 0) { throw "Scheduled task schtasks verification failed: $taskFullName exit=$queryExit" }
+    $registered = [pscustomobject]@{
+      TaskName=$TaskName
+      TaskPath=$TaskPath
+      Principal=[pscustomobject]@{ UserId=$registrationUser }
+      RegisteredBy='schtasks'
     }
-    $accepted = @($registrationUser,$expectedSid,"NT AUTHORITY\$registrationUser")
-    if ($actualPrincipal -and -not ($accepted | Where-Object { $actualPrincipal.Equals($_,[System.StringComparison]::OrdinalIgnoreCase) })) {
-      throw "Scheduled task principal verification failed task=$TaskName expected=$registrationUser/$expectedSid actual=$actualPrincipal"
+  } else {
+    $registered = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+    if ($null -eq $registered) { throw "Scheduled task registration verification failed: $TaskPath$TaskName" }
+    if ($registrationUser) {
+      $actualPrincipal = ([string]$registered.Principal.UserId).Trim()
+      $expectedSid = switch ($registrationUser) {
+        'SYSTEM' { 'S-1-5-18' }
+        'LOCAL SERVICE' { 'S-1-5-19' }
+        'NETWORK SERVICE' { 'S-1-5-20' }
+        default { '' }
+      }
+      $accepted = @($registrationUser,$expectedSid,"NT AUTHORITY\$registrationUser")
+      if ($actualPrincipal -and -not ($accepted | Where-Object { $actualPrincipal.Equals($_,[System.StringComparison]::OrdinalIgnoreCase) })) {
+        throw "Scheduled task principal verification failed task=$TaskName expected=$registrationUser/$expectedSid actual=$actualPrincipal"
+      }
     }
   }
   Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_RESTORED path=$TaskPath name=$TaskName registeredBy=$registeredBy"
