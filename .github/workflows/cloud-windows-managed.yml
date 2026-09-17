@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091706
+# csm-managed-workflow-version: 2026091707
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -640,6 +640,8 @@ jobs:
           } else {
             Write-Host "MANAGED_WINDOWS_REHYDRATION_STEP_OK total=$($result.total) restored=$($result.restored)"
           }
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Restore Windows software delta
         if: ${{ inputs.mode == 'restore' }}

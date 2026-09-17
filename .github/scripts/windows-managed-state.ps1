@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091705
+# csm-managed-support-version: 2026091706
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -480,6 +480,10 @@ function Invoke-ManagedSoftwareRehydrate {
   }
   $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $StateRoot 'rehydration-result.json') -Encoding UTF8
   Write-Host "MANAGED_WINDOWS_REHYDRATION_COMPLETE total=$($plan.Count) restored=$restored failed=$failed fallbackRequired=$fallbackRequired"
+  # Package-manager failure is advisory because the full software capsule is authoritative.
+  # Normalize the native-process status so pwsh/GitHub does not convert an intentional
+  # fallback into a failed workflow step.
+  $global:LASTEXITCODE = 0
   return $result
 }
 function Restore-ManagedStartupEntries {

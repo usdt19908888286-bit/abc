@@ -75,10 +75,12 @@ jobs:
             if ([int]$emptyResult.total -ne 0 -or [int]$emptyResult.restored -ne 0 -or [int]$emptyResult.failed -ne 0) { throw 'Empty reconstruction plan did not return a no-op result' }
             @([pscustomobject]@{ manager='unavailable-test-manager'; package_id='example'; version='1.0'; source='test' }) |
               ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $emptyState 'rehydration-plan.json') -Encoding UTF8
+            $global:LASTEXITCODE = 7
             $fallbackResult = Invoke-ManagedSoftwareRehydrate -StateRoot $emptyState
             if ([int]$fallbackResult.total -ne 1 -or [int]$fallbackResult.failed -ne 1 -or -not [bool]$fallbackResult.fallback_required) {
               throw 'Unavailable package source did not degrade to software-capsule fallback'
             }
+            if ($LASTEXITCODE -ne 0) { throw "Software-capsule fallback leaked native exit code: $LASTEXITCODE" }
           } finally {
             Remove-Item -LiteralPath $emptyState -Recurse -Force -ErrorAction SilentlyContinue
           }
