@@ -67,7 +67,7 @@ jobs:
             $deleter = Start-Job -ArgumentList $runPath,$runName -ScriptBlock {
               param($Path,$Name)
               Start-Sleep -Milliseconds 1800
-              Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+              try { Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction Stop } catch { }
             }
             $restored = Restore-ManagedStartupEntries -ManifestPath $manifestPath -Phase 'preflight-stable' -ReconcilePasses 5 -PassDelayMilliseconds 1000
             if ($restored -ne 1) { throw "Unexpected startup restore count: $restored" }
