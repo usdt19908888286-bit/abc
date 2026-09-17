@@ -41,6 +41,17 @@ jobs:
           if (Test-ManagedStartupCommandEquivalent -Expected $quoted -Actual $changedArgs) { throw 'Startup semantic comparison accepted changed arguments' }
           Write-Host 'PREFLIGHT_STARTUP_SEMANTICS_OK'
 
+          $serviceBacked = Get-ManagedStartupServiceBacking -StartupValue '"C:\Program Files\Example\Example.exe" -startup' -Services @(
+            [pscustomobject]@{ name='ExampleSvc'; path='"C:\Program Files\Example\Example.exe" -service'; start=2 },
+            [pscustomobject]@{ name='ManualSvc'; path='"C:\Program Files\Other\Other.exe"'; start=3 }
+          )
+          if ($null -eq $serviceBacked -or [string]$serviceBacked.name -ne 'ExampleSvc') { throw 'Automatic service-backed startup entry was not detected' }
+          $notServiceBacked = Get-ManagedStartupServiceBacking -StartupValue '"C:\Program Files\Example\Tray.exe" -startup' -Services @(
+            [pscustomobject]@{ name='ExampleSvc'; path='"C:\Program Files\Example\Example.exe" -service'; start=2 }
+          )
+          if ($null -ne $notServiceBacked) { throw 'Unrelated startup executable was incorrectly classified as service-backed' }
+          Write-Host 'PREFLIGHT_STARTUP_SERVICE_BACKING_OK'
+
           $runPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
           $runName = "OmniMCP-Preflight-$env:GITHUB_RUN_ID"
           $manifestPath = Join-Path $env:RUNNER_TEMP 'managed-startup-preflight.json'

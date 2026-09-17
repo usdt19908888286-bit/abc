@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091702
+# csm-managed-support-version: 2026091703
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -63,6 +63,30 @@ function Test-ManagedStartupCommandEquivalent {
   $exeEqual = ([string]$expectedIdentity.exe).Equals([string]$actualIdentity.exe,[System.StringComparison]::OrdinalIgnoreCase)
   $argsEqual = ([string]$expectedIdentity.args).Equals([string]$actualIdentity.args,[System.StringComparison]::OrdinalIgnoreCase)
   return ($exeEqual -and $argsEqual)
+}
+
+function Get-ManagedStartupServiceBacking {
+  [CmdletBinding()]
+  param(
+    [string]$StartupValue,
+    [object[]]$Services = @()
+  )
+
+  $startupIdentity = ConvertTo-ManagedStartupCommandIdentity -Value $StartupValue
+  if ($null -eq $startupIdentity -or [string]::IsNullOrWhiteSpace([string]$startupIdentity.exe)) { return $null }
+
+  foreach ($service in @($Services)) {
+    if ($null -eq $service) { continue }
+    $start = -1
+    try { $start = [int]$service.start } catch { $start = -1 }
+    if ($start -ne 2) { continue }
+    $serviceIdentity = ConvertTo-ManagedStartupCommandIdentity -Value ([string]$service.path)
+    if ($null -eq $serviceIdentity -or [string]::IsNullOrWhiteSpace([string]$serviceIdentity.exe)) { continue }
+    if (([string]$startupIdentity.exe).Equals([string]$serviceIdentity.exe,[System.StringComparison]::OrdinalIgnoreCase)) {
+      return $service
+    }
+  }
+  return $null
 }
 
 function Restore-ManagedStartupEntries {
