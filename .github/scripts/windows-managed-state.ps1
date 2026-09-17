@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091709
+# csm-managed-support-version: 2026091710
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -629,14 +629,51 @@ function Register-ManagedScheduledTaskXml {
     }
   }
 
-  $normalizedXml = $taskXml.OuterXml
+  # Raw task files can retain the creator's old MACHINE\user in RegistrationInfo/Author
+  # after the managed account is renamed. Some hosted Task Scheduler APIs attempt to
+  # resolve that descriptive field during registration, so normalize it for service tasks.
   if ($registrationUser) {
-    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $normalizedXml -User $registrationUser -Force -ErrorAction Stop | Out-Null
-    Write-Host "MANAGED_WINDOWS_TASK_SERVICE_ACCOUNT_OVERRIDE task=$TaskName user=$registrationUser"
-  } else {
-    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $normalizedXml -Force -ErrorAction Stop | Out-Null
+    $authorNode = $taskXml.SelectSingleNode("//*[local-name()='RegistrationInfo']/*[local-name()='Author']")
+    if ($null -ne $authorNode) {
+      $oldAuthor = ([string]$authorNode.InnerText).Trim()
+      if (-not $oldAuthor.Equals($registrationUser,[System.StringComparison]::OrdinalIgnoreCase)) {
+        $authorNode.InnerText = $registrationUser
+        Write-Host "MANAGED_WINDOWS_TASK_AUTHOR_REWRITE task=$TaskName old=$oldAuthor new=$registrationUser"
+      }
+    }
   }
 
+  $normalizedXml = $taskXml.OuterXml
+  $registeredBy = 'powershell'
+  try {
+    if ($registrationUser) {
+      Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $normalizedXml -User $registrationUser -Force -ErrorAction Stop | Out-Null
+      Write-Host "MANAGED_WINDOWS_TASK_SERVICE_ACCOUNT_OVERRIDE task=$TaskName user=$registrationUser"
+    } else {
+      Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $normalizedXml -Force -ErrorAction Stop | Out-Null
+    }
+  } catch {
+    $primaryError = $_.Exception.Message
+    $taskFullName = if ($TaskPath -eq '\') { "\$TaskName" } else { ($TaskPath.TrimEnd('\') + '\' + $TaskName) }
+    if (-not $taskFullName.StartsWith('\')) { $taskFullName = '\' + $taskFullName }
+    $tempXml = Join-Path $env:RUNNER_TEMP ("managed-task-{0}.xml" -f [guid]::NewGuid().ToString('N'))
+    try {
+      Set-Content -LiteralPath $tempXml -Value $normalizedXml -Encoding Unicode
+      $schtasksArgs = @('/Create','/TN',$taskFullName,'/XML',$tempXml,'/F')
+      if ($registrationUser) { $schtasksArgs += @('/RU',$registrationUser) }
+      & schtasks.exe @schtasksArgs | Out-Host
+      $schtasksExit = $LASTEXITCODE
+      if ($schtasksExit -ne 0) {
+        throw "Register-ScheduledTask failed: $primaryError ; schtasks fallback failed exit=$schtasksExit"
+      }
+      $registeredBy = 'schtasks'
+      Write-Warning "MANAGED_WINDOWS_TASK_REGISTER_FALLBACK_OK task=$TaskName primary=[$primaryError]"
+    } finally {
+      Remove-Item -LiteralPath $tempXml -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  $global:LASTEXITCODE = 0
   $registered = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
   if ($null -eq $registered) { throw "Scheduled task registration verification failed: $TaskPath$TaskName" }
   if ($registrationUser) {
@@ -652,6 +689,6 @@ function Register-ManagedScheduledTaskXml {
       throw "Scheduled task principal verification failed task=$TaskName expected=$registrationUser/$expectedSid actual=$actualPrincipal"
     }
   }
-  Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_RESTORED path=$TaskPath name=$TaskName"
+  Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_RESTORED path=$TaskPath name=$TaskName registeredBy=$registeredBy"
   return $registered
 }
