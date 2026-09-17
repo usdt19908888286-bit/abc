@@ -4156,8 +4156,8 @@ jobs:
 
                 $regPath = 'HKCU:\Software\CloudMultiSystemManagerE2E'
                 New-Item -Path $regPath -Force | Out-Null
-                Set-ItemProperty -Path $regPath -Name 'Marker' -Value 'CLOUD_MULTI_SYSTEM_MANAGER_E2E' -Type String
-                Set-ItemProperty -Path $regPath -Name 'Packages' -Value ($installed -join ',') -Type String
+                Set-ItemProperty -Path $regPath -Name 'Marker' -Value 'CLOUD_MULTI_SYSTEM_MANAGER_E2E'
+                Set-ItemProperty -Path $regPath -Name 'Packages' -Value ($installed -join ',')
 
                 $startupRoot = [Environment]::GetFolderPath('Startup')
                 if (-not $startupRoot) { $startupRoot = Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' }
