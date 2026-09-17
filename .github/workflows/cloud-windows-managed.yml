@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091712
+# csm-managed-workflow-version: 2026091713
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -1361,7 +1361,7 @@ jobs:
               }
               $missingAclLines = @($aclOutput | Where-Object { [string]$_ -match '(?i)The system cannot find the (?:file|path) specified' })
               $persistentAclMissing = @($missingAclLines | Where-Object {
-                [string]$_ -notmatch '(?i)[\\/](?:log|logs|cache|caches|temp|tmp|crash|crashes|sentry)[\\/]|\.run(?:[\\/]|\.lock|:|$)|\.lock(?:[\\/]|:|$)'
+                -not (Test-ManagedVolatileAclMissingLine -Line ([string]$_))
               })
               $volatileOnly = $failedAclCount -gt 0 -and $missingAclLines.Count -eq $failedAclCount -and $persistentAclMissing.Count -eq 0
               if ($aclExit -ne 0 -or $failedAclCount -gt 0) {
@@ -3454,7 +3454,7 @@ jobs:
                 }
                 $missingAclLines = @($aclOutput | Where-Object { [string]$_ -match '(?i)The system cannot find the (?:file|path) specified' })
                 $persistentAclMissing = @($missingAclLines | Where-Object {
-                  [string]$_ -notmatch '(?i)[\\/](?:log|logs|cache|caches|temp|tmp|crash|crashes|sentry)[\\/]|\.run(?:[\\/]|\.lock|:|$)|\.lock(?:[\\/]|:|$)'
+                  -not (Test-ManagedVolatileAclMissingLine -Line ([string]$_))
                 })
                 $volatileOnly = $failedAclCount -gt 0 -and $missingAclLines.Count -eq $failedAclCount -and $persistentAclMissing.Count -eq 0
                 if ($aclExit -ne 0 -or $failedAclCount -gt 0) {

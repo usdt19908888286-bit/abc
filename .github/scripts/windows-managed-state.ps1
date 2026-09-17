@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091712
+# csm-managed-support-version: 2026091713
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -40,6 +40,32 @@ function Test-ManagedWindowsRuntimeRegistryPath {
     if ($text.Equals($prefix,[System.StringComparison]::OrdinalIgnoreCase) -or
         $text.StartsWith($prefix + '\',[System.StringComparison]::OrdinalIgnoreCase)) { return $true }
   }
+  return $false
+}
+
+function Test-ManagedVolatileAclMissingLine {
+  [CmdletBinding()]
+  param([Parameter(Mandatory=$true)][string]$Line)
+
+  $text = $Line.Trim()
+  if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+
+  # icacls reports a missing object as "<path>: The system cannot find ...".
+  # Classify only clearly disposable runtime objects. Durable configuration files
+  # must remain strict so ACL restore still catches a genuinely incomplete capsule.
+  $pathText = $text
+  $marker = ': The system cannot find'
+  $markerIndex = $text.IndexOf($marker,[System.StringComparison]::OrdinalIgnoreCase)
+  if ($markerIndex -gt 1) { $pathText = $text.Substring(0,$markerIndex).Trim().Trim('"') }
+  $normalized = $pathText.Replace('/','\')
+
+  if ($normalized -match '(?i)[\\](?:log|logs|cache|caches|temp|tmp|crash|crashes|sentry)(?:[\\]|$)') { return $true }
+  if ($normalized -match '(?i)\.run(?:[\\]|\.lock|:|$)|\.lock(?:[\\]|:|$)') { return $true }
+
+  $leaf = [IO.Path]::GetFileName($normalized)
+  if ([string]::IsNullOrWhiteSpace($leaf)) { return $false }
+  if ($leaf -match '(?i)^(?:cache|cached)(?:[_\-.].*)?$') { return $true }
+  if ($leaf -match '(?i)\.(?:tmp|temp|cache|lock)$') { return $true }
   return $false
 }
 

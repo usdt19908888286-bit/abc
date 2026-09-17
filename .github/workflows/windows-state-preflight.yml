@@ -34,6 +34,15 @@ jobs:
           if (Test-ManagedWindowsOwnedRegistryPath -RegistryPath $ordinary) { throw 'Ordinary application registry path was incorrectly classified as Windows-owned' }
           Write-Host 'PREFLIGHT_PROTECTED_REGISTRY_OK'
 
+
+          $volatileAclMissing = 'C:\ProgramData\Netease\GameViewer\cache_setting.ini: The system cannot find the file specified.'
+          $volatileAclDirectory = 'C:\ProgramData\Example\cache\session.db: The system cannot find the file specified.'
+          $durableAclMissing = 'C:\ProgramData\Netease\GameViewer\config.ini: The system cannot find the file specified.'
+          if (-not (Test-ManagedVolatileAclMissingLine -Line $volatileAclMissing)) { throw 'cache_setting.ini was not classified as volatile ACL state' }
+          if (-not (Test-ManagedVolatileAclMissingLine -Line $volatileAclDirectory)) { throw 'cache directory payload was not classified as volatile ACL state' }
+          if (Test-ManagedVolatileAclMissingLine -Line $durableAclMissing) { throw 'Durable config.ini was incorrectly classified as volatile ACL state' }
+          Write-Host 'PREFLIGHT_VOLATILE_ACL_CLASSIFIER_OK'
+
           $quoted = '"C:\Windows\System32\cmd.exe" /c exit 0'
           $unquoted = 'C:\Windows\System32\cmd.exe /c exit 0'
           $changedArgs = 'C:\Windows\System32\cmd.exe /c exit 1'
