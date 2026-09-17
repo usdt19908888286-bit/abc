@@ -1088,16 +1088,31 @@ jobs:
           Write-Host "MANAGED_WINDOWS_UNINSTALL_REGISTRY_RESTORED count=$uninstallRegistryRestored"
 
           $appRegistryRestored = 0
+          $appRegistryPortabilitySkipped = 0
           $appRegistryManifestPath = Join-Path $stateRoot 'app-registry.json'
           if (Test-Path -LiteralPath $appRegistryManifestPath) {
             foreach ($entry in @(Get-Content -LiteralPath $appRegistryManifestPath -Raw | ConvertFrom-Json)) {
+              $regPathText = [string]$entry.registry_path
               $file = Join-Path (Join-Path $stateRoot 'app-registry') ([string]$entry.file)
-              if (-not (Test-Path -LiteralPath $file)) { Write-Warning "Application registry backup missing: $($entry.registry_path)"; continue }
+              if (-not (Test-Path -LiteralPath $file)) { Write-Warning "Application registry backup missing: $regPathText"; continue }
               & reg.exe import $file | Out-Null
               if ($LASTEXITCODE -eq 0) {
                 $appRegistryRestored++
-                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_RESTORED path=$($entry.registry_path)"
-              } else { Write-Warning "Application registry restore failed: $($entry.registry_path) exit=$LASTEXITCODE" }
+                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_RESTORED path=$regPathText"
+              } else {
+                $protectedElevationKey =
+                  $regPathText.StartsWith('HKEY_LOCAL_MACHINE\SOFTWARE\',[System.StringComparison]::OrdinalIgnoreCase) -and
+                  $regPathText.IndexOf('\Classes\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                  $regPathText.IndexOf('\CLSID\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                  ($regPathText.EndsWith('\Elevation',[System.StringComparison]::OrdinalIgnoreCase) -or $regPathText.IndexOf('\Elevation\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+                $providerPath = "Registry::$regPathText"
+                if ($protectedElevationKey -and (Test-Path -LiteralPath $providerPath)) {
+                  $appRegistryPortabilitySkipped++
+                  Write-Warning "MANAGED_WINDOWS_APP_REGISTRY_PROTECTED_EXISTING_SKIPPED path=$regPathText exit=$LASTEXITCODE policy=windows-owned-elevation"
+                } else {
+                  Write-Warning "Application registry restore failed: $regPathText exit=$LASTEXITCODE"
+                }
+              }
             }
           }
 
@@ -1781,16 +1796,60 @@ jobs:
           $taskManifestPath = Join-Path $stateRoot 'scheduled-tasks.json'
           $taskRestored = 0
           if (Test-Path -LiteralPath $taskManifestPath) {
+            $taskTargetSidByName = @{}
+            foreach ($localUser in @(Get-LocalUser -ErrorAction SilentlyContinue)) {
+              if ($localUser.Name -and $localUser.SID) { $taskTargetSidByName[[string]$localUser.Name] = [string]$localUser.SID.Value }
+            }
+            $taskSourceSidMap = @{}
+            if ($metadata.source_sid) { $taskSourceSidMap[[string]$metadata.source_sid] = $sid }
+            if ($metadata.PSObject.Properties.Name -contains 'source_local_accounts' -and $null -ne $metadata.source_local_accounts) {
+              foreach ($savedAccount in @($metadata.source_local_accounts)) {
+                $oldSid = ([string]$savedAccount.sid).Trim()
+                $accountName = ([string]$savedAccount.name).Trim()
+                if ($oldSid -and $accountName -and $taskTargetSidByName.ContainsKey($accountName)) {
+                  $taskSourceSidMap[$oldSid] = [string]$taskTargetSidByName[$accountName]
+                }
+              }
+            }
+            $wellKnownTaskPrincipals = @{
+              'SYSTEM'='S-1-5-18'; 'NT AUTHORITY\SYSTEM'='S-1-5-18'; 'S-1-5-18'='S-1-5-18'
+              'LOCAL SERVICE'='S-1-5-19'; 'NT AUTHORITY\LOCAL SERVICE'='S-1-5-19'; 'S-1-5-19'='S-1-5-19'
+              'NETWORK SERVICE'='S-1-5-20'; 'NT AUTHORITY\NETWORK SERVICE'='S-1-5-20'; 'S-1-5-20'='S-1-5-20'
+              'BUILTIN\Administrators'='S-1-5-32-544'; 'S-1-5-32-544'='S-1-5-32-544'
+              'BUILTIN\Users'='S-1-5-32-545'; 'S-1-5-32-545'='S-1-5-32-545'
+            }
             $tasks = @(Get-Content -LiteralPath $taskManifestPath -Raw | ConvertFrom-Json)
             foreach ($task in $tasks) {
               try {
                 $xmlPath = Join-Path (Join-Path $stateRoot 'tasks') ([string]$task.file)
                 if (-not (Test-Path -LiteralPath $xmlPath)) { continue }
                 $xml = Get-Content -LiteralPath $xmlPath -Raw
-                if ($metadata.source_sid) { $xml = $xml.Replace([string]$metadata.source_sid, $sid) }
+                foreach ($oldSid in @($taskSourceSidMap.Keys)) { $xml = $xml.Replace([string]$oldSid,[string]$taskSourceSidMap[$oldSid]) }
+                try {
+                  [xml]$taskXml = $xml
+                  $principalNodes = @($taskXml.SelectNodes("//*[local-name()='Principal']/*[local-name()='UserId' or local-name()='GroupId']"))
+                  foreach ($node in $principalNodes) {
+                    $originalPrincipal = ([string]$node.InnerText).Trim()
+                    if (-not $originalPrincipal) { continue }
+                    $mappedPrincipal = ''
+                    if ($wellKnownTaskPrincipals.ContainsKey($originalPrincipal)) {
+                      $mappedPrincipal = [string]$wellKnownTaskPrincipals[$originalPrincipal]
+                    } elseif ($taskSourceSidMap.ContainsKey($originalPrincipal)) {
+                      $mappedPrincipal = [string]$taskSourceSidMap[$originalPrincipal]
+                    } elseif ($originalPrincipal -match '^[^\\]+\\(?<name>[^\\]+)$' -and $taskTargetSidByName.ContainsKey($matches.name)) {
+                      $mappedPrincipal = [string]$taskTargetSidByName[$matches.name]
+                    }
+                    if ($mappedPrincipal -and -not $originalPrincipal.Equals($mappedPrincipal,[System.StringComparison]::OrdinalIgnoreCase)) {
+                      Write-Host "MANAGED_WINDOWS_TASK_PRINCIPAL_REWRITE task=$($task.name) old=$originalPrincipal new=$mappedPrincipal"
+                      $node.InnerText = $mappedPrincipal
+                    }
+                  }
+                  $xml = $taskXml.OuterXml
+                } catch { Write-Warning "scheduled task principal normalization skipped task=$($task.name): $($_.Exception.Message)" }
                 Register-ScheduledTask -TaskName ([string]$task.name) -TaskPath ([string]$task.path) -Xml $xml -Force | Out-Null
                 $taskRestored++
-              } catch { Write-Warning "scheduled task restore failed: $($_.Exception.Message)" }
+                Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_RESTORED path=$($task.path) name=$($task.name)"
+              } catch { Write-Warning "scheduled task restore failed name=$($task.name): $($_.Exception.Message)" }
             }
           }
 
@@ -1898,7 +1957,7 @@ jobs:
             $expectedCommonStartup = if ($null -eq $metadata.common_startup_count) { 0 } else { [int]$metadata.common_startup_count }
             $expectedDrivers = if ($null -eq $metadata.driver_delta_count) { 0 } else { [int]$metadata.driver_delta_count }
             $expectedDriverPackages = if ($null -eq $metadata.driver_package_delta_count) { 0 } else { [int]$metadata.driver_package_delta_count }
-            if ($appRegistryRestored -lt $expectedAppRegistry) { throw "V$version app registry restore incomplete expected=$expectedAppRegistry actual=$appRegistryRestored" }
+            if (($appRegistryRestored + $appRegistryPortabilitySkipped) -lt $expectedAppRegistry) { throw "V$version app registry restore incomplete expected=$expectedAppRegistry actual=$appRegistryRestored portabilitySkipped=$appRegistryPortabilitySkipped" }
             if ($startupRestored -lt $expectedStartup) { throw "V$version startup restore incomplete expected=$expectedStartup actual=$startupRestored" }
             if ($startupApprovedRestored -lt $expectedStartupApproved) { throw "V$version StartupApproved restore incomplete expected=$expectedStartupApproved actual=$startupApprovedRestored" }
             if ($commonStartupRestored -lt $expectedCommonStartup) { throw "V$version common Startup restore incomplete expected=$expectedCommonStartup actual=$commonStartupRestored" }
@@ -2095,14 +2154,51 @@ jobs:
               Write-Host "MANAGED_WINDOWS_PROTECTED_USER_STATE_RESTORED relative=$relative files=$actualCount portability=encrypted-data-only"
             }
 
+            function ConvertTo-ManagedStartupCommandIdentity {
+              param([string]$Value)
+              if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+              $text = [Environment]::ExpandEnvironmentVariables($Value.Trim())
+              $exe = ''
+              $args = ''
+              if ($text -match '^"([^\"]+?\.exe)"(?:\s+(.*))?$') {
+                $exe = $matches[1]; if ($matches.Count -gt 2) { $args = [string]$matches[2] }
+              } elseif ($text -match '^([A-Za-z]:\\.*?\.exe)(?:\s+(.*))?$') {
+                $exe = $matches[1]; if ($matches.Count -gt 2) { $args = [string]$matches[2] }
+              } elseif ($text -match '^([^\s]+\.exe)(?:\s+(.*))?$') {
+                $exe = $matches[1]; if ($matches.Count -gt 2) { $args = [string]$matches[2] }
+              }
+              if (-not $exe) { return $null }
+              if ([IO.Path]::IsPathRooted($exe)) {
+                try { $exe = [IO.Path]::GetFullPath($exe) } catch { }
+              }
+              return [pscustomobject]@{ exe=$exe.Trim(); args=$args.Trim() }
+            }
+            function Test-ManagedStartupCommandEquivalent {
+              param([string]$Expected,[string]$Actual)
+              if ([string]$Expected -ceq [string]$Actual) { return $true }
+              $expectedIdentity = ConvertTo-ManagedStartupCommandIdentity -Value $Expected
+              $actualIdentity = ConvertTo-ManagedStartupCommandIdentity -Value $Actual
+              if ($null -eq $expectedIdentity -or $null -eq $actualIdentity) { return $false }
+              $exeEqual = ([string]$expectedIdentity.exe).Equals([string]$actualIdentity.exe,[System.StringComparison]::OrdinalIgnoreCase)
+              $argsEqual = ([string]$expectedIdentity.args).Equals([string]$actualIdentity.args,[System.StringComparison]::OrdinalIgnoreCase)
+              return ($exeEqual -and $argsEqual)
+            }
+
             $startupManifestPath = Join-Path $stateRoot 'machine-startup.json'
             if (Test-Path -LiteralPath $startupManifestPath) {
               foreach ($entry in @(Get-Content -LiteralPath $startupManifestPath -Raw | ConvertFrom-Json)) {
                 if (-not $entry.path -or -not $entry.name) { continue }
                 $item = Get-Item -LiteralPath ([string]$entry.path) -ErrorAction Stop
-                $actualValue = $item.GetValue([string]$entry.name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-                if ([string]$actualValue -ne [string]$entry.value) { throw "V9 startup entry mismatch path=$($entry.path) name=$($entry.name)" }
-                Write-Host "MANAGED_WINDOWS_STARTUP_RESTORE_OK path=$($entry.path) name=$($entry.name)"
+                $actualValue = [string]$item.GetValue([string]$entry.name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $expectedValue = [string]$entry.value
+                if (-not (Test-ManagedStartupCommandEquivalent -Expected $expectedValue -Actual $actualValue)) {
+                  throw "V9 startup entry mismatch path=$($entry.path) name=$($entry.name) expected=[$expectedValue] actual=[$actualValue]"
+                }
+                if ($expectedValue -ne $actualValue) {
+                  Write-Host "MANAGED_WINDOWS_STARTUP_RESTORE_SEMANTIC_EQUIVALENT path=$($entry.path) name=$($entry.name) expected=[$expectedValue] actual=[$actualValue]"
+                } else {
+                  Write-Host "MANAGED_WINDOWS_STARTUP_RESTORE_OK path=$($entry.path) name=$($entry.name)"
+                }
               }
             }
 
@@ -3278,6 +3374,15 @@ jobs:
             }
             $appRegistryRoots = [System.Collections.Generic.List[string]]::new()
             foreach ($candidate in @($appRegistryCandidates | Sort-Object Length,@{Expression={$_}} -Unique)) {
+              $protectedElevationCandidate =
+                $candidate.StartsWith('HKEY_LOCAL_MACHINE\SOFTWARE\',[System.StringComparison]::OrdinalIgnoreCase) -and
+                $candidate.IndexOf('\Classes\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                $candidate.IndexOf('\CLSID\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                ($candidate.EndsWith('\Elevation',[System.StringComparison]::OrdinalIgnoreCase) -or $candidate.IndexOf('\Elevation\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+              if ($protectedElevationCandidate) {
+                Write-Host "MANAGED_WINDOWS_APP_REGISTRY_PORTABILITY_SKIPPED path=$candidate policy=windows-owned-elevation"
+                continue
+              }
               $nested = $false
               foreach ($chosen in $appRegistryRoots) {
                 if ($candidate.Equals($chosen,[System.StringComparison]::OrdinalIgnoreCase) -or $candidate.StartsWith("$chosen\",[System.StringComparison]::OrdinalIgnoreCase)) { $nested = $true; break }
