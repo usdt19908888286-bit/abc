@@ -183,14 +183,49 @@ jobs:
         run: |
           set -euo pipefail
 
+          MANAGED_UBUNTU_INFRA_UNITS=/tmp/managed-ubuntu-quiesce-infra-units.txt
+
+          managed_init_quiesce_infra_units() {
+            : >"$MANAGED_UBUNTU_INFRA_UNITS"
+            local pid="$$" cgroup_line unit ppid
+            # Preserve whichever systemd service actually owns this workflow process.
+            # GitHub-hosted runners currently execute below hosted-compute-agent.service,
+            # while self-hosted images may use a different service name. Walking the
+            # live parent/cgroup chain makes this independent of that provider detail.
+            while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && [ -r "/proc/${pid}/cgroup" ]; do
+              while IFS= read -r cgroup_line || [ -n "$cgroup_line" ]; do
+                unit="${cgroup_line##*/}"
+                case "$unit" in
+                  *.service) printf '%s\n' "$unit" >>"$MANAGED_UBUNTU_INFRA_UNITS" ;;
+                esac
+              done <"/proc/${pid}/cgroup"
+              ppid=$(awk '/^PPid:/ {print $2; exit}' "/proc/${pid}/status" 2>/dev/null || true)
+              [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+              pid="$ppid"
+            done
+            # Keep the workflow account's user manager. Application-user managers are
+            # still stopped after loginctl terminate-user below.
+            printf 'user@%s.service\n' "$(id -u)" >>"$MANAGED_UBUNTU_INFRA_UNITS"
+            LC_ALL=C sort -u -o "$MANAGED_UBUNTU_INFRA_UNITS" "$MANAGED_UBUNTU_INFRA_UNITS"
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] && echo "MANAGED_UBUNTU_INFRA_UNIT_KEEP unit=$unit"
+            done <"$MANAGED_UBUNTU_INFRA_UNITS"
+          }
+
           managed_keep_quiesce_unit() {
-            case "$1" in
+            local unit="$1"
+            if [ -s "$MANAGED_UBUNTU_INFRA_UNITS" ] && grep -Fxq -- "$unit" "$MANAGED_UBUNTU_INFRA_UNITS"; then
+              return 0
+            fi
+            case "$unit" in
               ssh.service|ssh.socket|tailscaled.service|systemd-networkd.service|NetworkManager.service|systemd-resolved.service|networkd-dispatcher.service|systemd-journald.service|systemd-journald.socket|systemd-journald-dev-log.socket|systemd-udevd.service|systemd-udevd-control.socket|systemd-udevd-kernel.socket|systemd-logind.service|systemd-timesyncd.service|dbus.service|dbus.socket|polkit.service|waagent.service|walinuxagent.service|WALinuxAgent.service|actions.runner.*.service|github-actions-runner*.service)
                 return 0
                 ;;
             esac
             return 1
           }
+
+          managed_init_quiesce_infra_units
 
           managed_capture_active_units() {
             local dir="$1"
@@ -844,14 +879,49 @@ jobs:
         run: |
           set -euo pipefail
 
+          MANAGED_UBUNTU_INFRA_UNITS=/tmp/managed-ubuntu-quiesce-infra-units.txt
+
+          managed_init_quiesce_infra_units() {
+            : >"$MANAGED_UBUNTU_INFRA_UNITS"
+            local pid="$$" cgroup_line unit ppid
+            # Preserve whichever systemd service actually owns this workflow process.
+            # GitHub-hosted runners currently execute below hosted-compute-agent.service,
+            # while self-hosted images may use a different service name. Walking the
+            # live parent/cgroup chain makes this independent of that provider detail.
+            while [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && [ -r "/proc/${pid}/cgroup" ]; do
+              while IFS= read -r cgroup_line || [ -n "$cgroup_line" ]; do
+                unit="${cgroup_line##*/}"
+                case "$unit" in
+                  *.service) printf '%s\n' "$unit" >>"$MANAGED_UBUNTU_INFRA_UNITS" ;;
+                esac
+              done <"/proc/${pid}/cgroup"
+              ppid=$(awk '/^PPid:/ {print $2; exit}' "/proc/${pid}/status" 2>/dev/null || true)
+              [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+              pid="$ppid"
+            done
+            # Keep the workflow account's user manager. Application-user managers are
+            # still stopped after loginctl terminate-user below.
+            printf 'user@%s.service\n' "$(id -u)" >>"$MANAGED_UBUNTU_INFRA_UNITS"
+            LC_ALL=C sort -u -o "$MANAGED_UBUNTU_INFRA_UNITS" "$MANAGED_UBUNTU_INFRA_UNITS"
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] && echo "MANAGED_UBUNTU_INFRA_UNIT_KEEP unit=$unit"
+            done <"$MANAGED_UBUNTU_INFRA_UNITS"
+          }
+
           managed_keep_quiesce_unit() {
-            case "$1" in
+            local unit="$1"
+            if [ -s "$MANAGED_UBUNTU_INFRA_UNITS" ] && grep -Fxq -- "$unit" "$MANAGED_UBUNTU_INFRA_UNITS"; then
+              return 0
+            fi
+            case "$unit" in
               ssh.service|ssh.socket|tailscaled.service|systemd-networkd.service|NetworkManager.service|systemd-resolved.service|networkd-dispatcher.service|systemd-journald.service|systemd-journald.socket|systemd-journald-dev-log.socket|systemd-udevd.service|systemd-udevd-control.socket|systemd-udevd-kernel.socket|systemd-logind.service|systemd-timesyncd.service|dbus.service|dbus.socket|polkit.service|waagent.service|walinuxagent.service|WALinuxAgent.service|actions.runner.*.service|github-actions-runner*.service)
                 return 0
                 ;;
             esac
             return 1
           }
+
+          managed_init_quiesce_infra_units
 
           managed_capture_active_units() {
             local dir="$1"
