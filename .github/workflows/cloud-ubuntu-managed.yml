@@ -291,6 +291,21 @@ jobs:
             done <"$file"
           }
 
+          managed_start_unit_file_best_effort() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            while IFS= read -r unit || [ -n "$unit" ]; do
+              [ -n "$unit" ] || continue
+              managed_keep_quiesce_unit "$unit" && continue
+              if sudo systemctl start "$unit" >/dev/null 2>&1 \
+                && systemctl is-active --quiet "$unit" 2>/dev/null; then
+                echo "MANAGED_UBUNTU_BASELINE_UNIT_RESUMED unit=$unit"
+              else
+                echo "::warning::Fresh-runner baseline unit could not be resumed on this VM: $unit"
+              fi
+            done <"$file"
+          }
+
           sudo apt-get update -qq
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server rsync jq dpkg-repack acl
 
@@ -314,9 +329,9 @@ jobs:
           (systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null || true) \
             | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
             >/tmp/managed-ubuntu-baseline-systemd-enabled.txt
-          (systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true) \
-            | awk '{print $1}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
-            >/tmp/managed-ubuntu-baseline-systemd-running.txt
+          rm -rf /tmp/managed-ubuntu-baseline-active
+          managed_capture_active_units /tmp/managed-ubuntu-baseline-active
+          cp /tmp/managed-ubuntu-baseline-active/services.txt /tmp/managed-ubuntu-baseline-systemd-running.txt
           if command -v snap >/dev/null 2>&1; then
             (snap list 2>/dev/null || true) | awk 'NR>1 {print $1}' | LC_ALL=C sort -u \
               >/tmp/managed-ubuntu-baseline-snaps.txt
@@ -677,41 +692,49 @@ jobs:
             rm -rf "$RESTORE_RUNTIME_DIR"
             mkdir -p "$RESTORE_RUNTIME_DIR"
 
-            if [ -s "$SYSTEMD_STATE/runtime-services.txt" ]; then
-              cp "$SYSTEMD_STATE/runtime-services.txt" "$RESTORE_RUNTIME_DIR/services.txt"
+            # Resume the units that belonged to this fresh runner before quiescing.
+            # They are provider/OS baseline state, not application state, so hardware-
+            # conditional units such as multipathd.socket are advisory across VMs.
+            for kind in services sockets paths timers; do
+              managed_start_unit_file_best_effort "$RESTORE_QUIESCE_DIR/${kind}.txt"
+            done
+
+            # Application runtime state remains strict. V5 stores the exact active
+            # delta against the clean-runner baseline. Older V4 caches stored full
+            # socket/timer/path inventories, so subtract this restore VM's baseline
+            # to recover the portable application delta instead of replaying host
+            # hardware/provider units.
+            if [ -s "$SYSTEMD_STATE/runtime-services-added.txt" ]; then
+              cp "$SYSTEMD_STATE/runtime-services-added.txt" "$RESTORE_RUNTIME_DIR/services.txt"
+            elif [ -s "$SYSTEMD_STATE/running-added.txt" ]; then
+              cp "$SYSTEMD_STATE/running-added.txt" "$RESTORE_RUNTIME_DIR/services.txt"
             else
-              # Backward compatibility with V3 backups: preserve fresh-runner baseline
-              # services and add the user/application services that the old backup did
-              # explicitly record as running-added.
-              cat "$RESTORE_QUIESCE_DIR/services.txt" >"$RESTORE_RUNTIME_DIR/services.txt"
-              if [ -s "$SYSTEMD_STATE/running-added.txt" ]; then
-                cat "$SYSTEMD_STATE/running-added.txt" >>"$RESTORE_RUNTIME_DIR/services.txt"
-              fi
-              sed '/^[[:space:]]*$/d' "$RESTORE_RUNTIME_DIR/services.txt" | LC_ALL=C sort -u \
-                >"$RESTORE_RUNTIME_DIR/services.tmp"
-              mv "$RESTORE_RUNTIME_DIR/services.tmp" "$RESTORE_RUNTIME_DIR/services.txt"
+              : >"$RESTORE_RUNTIME_DIR/services.txt"
             fi
 
             for kind in sockets timers paths; do
-              if [ -s "$SYSTEMD_STATE/runtime-${kind}.txt" ]; then
-                cp "$SYSTEMD_STATE/runtime-${kind}.txt" "$RESTORE_RUNTIME_DIR/${kind}.txt"
+              if [ -s "$SYSTEMD_STATE/runtime-${kind}-added.txt" ]; then
+                cp "$SYSTEMD_STATE/runtime-${kind}-added.txt" "$RESTORE_RUNTIME_DIR/${kind}.txt"
+              elif [ -s "$SYSTEMD_STATE/runtime-${kind}.txt" ]; then
+                LC_ALL=C sort -u "$SYSTEMD_STATE/runtime-${kind}.txt" >"$RESTORE_RUNTIME_DIR/${kind}.saved"
+                LC_ALL=C sort -u "$RESTORE_QUIESCE_DIR/${kind}.txt" >"$RESTORE_RUNTIME_DIR/${kind}.baseline"
+                comm -23 "$RESTORE_RUNTIME_DIR/${kind}.saved" "$RESTORE_RUNTIME_DIR/${kind}.baseline" \
+                  >"$RESTORE_RUNTIME_DIR/${kind}.txt"
               else
-                cp "$RESTORE_QUIESCE_DIR/${kind}.txt" "$RESTORE_RUNTIME_DIR/${kind}.txt" 2>/dev/null || :
+                : >"$RESTORE_RUNTIME_DIR/${kind}.txt"
                 case "$kind" in
                   sockets) suffix='\.socket$' ;;
                   timers) suffix='\.timer$' ;;
                   paths) suffix='\.path$' ;;
                 esac
                 if [ -s "$SYSTEMD_STATE/enabled-added.txt" ]; then
-                  { grep -E "$suffix" "$SYSTEMD_STATE/enabled-added.txt" 2>/dev/null || true; cat "$RESTORE_RUNTIME_DIR/${kind}.txt"; } \
-                    | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$RESTORE_RUNTIME_DIR/${kind}.tmp"
-                  mv "$RESTORE_RUNTIME_DIR/${kind}.tmp" "$RESTORE_RUNTIME_DIR/${kind}.txt"
+                  grep -E "$suffix" "$SYSTEMD_STATE/enabled-added.txt" 2>/dev/null \
+                    | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$RESTORE_RUNTIME_DIR/${kind}.txt" || true
                 fi
               fi
             done
 
-            # Services first so dependencies are available; activators follow and
-            # recover socket/timer/path driven application behavior.
+            # Strictly restore only the portable application delta.
             managed_start_unit_file "$RESTORE_RUNTIME_DIR/services.txt"
             managed_start_unit_file "$RESTORE_RUNTIME_DIR/sockets.txt"
             managed_start_unit_file "$RESTORE_RUNTIME_DIR/paths.txt"
@@ -997,6 +1020,10 @@ jobs:
             cp /tmp/managed-ubuntu-backup-active/sockets.txt /tmp/managed-desktop-backup/systemd/runtime-sockets.txt
             cp /tmp/managed-ubuntu-backup-active/timers.txt /tmp/managed-desktop-backup/systemd/runtime-timers.txt
             cp /tmp/managed-ubuntu-backup-active/paths.txt /tmp/managed-desktop-backup/systemd/runtime-paths.txt
+            for kind in services sockets timers paths; do
+              comm -13 "/tmp/managed-ubuntu-baseline-active/${kind}.txt" "/tmp/managed-ubuntu-backup-active/${kind}.txt" \
+                >"/tmp/managed-desktop-backup/systemd/runtime-${kind}-added.txt"
+            done
             comm -13 /tmp/managed-ubuntu-baseline-systemd-enabled.txt /tmp/managed-ubuntu-current-systemd-enabled.txt \
               >/tmp/managed-desktop-backup/systemd/enabled-added.txt
             comm -23 /tmp/managed-ubuntu-baseline-systemd-enabled.txt /tmp/managed-ubuntu-current-systemd-enabled.txt \
@@ -1368,18 +1395,18 @@ jobs:
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 4,
+              'version': 5,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-home-plus-installer-state-v4-quiesced-without-dot-cache',
-              'features': ['apt','apt-config','snap','flatpak','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state'],
+              'scope': 'managed-home-plus-installer-state-v5-quiesced-runtime-delta-without-dot-cache',
+              'features': ['apt','apt-config','snap','flatpak','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state','runtime-unit-delta'],
           }, separators=(',', ':')))
           PY
-            echo 'MANAGED_UBUNTU_V4_BACKUP_STAGED'
+            echo 'MANAGED_UBUNTU_V5_BACKUP_STAGED'
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
