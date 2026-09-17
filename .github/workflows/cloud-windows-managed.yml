@@ -192,8 +192,18 @@ jobs:
 
           function Get-ManagedAppxInventory {
             $items = [System.Collections.Generic.List[object]]::new()
-            try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
-            catch { $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue) }
+            try {
+              # The Appx module is loadable from pwsh on windows-2025, but the same
+              # module can be discoverable yet unsupported on windows-2022 (0x80131539).
+              # AppX/MSIX inventory is an enhancement; an unavailable module must never
+              # make the core Windows profile/VSS backup fail.
+              Import-Module Appx -ErrorAction Stop
+              try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
+              catch { $packages = @(Get-AppxPackage -ErrorAction Stop) }
+            } catch {
+              Write-Warning "MANAGED_WINDOWS_APPX_INVENTORY_UNAVAILABLE runner=$env:RUNNER_IMAGE reason=$($_.Exception.Message)"
+              return @()
+            }
             foreach ($pkg in $packages) {
               $family = [string]$pkg.PackageFamilyName
               if ([string]::IsNullOrWhiteSpace($family)) { continue }
@@ -975,21 +985,43 @@ jobs:
             } catch { $softwareFailed++; Write-Warning "scoop import failed: $($_.Exception.Message)" }
           }
 
-          # V12 package-aware restore. WinGet/other package managers above are the primary
-          # installation channel. AppX metadata verifies the package identity and, when the
-          # payload is already present on the runner for another user, registers it for this SID.
+          # V12+ package-aware restore. WinGet/other package managers above are the primary
+          # installation channel. AppX is optional on Server editions and PowerShell 7 cannot
+          # load the Appx module on some windows-2022 images. Detect that capability explicitly
+          # so an AppX-incompatible runner never breaks an otherwise valid Windows restore.
           $appxRequiredRestored = 0
           $appxRequiredMissing = 0
           $appxOptionalPresent = 0
           $appxManifestPath = Join-Path $stateRoot 'appx-packages.json'
+          $appxManifest = @()
           if (Test-Path -LiteralPath $appxManifestPath) {
-            foreach ($pkg in @(Get-Content -LiteralPath $appxManifestPath -Raw | ConvertFrom-Json)) {
+            $appxManifest = @(Get-Content -LiteralPath $appxManifestPath -Raw | ConvertFrom-Json)
+          }
+          $appxRuntimeAvailable = $true
+          try { Import-Module Appx -ErrorAction Stop }
+          catch {
+            $appxRuntimeAvailable = $false
+            Write-Warning "MANAGED_WINDOWS_APPX_RESTORE_UNAVAILABLE runner=$env:RUNNER_IMAGE reason=$($_.Exception.Message)"
+          }
+          function Get-ManagedAppxByFamily {
+            param([Parameter(Mandatory=$true)][string]$Family,[switch]$AllUsers)
+            if (-not $appxRuntimeAvailable) { return @() }
+            try {
+              $packages = if ($AllUsers) { @(Get-AppxPackage -AllUsers -ErrorAction Stop) } else { @(Get-AppxPackage -ErrorAction Stop) }
+              return @($packages | Where-Object { ([string]$_.PackageFamilyName).Equals($Family,[System.StringComparison]::OrdinalIgnoreCase) })
+            } catch {
+              Write-Warning "MANAGED_WINDOWS_APPX_QUERY_FAILED family=$Family allUsers=$([bool]$AllUsers) reason=$($_.Exception.Message)"
+              return @()
+            }
+          }
+          if ($appxRuntimeAvailable) {
+            foreach ($pkg in $appxManifest) {
               $family = ([string]$pkg.family_name).Trim()
               if (-not $family) { continue }
               $required = [bool]$pkg.restore_required
-              $present = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { ([string]$_.PackageFamilyName).Equals($family,[System.StringComparison]::OrdinalIgnoreCase) })
+              $present = @(Get-ManagedAppxByFamily -Family $family)
               if (-not $present.Count) {
-                $available = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { ([string]$_.PackageFamilyName).Equals($family,[System.StringComparison]::OrdinalIgnoreCase) })
+                $available = @(Get-ManagedAppxByFamily -Family $family -AllUsers)
                 foreach ($candidate in $available) {
                   $manifest = if ($candidate.InstallLocation) { Join-Path ([string]$candidate.InstallLocation) 'AppxManifest.xml' } else { '' }
                   if (-not $manifest -or -not (Test-Path -LiteralPath $manifest -PathType Leaf)) { continue }
@@ -999,7 +1031,7 @@ jobs:
                     break
                   } catch { Write-Warning "AppX register failed family=${family}: $($_.Exception.Message)" }
                 }
-                $present = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { ([string]$_.PackageFamilyName).Equals($family,[System.StringComparison]::OrdinalIgnoreCase) })
+                $present = @(Get-ManagedAppxByFamily -Family $family)
               }
               if ($present.Count) {
                 if ($required) { $appxRequiredRestored++ } else { $appxOptionalPresent++ }
@@ -1010,6 +1042,16 @@ jobs:
               } else {
                 Write-Host "MANAGED_WINDOWS_APPX_OPTIONAL_ABSENT family=$family change=$($pkg.change)"
               }
+            }
+          } else {
+            $unsupportedRequired = @($appxManifest | Where-Object { [bool]$_.restore_required }).Count
+            if ($unsupportedRequired -gt 0) {
+              # A backup created on an AppX-capable image should normally be restored to
+              # the same runner image. Preserve strictness for required package deltas.
+              $appxRequiredMissing += $unsupportedRequired
+              Write-Warning "MANAGED_WINDOWS_APPX_REQUIRED_UNSUPPORTED count=$unsupportedRequired runner=$env:RUNNER_IMAGE"
+            } else {
+              Write-Host "MANAGED_WINDOWS_APPX_RESTORE_SKIPPED_UNSUPPORTED runner=$env:RUNNER_IMAGE"
             }
           }
           Write-Host "MANAGED_WINDOWS_SOFTWARE_REHYDRATE packagesOk=$softwareOk packagesFailed=$softwareFailed appxRequiredRestored=$appxRequiredRestored appxRequiredMissing=$appxRequiredMissing appxOptionalPresent=$appxOptionalPresent"
@@ -2604,8 +2646,17 @@ jobs:
 
             function Get-ManagedAppxInventory {
               $items = [System.Collections.Generic.List[object]]::new()
-              try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
-              catch { $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue) }
+              try {
+                # Keep the strict V13 backup portable across windows-2022 and
+                # windows-2025. Server 2022 can expose Get-AppxPackage through module
+                # discovery while refusing to load Appx from PowerShell 7 (0x80131539).
+                Import-Module Appx -ErrorAction Stop
+                try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
+                catch { $packages = @(Get-AppxPackage -ErrorAction Stop) }
+              } catch {
+                Write-Warning "MANAGED_WINDOWS_APPX_INVENTORY_UNAVAILABLE runner=$env:RUNNER_IMAGE reason=$($_.Exception.Message)"
+                return @()
+              }
               foreach ($pkg in $packages) {
                 $family = [string]$pkg.PackageFamilyName
                 if ([string]::IsNullOrWhiteSpace($family)) { continue }
