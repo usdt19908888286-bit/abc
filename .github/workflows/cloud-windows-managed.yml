@@ -4157,7 +4157,11 @@ jobs:
                   } catch { }
                 }
 
-                $candidates = @('vlc','winscp','sumatrapdf','qbittorrent','filezilla','putty','everything','grepwin')
+                $candidates = @(
+                  'everything','grepwin','keepass','greenshot','peazip','geany','wiztree','lockhunter',
+                  'sharex','irfanview','foobar2000','mpv','heidisql','sqlitebrowser','jpegview','nomacs',
+                  'mediainfo','windirstat','cpu-z','hwinfo','rufus','mremoteng','handbrake','audacity'
+                )
                 $current = @(& choco.exe list --local-only --limit-output 2>$null)
                 if ($LASTEXITCODE -ne 0) { $current = @(& choco.exe list --limit-output 2>$null) }
                 $present = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
