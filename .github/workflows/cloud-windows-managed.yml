@@ -4092,50 +4092,6 @@ jobs:
               }
               if (
                 $null -ne $cmd -and
-                $cmd.command -eq 'e2e_install_app' -and
-                [string]$cmd.system_type -eq 'windows' -and
-                [string]$cmd.machine_id -eq $env:MACHINE_ID -and
-                [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID
-              ) {
-                if ([string]$env:MACHINE_NAME -notlike 'E2E-WIN*') {
-                  throw "E2E install command rejected for non-test machine: $env:MACHINE_NAME"
-                }
-                $packageId = ([string]$cmd.package_id).Trim().ToLowerInvariant()
-                if ($packageId -ne 'vlc') {
-                  throw "E2E install package is not allowlisted: $packageId"
-                }
-                if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-                  throw 'choco.exe is unavailable for E2E install'
-                }
-                $before = @(& choco.exe list --local-only --limit-output 2>$null)
-                if ($LASTEXITCODE -ne 0) { $before = @(& choco.exe list --limit-output 2>$null) }
-                if (@($before | Where-Object { ([string]$_) -match '^vlc\|' }).Count -gt 0) {
-                  throw "E2E package already exists in runner baseline: $packageId"
-                }
-                Write-Host "E2E_WINDOWS_APP_INSTALL_START package=$packageId manager=choco issue=$($issue.number)"
-                & choco.exe install $packageId -y --no-progress
-                $installExit = $LASTEXITCODE
-                $after = @(& choco.exe list --local-only --limit-output 2>$null)
-                if ($LASTEXITCODE -ne 0) { $after = @(& choco.exe list --limit-output 2>$null) }
-                if ($installExit -ne 0 -or @($after | Where-Object { ([string]$_) -match '^vlc\|' }).Count -eq 0) {
-                  $after | Out-Host
-                  throw "E2E package install verification failed: package=$packageId exit=$installExit"
-                }
-                $profileRoot = Get-ManagedUserProfilePath
-                $desktopRoot = Join-Path $profileRoot 'Desktop'
-                New-Item -ItemType Directory -Path $desktopRoot -Force | Out-Null
-                $markerPath = Join-Path $desktopRoot 'E2E-VLC-MARKER.txt'
-                Set-Content -LiteralPath $markerPath -Value "E2E_WINDOWS_APP_MARKER run=$env:GITHUB_RUN_ID" -Encoding ASCII
-                Write-Host "E2E_WINDOWS_APP_INSTALL_OK package=$packageId marker=$markerPath"
-                try {
-                  & gh api --method PATCH "/repos/$env:GITHUB_REPOSITORY/issues/$($issue.number)" -f state=closed 2>$null | Out-Null
-                } catch { Write-Warning "E2E command issue close skipped: $($_.Exception.Message)" }
-                Start-Sleep -Seconds 2
-                continue
-              }
-
-              if (
-                $null -ne $cmd -and
                 $cmd.command -eq 'backup' -and
                 [string]$cmd.system_type -eq 'windows' -and
                 [string]$cmd.machine_id -eq $env:MACHINE_ID -and
