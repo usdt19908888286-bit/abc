@@ -4073,6 +4073,7 @@ jobs:
           }
 
           $commandTitle = "Cloud Windows Command $env:MACHINE_ID"
+          $handledE2ECommandIssues = [System.Collections.Generic.HashSet[int]]::new()
           while ($true) {
             $issue = $null
             try {
@@ -4080,6 +4081,10 @@ jobs:
               if ($LASTEXITCODE -eq 0 -and $raw) {
                 $items = $raw | ConvertFrom-Json
                 $issue = $items | Where-Object { -not $_.pull_request -and $_.title -eq $commandTitle } | Select-Object -First 1
+                if ($null -ne $issue -and $handledE2ECommandIssues.Contains([int]$issue.number)) {
+                  Write-Host "E2E_COMMAND_ALREADY_HANDLED issue=$($issue.number)"
+                  $issue = $null
+                }
               }
             } catch { }
 
@@ -4097,6 +4102,7 @@ jobs:
                 [string]$cmd.machine_id -eq $env:MACHINE_ID -and
                 (-not [string]$cmd.run_id -or [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID)
               ) {
+                [void]$handledE2ECommandIssues.Add([int]$issue.number)
                 if ([string]$env:MACHINE_NAME -notlike 'E2E-WIN*') {
                   throw "E2E seed command rejected for non-test machine: $env:MACHINE_NAME"
                 }
@@ -4233,6 +4239,7 @@ jobs:
                 [string]$cmd.machine_id -eq $env:MACHINE_ID -and
                 (-not [string]$cmd.run_id -or [string]$cmd.run_id -eq [string]$env:GITHUB_RUN_ID)
               ) {
+                [void]$handledE2ECommandIssues.Add([int]$issue.number)
                 if ([string]$env:MACHINE_NAME -notlike 'E2E-WIN*') {
                   throw "E2E verify command rejected for non-test machine: $env:MACHINE_NAME"
                 }
