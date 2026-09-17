@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091704
+# csm-managed-workflow-version: 2026091705
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -44,7 +44,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
   issues: write
 
 concurrency:
@@ -176,7 +176,7 @@ jobs:
           if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
             try {
               $path = Join-Path $baselineRoot 'winget.json'
-              & winget.exe export -o $path --accept-source-agreements --disable-interactivity
+              & winget.exe export -o $path --include-versions --accept-source-agreements --disable-interactivity
               if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
             } catch { }
           }
@@ -620,6 +620,27 @@ jobs:
           }
           Write-Host "MANAGED_WINDOWS_BACKUP_COMPATIBLE image=$backupRunnerImage current=$env:RUNNER_IMAGE machine=$env:MACHINE_ID"
 
+      - name: Rehydrate Windows applications from compact plan
+        if: ${{ inputs.mode == 'restore' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\windows-managed-state.ps1')
+          $restoreRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
+          $metadata = Get-Content -LiteralPath (Join-Path $restoreRoot 'metadata.json') -Raw | ConvertFrom-Json
+          $version = if ($null -eq $metadata.version) { 1 } else { [int]$metadata.version }
+          if ($version -lt 14) {
+            Write-Host "MANAGED_WINDOWS_REHYDRATION_LEGACY_DEFERRED version=$version"
+            exit 0
+          }
+          $stateRoot = Join-Path $restoreRoot 'state'
+          $result = Invoke-ManagedSoftwareRehydrate -StateRoot $stateRoot
+          if ([int]$result.failed -gt 0) {
+            Write-Warning "MANAGED_WINDOWS_REHYDRATION_PARTIAL total=$($result.total) restored=$($result.restored) failed=$($result.failed); continuing with complete software capsule fallback"
+          } else {
+            Write-Host "MANAGED_WINDOWS_REHYDRATION_STEP_OK total=$($result.total) restored=$($result.restored)"
+          }
+
       - name: Restore Windows software delta
         if: ${{ inputs.mode == 'restore' }}
         shell: pwsh
@@ -972,40 +993,59 @@ jobs:
 
           Write-ManagedRdpProbe -Stage 'step11-start'
 
-          # Reinstall package-managed applications first so restored AppData/registry overlays their fresh defaults.
+          # V14 rehydrates package-managed applications before profile/AppData restore.
+          # Older backups retain the legacy in-place behavior for compatibility only.
           $softwareOk = 0
           $softwareFailed = 0
-          $wingetManifest = Join-Path $stateRoot 'winget.json'
-          if ((Test-Path -LiteralPath $wingetManifest) -and (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-            try {
-              & winget.exe import -i $wingetManifest --accept-package-agreements --accept-source-agreements --ignore-unavailable --disable-interactivity
-              if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "winget import exited $LASTEXITCODE" }
-            } catch { $softwareFailed++; Write-Warning "winget import failed: $($_.Exception.Message)" }
-          }
-
-          $chocoManifest = Join-Path $stateRoot 'choco-packages.txt'
-          if ((Test-Path -LiteralPath $chocoManifest) -and (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-            Get-Content -LiteralPath $chocoManifest | ForEach-Object {
-              $line = [string]$_
-              if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('Chocolatey ')) { return }
-              $parts = $line -split '\|', 2
-              $name = $parts[0].Trim()
-              if (-not $name) { return }
+          if ($version -lt 14) {
+            $wingetManifest = Join-Path $stateRoot 'winget.json'
+            if ((Test-Path -LiteralPath $wingetManifest) -and (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
               try {
-                $args = @('install', $name, '-y', '--no-progress')
-                if ($parts.Count -gt 1 -and $parts[1].Trim()) { $args += @('--version', $parts[1].Trim()) }
-                & choco.exe @args
-                if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "choco restore failed for $name" }
-              } catch { $softwareFailed++; Write-Warning "choco restore failed for ${name}: $($_.Exception.Message)" }
+                & winget.exe import -i $wingetManifest --accept-package-agreements --accept-source-agreements --ignore-unavailable --disable-interactivity
+                if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "winget import exited $LASTEXITCODE" }
+              } catch { $softwareFailed++; Write-Warning "winget import failed: $($_.Exception.Message)" }
             }
-          }
 
-          $scoopManifest = Join-Path $stateRoot 'scoop.json'
-          if ((Test-Path -LiteralPath $scoopManifest) -and (Get-Command scoop -ErrorAction SilentlyContinue)) {
-            try {
-              & scoop import $scoopManifest
-              if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "scoop import exited $LASTEXITCODE" }
-            } catch { $softwareFailed++; Write-Warning "scoop import failed: $($_.Exception.Message)" }
+            $chocoManifest = Join-Path $stateRoot 'choco-packages.txt'
+            if ((Test-Path -LiteralPath $chocoManifest) -and (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+              Get-Content -LiteralPath $chocoManifest | ForEach-Object {
+                $line = [string]$_
+                if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('Chocolatey ')) { return }
+                $parts = $line -split '\|', 2
+                $name = $parts[0].Trim()
+                if (-not $name) { return }
+                try {
+                  $args = @('install', $name, '-y', '--no-progress')
+                  if ($parts.Count -gt 1 -and $parts[1].Trim()) { $args += @('--version', $parts[1].Trim()) }
+                  & choco.exe @args
+                  if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "choco restore failed for $name" }
+                } catch { $softwareFailed++; Write-Warning "choco restore failed for ${name}: $($_.Exception.Message)" }
+              }
+            }
+
+            $scoopManifest = Join-Path $stateRoot 'scoop.json'
+            if ((Test-Path -LiteralPath $scoopManifest) -and (Get-Command scoop -ErrorAction SilentlyContinue)) {
+              try {
+                & scoop import $scoopManifest
+                if ($LASTEXITCODE -eq 0) { $softwareOk++ } else { $softwareFailed++; Write-Warning "scoop import exited $LASTEXITCODE" }
+              } catch { $softwareFailed++; Write-Warning "scoop import failed: $($_.Exception.Message)" }
+            }
+          } else {
+            $planPath = Join-Path $stateRoot 'rehydration-plan.json'
+            $resultPath = Join-Path $stateRoot 'rehydration-result.json'
+            $planned = if (Test-Path -LiteralPath $planPath) { @(Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json).Count } else { 0 }
+            if ($planned -gt 0 -and -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+              throw "V14 software rehydration result is missing planned=$planned"
+            }
+            if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
+              $rehydrationResult = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+              $softwareOk = [int]$rehydrationResult.restored
+              $softwareFailed = [int]$rehydrationResult.failed
+              if ($softwareFailed -gt 0) {
+                Write-Warning "MANAGED_WINDOWS_REHYDRATION_RESULT_FALLBACK total=$($rehydrationResult.total) restored=$softwareOk failed=$softwareFailed; capsule payload/state restore remains authoritative"
+              }
+            }
+            Write-Host "MANAGED_WINDOWS_REHYDRATION_RESULT_REUSED planned=$planned restored=$softwareOk failed=$softwareFailed"
           }
 
           # V12+ package-aware restore. WinGet/other package managers above are the primary
@@ -1978,6 +2018,14 @@ jobs:
               $allowLegacyMissingPayload = ($backupVersion -le 7 -and [int]$backupMetadata.software_app_delta_count -gt 0 -and [int]$backupMetadata.software_root_count -eq 0)
             } catch { }
           }
+          $applicationPlanByRegistry = @{}
+          $applicationPlanPath = Join-Path $stateRoot 'application-plan.json'
+          if (Test-Path -LiteralPath $applicationPlanPath -PathType Leaf) {
+            foreach ($entry in @(Get-Content -LiteralPath $applicationPlanPath -Raw | ConvertFrom-Json)) {
+              $key = ([string]$entry.registry_path).ToLowerInvariant()
+              if ($key) { $applicationPlanByRegistry[$key] = $entry }
+            }
+          }
           $payloadEvidenceByRegistry = @{}
           $payloadEvidencePath = Join-Path $stateRoot 'app-payload-evidence.json'
           if (Test-Path -LiteralPath $payloadEvidencePath) {
@@ -2012,31 +2060,52 @@ jobs:
             if (-not (Test-Path -LiteralPath $providerPath)) {
               throw "Restored app uninstall registry is missing: $name path=$regPath"
             }
+            $registryProperties = Get-ItemProperty -LiteralPath $providerPath -ErrorAction Stop
+            $expectedVersion = ([string]$app.version).Trim()
+            $actualVersion = ([string]$registryProperties.DisplayVersion).Trim()
+            if ($backupVersion -ge 14 -and $expectedVersion) {
+              if (-not $actualVersion) { throw "Restored app version is missing: $name expected=$expectedVersion" }
+              if (-not $expectedVersion.Equals($actualVersion,[System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Restored app version mismatch: $name expected=$expectedVersion actual=$actualVersion"
+              }
+            }
 
+            $regKey = $regPath.ToLowerInvariant()
+            $applicationPlanEntry = if ($applicationPlanByRegistry.ContainsKey($regKey)) { $applicationPlanByRegistry[$regKey] } else { $null }
+            $rehydrated = $backupVersion -ge 14 -and $null -ne $applicationPlanEntry -and [string]$applicationPlanEntry.strategy -eq 'rehydrate'
+            $rehydrateEvidence = ''
             $declaredEvidence = 0
+            $declaredFileEvidence = 0
+            if ($rehydrated) {
+              $declaredEvidence++
+              $rehydrateEvidence = "rehydrate:$([string]$applicationPlanEntry.manager)/$([string]$applicationPlanEntry.package_id)@$([string]$applicationPlanEntry.package_version)"
+            }
             $existingEvidence = [System.Collections.Generic.List[string]]::new()
             $installLocation = [Environment]::ExpandEnvironmentVariables(([string]$app.install_location).Trim().Trim('"'))
             if ($installLocation -and [IO.Path]::IsPathRooted($installLocation)) {
               $declaredEvidence++
+              $declaredFileEvidence++
               if (Test-Path -LiteralPath $installLocation) { [void]$existingEvidence.Add("install:$installLocation") }
             }
             $icon = ([string]$app.display_icon -replace ',\s*-?\d+\s*$','').Trim().Trim('"')
             $icon = [Environment]::ExpandEnvironmentVariables($icon)
             if ($icon -and [IO.Path]::IsPathRooted($icon)) {
               $declaredEvidence++
+              $declaredFileEvidence++
               if (Test-Path -LiteralPath $icon) { [void]$existingEvidence.Add("icon:$icon") }
             }
             foreach ($commandValue in @([string]$app.uninstall, [string]$app.quiet_uninstall)) {
               $exe = Resolve-CommandExecutablePath -Value $commandValue
               if (-not $exe) { continue }
               $declaredEvidence++
+              $declaredFileEvidence++
               if (Test-Path -LiteralPath $exe) { [void]$existingEvidence.Add("command:$exe") }
             }
-            $regKey = $regPath.ToLowerInvariant()
             foreach ($payload in @($payloadEvidenceByRegistry[$regKey])) {
               $payloadPath = [Environment]::ExpandEnvironmentVariables(([string]$payload.path).Trim().Trim('"'))
               if (-not $payloadPath -or -not [IO.Path]::IsPathRooted($payloadPath)) { continue }
               $declaredEvidence++
+              $declaredFileEvidence++
               if (Test-Path -LiteralPath $payloadPath -PathType Container) {
                 $payloadFile = Get-ChildItem -LiteralPath $payloadPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($null -ne $payloadFile) {
@@ -2046,9 +2115,12 @@ jobs:
               }
             }
             if ($backupVersion -ge 8 -and $declaredEvidence -eq 0) {
-              throw "Restored app has no payload evidence in a strict V8+ backup: $name registry=$regPath"
+              throw "Restored app has no reconstruction evidence in a strict V8+ backup: $name registry=$regPath"
             }
-            if ($declaredEvidence -gt 0 -and $existingEvidence.Count -eq 0) {
+            if ($rehydrated -and $declaredFileEvidence -gt 0 -and $existingEvidence.Count -eq 0) {
+              throw "Rehydrated app has no surviving program-file evidence: $name registry=$regPath plan=$rehydrateEvidence"
+            }
+            if ($declaredEvidence -gt 0 -and $existingEvidence.Count -eq 0 -and -not ($rehydrated -and $declaredFileEvidence -eq 0)) {
               if ($allowLegacyMissingPayload) {
                 Write-Warning "MANAGED_WINDOWS_APP_RESTORE_LEGACY_PAYLOAD_MISSING name=$name registry=$regPath"
                 $verified++
@@ -2057,8 +2129,10 @@ jobs:
               throw "Restored app payload is missing: $name registry=$regPath"
             }
             $verified++
-            $evidenceText = if ($existingEvidence.Count) { $existingEvidence -join ';' } else { 'registry-only' }
-            Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_OK name=$name registry=$regPath evidence=$evidenceText"
+            $evidenceItems = @($existingEvidence)
+            if ($rehydrateEvidence) { $evidenceItems += $rehydrateEvidence }
+            $evidenceText = if ($evidenceItems.Count) { $evidenceItems -join ';' } else { 'registry-only' }
+            Write-Host "MANAGED_WINDOWS_APP_RESTORE_VERIFY_OK name=$name version=$actualVersion registry=$regPath evidence=$evidenceText"
           }
 
           if ($backupVersion -ge 9) {
@@ -2734,6 +2808,7 @@ jobs:
           }
 
           function Stage-ManagedBackup {
+            . (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\windows-managed-state.ps1')
             Stop-ManagedUserSessions
             $profileRoot = Get-ManagedUserProfilePath
             if (-not (Test-Path $profileRoot)) { throw "$env:DESKTOP_USERNAME profile not found: $profileRoot" }
@@ -2822,6 +2897,12 @@ jobs:
               $deltaInstall = ([string]$deltaApp.install_location -replace '[\r\n]+',' ').Trim()
               Write-Host "MANAGED_WINDOWS_APP_DELTA name=$deltaName version=$deltaVersion registry=$deltaRegistry install=$deltaInstall"
             }
+
+            # V14 compact backup: build the package-manager reconstruction plan before
+            # deciding which machine-level directories genuinely need binary payload backup.
+            $softwarePlan = New-ManagedSoftwareRehydrationPlan -BaselineRoot $baselineRoot -StateRoot $stateRoot -AppDelta $appDelta
+            $applicationPlan = @($softwarePlan.applications)
+            Write-Host "MANAGED_WINDOWS_COMPACT_PLAN_READY packages=$(@($softwarePlan.packages).Count) rehydrateApps=$($softwarePlan.rehydrate_apps) fallbackApps=$($softwarePlan.fallback_apps)"
 
             function Get-ManagedAppxInventory {
               $items = [System.Collections.Generic.List[object]]::new()
@@ -3018,6 +3099,39 @@ jobs:
             $programDirectoryInventory = @($programDirectoryInventory | Sort-Object -Unique)
             $appPayloadEvidence = [System.Collections.Generic.List[object]]::new()
 
+            function Add-AppPayloadEvidence {
+              param(
+                [Parameter(Mandatory=$true)]$App,
+                [Parameter(Mandatory=$true)][string]$Path,
+                [Parameter(Mandatory=$true)][string]$Evidence
+              )
+              if ([string]::IsNullOrWhiteSpace($Path)) { return }
+              try {
+                $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+                if (-not [IO.Path]::IsPathRooted($expanded)) { return }
+                $full = [IO.Path]::GetFullPath($expanded).TrimEnd('\')
+                if (-not (Test-Path -LiteralPath $full -PathType Container)) { return }
+                if (Test-ManagedSoftwareExcludedPath -Path $full) { return }
+                $volumeRoot = [IO.Path]::GetPathRoot($full)
+                if ([string]::IsNullOrWhiteSpace($volumeRoot)) { return }
+                $volume = $volumeRoot.TrimEnd('\').ToUpperInvariant()
+                $relative = $full.Substring($volumeRoot.Length).TrimStart('\')
+                $registryPath = [string]$App.registry_path
+                $already = $appPayloadEvidence | Where-Object {
+                  ([string]$_.registry_path).Equals($registryPath,[System.StringComparison]::OrdinalIgnoreCase) -and
+                  ([string]$_.path).Equals($full,[System.StringComparison]::OrdinalIgnoreCase)
+                } | Select-Object -First 1
+                if ($null -ne $already) { return }
+                [void]$appPayloadEvidence.Add([pscustomobject]@{
+                  registry_path=$registryPath; name=[string]$App.name; version=[string]$App.version;
+                  path=$full; volume=$volume; relative=$relative; evidence=$Evidence
+                })
+                Write-Host "MANAGED_WINDOWS_APP_PAYLOAD_EVIDENCE app=$($App.name) path=$full evidence=$Evidence"
+              } catch {
+                Write-Warning "MANAGED_WINDOWS_APP_PAYLOAD_EVIDENCE_SKIPPED app=$($App.name) path=$Path evidence=$Evidence reason=$($_.Exception.Message)"
+              }
+            }
+
             # Fallback for installers that register an app but omit usable install paths.
             # Compare shallow Program Files topology against the pristine runner baseline;
             # this catches vendor/application directories created after the pristine runner baseline
@@ -3048,15 +3162,26 @@ jobs:
             }
 
             foreach ($app in $appDelta) {
+              # Always capture the application payload. Package-manager rehydration is a
+              # preferred restore source, not a substitute for the user's actual software bytes.
               Add-SoftwareRootCandidate -Path ([string]$app.install_location) -Reason "install-location:$($app.name)"
+              Add-AppPayloadEvidence -App $app -Path ([string]$app.install_location) -Evidence 'install-location'
               $icon = ([string]$app.display_icon -replace ',\s*-?\d+\s*$','').Trim().Trim('"')
               if ($icon -and [IO.Path]::IsPathRooted($icon)) {
-                try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($icon)) -Reason "display-icon:$($app.name)" } catch { }
+                try {
+                  $iconDir = [IO.Path]::GetDirectoryName($icon)
+                  Add-SoftwareRootCandidate -Path $iconDir -Reason "display-icon:$($app.name)"
+                  Add-AppPayloadEvidence -App $app -Path $iconDir -Evidence 'display-icon'
+                } catch { }
               }
               foreach ($commandValue in @([string]$app.uninstall, [string]$app.quiet_uninstall)) {
                 $exe = Resolve-CommandExecutablePath -Value $commandValue
                 if ($exe) {
-                  try { Add-SoftwareRootCandidate -Path ([IO.Path]::GetDirectoryName($exe)) -Reason "uninstall-command:$($app.name)" } catch { }
+                  try {
+                    $uninstallDir = [IO.Path]::GetDirectoryName($exe)
+                    Add-SoftwareRootCandidate -Path $uninstallDir -Reason "uninstall-command:$($app.name)"
+                    Add-AppPayloadEvidence -App $app -Path $uninstallDir -Evidence 'uninstall-command'
+                  } catch { }
                 }
               }
               $registryLeaf = (([string]$app.registry_path -split '\\') | Select-Object -Last 1)
@@ -3083,16 +3208,10 @@ jobs:
                         [void]$softwareCandidates.Add([pscustomobject]@{ volume=$payloadVolume; relative=$payloadRelative; source=$payloadPath; reason="registry-identity-direct:$($app.name)" })
                         Write-Warning "MANAGED_WINDOWS_SOFTWARE_CANDIDATE_DIRECT app=$($app.name) path=$payloadPath"
                       }
-                      [void]$appPayloadEvidence.Add([pscustomobject]@{
-                        registry_path = [string]$app.registry_path
-                        name = [string]$app.name
-                        path = $payloadPath
-                        volume = $payloadVolume
-                        relative = $payloadRelative
-                        evidence = 'registry-identity'
-                      })
+                      Add-AppPayloadEvidence -App $app -Path $payloadPath -Evidence 'registry-identity'
                       Write-Host "MANAGED_WINDOWS_APP_DIRECTORY_MATCH app=$($app.name) registryLeaf=$registryLeaf path=$payloadPath"
                     } else {
+
                       Write-Host "MANAGED_WINDOWS_APP_PACKAGE_STORE_RAW_PAYLOAD_SKIPPED app=$($app.name) path=$payloadPath"
                     }
                     break
@@ -3100,6 +3219,24 @@ jobs:
                 }
               }
             }
+
+            # A backup is only valid when every added/changed installed application has at
+            # least one concrete program-directory source. Package metadata alone is not enough.
+            $appsMissingPayloadEvidence = [System.Collections.Generic.List[string]]::new()
+            foreach ($app in $appDelta) {
+              $registryPath = ([string]$app.registry_path).Trim()
+              $covered = @($appPayloadEvidence | Where-Object {
+                ([string]$_.registry_path).Equals($registryPath,[System.StringComparison]::OrdinalIgnoreCase)
+              }).Count -gt 0
+              if (-not $covered) {
+                [void]$appsMissingPayloadEvidence.Add("$([string]$app.name)|$([string]$app.version)|$registryPath")
+                Write-Warning "MANAGED_WINDOWS_APP_CAPSULE_MISSING_PAYLOAD app=$($app.name) version=$($app.version) registry=$registryPath"
+              }
+            }
+            if ($appsMissingPayloadEvidence.Count -gt 0) {
+              throw "Software capsule coverage incomplete missing=$($appsMissingPayloadEvidence.Count): $($appsMissingPayloadEvidence -join ' ; ')"
+            }
+            Write-Host "MANAGED_WINDOWS_APP_CAPSULE_COVERAGE_OK apps=$(@($appDelta).Count) evidence=$($appPayloadEvidence.Count)"
 
             # Capture machine-scoped application state under ProgramData. Only directories
             # created after the pristine baseline and matching an app/vendor identity token
@@ -3471,6 +3608,9 @@ jobs:
             }
             ConvertTo-Json -InputObject @($installerTreeManifest) -Depth 6 | Set-Content -LiteralPath (Join-Path $stateRoot 'installer-registry-trees.json') -Encoding UTF8
 
+            # Preserve only the Windows Installer files added after the pristine runner baseline.
+            # This is bounded delta state, not a copy of the whole machine installer cache, and
+            # keeps uninstall/repair metadata available even if the original package source vanishes.
             $baselineInstallerCacheSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $baselineInstallerCachePath = Join-Path $baselineRoot 'installer-cache-files.json'
             if (Test-Path -LiteralPath $baselineInstallerCachePath) {
@@ -3489,6 +3629,7 @@ jobs:
               }
             }
             ConvertTo-Json -InputObject @($installerCacheManifest) -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'installer-cache.json') -Encoding UTF8
+            Write-Host "MANAGED_WINDOWS_INSTALLER_CACHE_DELTA_CAPTURED files=$($installerCacheManifest.Count)"
 
             # Copy the live user profile through a VSS snapshot. The managed desktop
             # shares the runner's active Windows session, so files such as WebCache,
@@ -3887,8 +4028,9 @@ jobs:
             })
             ConvertTo-Json -InputObject $autoServices -Depth 5 | Set-Content -LiteralPath (Join-Path $stateRoot 'auto-services.json') -Encoding UTF8
 
-            # Capture kernel/system-driver deltas from HKLM\SYSTEM\CurrentControlSet\Services instead of CIM.
-            # This remains reliable after Rename-LocalUser and fails closed if the baseline/current inventory is implausible.
+            # Capture user-software driver/PnP deltas as part of the complete software capsule.
+            # Package-manager rehydration remains an optimization; the backup must remain usable
+            # when an exact package/version is no longer downloadable.
             $baselineDriversPath = Join-Path $baselineRoot 'drivers.json'
             if (-not (Test-Path -LiteralPath $baselineDriversPath)) { throw 'Baseline driver inventory is missing' }
             $baselineDriversSaved = @(Get-Content -LiteralPath $baselineDriversPath -Raw | ConvertFrom-Json)
@@ -4012,97 +4154,15 @@ jobs:
               Write-Host "MANAGED_WINDOWS_PNP_DELTA instance=$instanceId hardware=$hardwareId inf=$originalName strategy=$strategy"
             }
             ConvertTo-Json -InputObject @($pnpDeviceManifest) -Depth 7 | Set-Content -LiteralPath (Join-Path $stateRoot 'pnp-devices.json') -Encoding UTF8
+            Write-Host "MANAGED_WINDOWS_DRIVER_CAPSULE_CAPTURED drivers=$($driverManifest.Count) packages=$($driverPackageManifest.Count) pnp=$($pnpDeviceManifest.Count)"
 
-            # installed-apps.json and installed-apps-delta.json were captured before VSS
-            # so their install roots could participate in the machine-level software snapshot.
-            # Save only package-manager DELTAS relative to the pristine runner image.
-            # This avoids reinstalling the large set of software that GitHub already preloads on every new runner.
-            $baselineRoot = Join-Path $env:RUNNER_TEMP 'managed-software-baseline'
-            $wingetDeltaCount = 0
-            $chocoDeltaCount = 0
-            $scoopDeltaCount = 0
-
-            if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
-              try {
-                $currentPath = Join-Path $stateRoot 'winget-current.json'
-                & winget.exe export -o $currentPath --accept-source-agreements --disable-interactivity
-                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $currentPath)) {
-                  $current = Get-Content -LiteralPath $currentPath -Raw | ConvertFrom-Json
-                  $baselineIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                  $baselinePath = Join-Path $baselineRoot 'winget.json'
-                  if (Test-Path -LiteralPath $baselinePath) {
-                    $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
-                    foreach ($source in @($baseline.Sources)) {
-                      foreach ($pkg in @($source.Packages)) {
-                        if ($pkg.PackageIdentifier) { [void]$baselineIds.Add([string]$pkg.PackageIdentifier) }
-                      }
-                    }
-                  }
-                  $deltaSources = @()
-                  foreach ($source in @($current.Sources)) {
-                    $packages = @($source.Packages | Where-Object { $_.PackageIdentifier -and -not $baselineIds.Contains([string]$_.PackageIdentifier) })
-                    if ($packages.Count) {
-                      $wingetDeltaCount += $packages.Count
-                      $deltaSources += [pscustomobject]@{ Packages=$packages; SourceDetails=$source.SourceDetails }
-                    }
-                  }
-                  if ($wingetDeltaCount -gt 0) {
-                    $delta = [ordered]@{}
-                    if ($current.PSObject.Properties.Name -contains '$schema') { $delta['$schema'] = $current.'$schema' }
-                    $delta['CreationDate'] = [DateTime]::UtcNow.ToString('o')
-                    $delta['Sources'] = $deltaSources
-                    ConvertTo-Json -InputObject $delta -Depth 12 | Set-Content -LiteralPath (Join-Path $stateRoot 'winget.json') -Encoding UTF8
-                  }
-                }
-                Remove-Item -LiteralPath $currentPath -Force -ErrorAction SilentlyContinue
-              } catch { Write-Warning "winget delta export skipped: $($_.Exception.Message)" }
-            }
-
-            if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
-              try {
-                $baselineVersions = @{}
-                $baselinePath = Join-Path $baselineRoot 'choco-packages.txt'
-                if (Test-Path -LiteralPath $baselinePath) {
-                  foreach ($line in Get-Content -LiteralPath $baselinePath) {
-                    $parts = ([string]$line) -split '\|', 2
-                    if ($parts.Count -gt 0 -and $parts[0].Trim()) { $baselineVersions[$parts[0].Trim().ToLowerInvariant()] = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' } }
-                  }
-                }
-                $currentChoco = @(& choco.exe list --local-only --limit-output 2>$null)
-                if ($LASTEXITCODE -ne 0) { $currentChoco = @(& choco.exe list --limit-output 2>$null) }
-                $deltaChoco = @()
-                foreach ($line in $currentChoco) {
-                  $parts = ([string]$line) -split '\|', 2
-                  if ($parts.Count -lt 1 -or -not $parts[0].Trim()) { continue }
-                  $name = $parts[0].Trim()
-                  $version = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
-                  $keyName = $name.ToLowerInvariant()
-                  if (-not $baselineVersions.ContainsKey($keyName) -or [string]$baselineVersions[$keyName] -ne $version) { $deltaChoco += [string]$line }
-                }
-                $chocoDeltaCount = $deltaChoco.Count
-                if ($chocoDeltaCount) { $deltaChoco | Set-Content -LiteralPath (Join-Path $stateRoot 'choco-packages.txt') -Encoding UTF8 }
-              } catch { Write-Warning "choco delta inventory skipped: $($_.Exception.Message)" }
-            }
-
-            if (Get-Command scoop -ErrorAction SilentlyContinue) {
-              try {
-                $currentScoopPath = Join-Path $stateRoot 'scoop-current.json'
-                & scoop export | Set-Content -LiteralPath $currentScoopPath -Encoding UTF8
-                $currentScoop = Get-Content -LiteralPath $currentScoopPath -Raw | ConvertFrom-Json
-                $baselineNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                $baselineScoopPath = Join-Path $baselineRoot 'scoop.json'
-                if (Test-Path -LiteralPath $baselineScoopPath) {
-                  $baselineScoop = Get-Content -LiteralPath $baselineScoopPath -Raw | ConvertFrom-Json
-                  foreach ($app in @($baselineScoop.apps)) { if ($app.Name) { [void]$baselineNames.Add([string]$app.Name) } }
-                }
-                $deltaApps = @($currentScoop.apps | Where-Object { $_.Name -and -not $baselineNames.Contains([string]$_.Name) })
-                $scoopDeltaCount = $deltaApps.Count
-                if ($scoopDeltaCount) {
-                  [pscustomobject]@{ buckets=$currentScoop.buckets; apps=$deltaApps } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $stateRoot 'scoop.json') -Encoding UTF8
-                }
-                Remove-Item -LiteralPath $currentScoopPath -Force -ErrorAction SilentlyContinue
-              } catch { Write-Warning "scoop delta export skipped: $($_.Exception.Message)" }
-            }
+            # V14 package-manager deltas were already captured before raw payload discovery.
+            # Reuse that single source of truth so backup classification and restore cannot drift.
+            $rehydrationEntries = @($softwarePlan.packages)
+            $wingetDeltaCount = @($rehydrationEntries | Where-Object { [string]$_.manager -eq 'winget' }).Count
+            $chocoDeltaCount = @($rehydrationEntries | Where-Object { [string]$_.manager -eq 'choco' }).Count
+            $scoopDeltaCount = @($rehydrationEntries | Where-Object { [string]$_.manager -eq 'scoop' }).Count
+            Write-Host "MANAGED_WINDOWS_PACKAGE_DELTAS_REUSED winget=$wingetDeltaCount choco=$chocoDeltaCount scoop=$scoopDeltaCount"
 
             # Track protected user credential/session stores by count only. Their encrypted
             # contents are already carried inside the VSS profile snapshot; values are never
@@ -4133,7 +4193,7 @@ jobs:
             $softwareBytes = if ($null -eq $softwareMeasure.Sum) { [int64]0 } else { [int64]$softwareMeasure.Sum }
             $softwareFiles = [int64]$softwareMeasure.Count
             if (@($appPayloadEvidence).Count -gt 0 -and (@($softwareRoots).Count -eq 0 -or $softwareFiles -eq 0)) {
-              throw "Strict app payload backup failed: evidence=$(@($appPayloadEvidence).Count) roots=$(@($softwareRoots).Count) files=$softwareFiles"
+              throw "Application capsule payload backup failed: apps=$(@($appDelta).Count) evidence=$(@($appPayloadEvidence).Count) roots=$(@($softwareRoots).Count) files=$softwareFiles"
             }
             $backupBytes = $profileBytes + $stateBytes + $softwareBytes
             $sourceLocalAccounts = @(
@@ -4143,7 +4203,7 @@ jobs:
             )
 
             @{
-              version = 13
+              version = 14
               system_type = 'windows'
               machine_id = $env:MACHINE_ID
               desktop_username = $env:DESKTOP_USERNAME
@@ -4152,7 +4212,7 @@ jobs:
               runner_image = $env:RUNNER_IMAGE
               run_id = [int64]$env:GITHUB_RUN_ID
               created_at = [DateTime]::UtcNow.ToString('o')
-              scope = 'managed-windows-state-v13-snapshot-verified-package-aware-installer-delta-services-drivers-pnp'
+              scope = 'managed-windows-state-v14-software-capsule-plus-rehydration-user-state-services-drivers-pnp'
               profile_file_count = $profileFiles
               profile_bytes = $profileBytes
               state_bytes = $stateBytes
@@ -4160,6 +4220,9 @@ jobs:
               software_bytes = $softwareBytes
               software_root_count = @($softwareRoots).Count
               software_app_delta_count = @($appDelta).Count
+              software_rehydration_package_count = @($softwarePlan.packages).Count
+              software_rehydrate_app_count = [int]$softwarePlan.rehydrate_apps
+              software_fallback_app_count = [int]$softwarePlan.fallback_apps
               software_app_payload_evidence_count = @($appPayloadEvidence).Count
               appx_delta_count = @($appxDelta).Count
               appx_restore_required_count = @($appxDelta | Where-Object { [bool]$_.restore_required }).Count
@@ -4189,7 +4252,7 @@ jobs:
             } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $backupRoot 'metadata.json') -Encoding UTF8
             $gib = [math]::Round($backupBytes / 1GB, 2)
             $softwareGib = [math]::Round($softwareBytes / 1GB, 2)
-            Write-Host "MANAGED_WINDOWS_BACKUP_V13_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) appxDelta=$(@($appxDelta).Count) appxRequired=$(@($appxDelta | Where-Object { [bool]$_.restore_required }).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
+            Write-Host "MANAGED_WINDOWS_BACKUP_V14_STAGED profileFiles=$profileFiles softwareFiles=$softwareFiles bytes=$backupBytes gib=$gib softwareGib=$softwareGib apps=$(@($apps).Count) appDelta=$(@($appDelta).Count) rehydratePackages=$(@($softwarePlan.packages).Count) rehydrateApps=$($softwarePlan.rehydrate_apps) fallbackApps=$($softwarePlan.fallback_apps) appxDelta=$(@($appxDelta).Count) appxRequired=$(@($appxDelta | Where-Object { [bool]$_.restore_required }).Count) appPayloadEvidence=$(@($appPayloadEvidence).Count) appProfileEvidence=$(@($appProfileEvidence).Count) protectedUserState=$(@($protectedUserState).Count) softwareRoots=$(@($softwareRoots).Count) softwareAcl=$(@($softwareAclManifest).Count) appRegistry=$(@($appRegistryManifest).Count) uninstallRegistry=$(@($uninstallRegistryManifest).Count) installerValues=$(@($installerValueDelta).Count) installerTrees=$(@($installerTreeManifest).Count) installerCache=$(@($installerCacheManifest).Count) startup=$(@($startupEntries).Count) startupApproved=$(@($startupApproved).Count) commonStartup=$(@($commonStartupManifest).Count) tasks=$(@($taskManifest).Count) services=$(@($autoServices).Count) serviceDelta=$(@($serviceDelta).Count) drivers=$(@($driverManifest).Count) driverPackages=$(@($driverPackageManifest).Count) pnpDevices=$(@($pnpDeviceManifest).Count) wingetDelta=$wingetDeltaCount chocoDelta=$chocoDeltaCount scoopDelta=$scoopDeltaCount"
             Write-Host 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
@@ -4521,6 +4584,31 @@ jobs:
           }
           Write-Host 'MANAGED_DESKTOP_BACKUP_SAVED'
           Write-Host 'MANAGED_WINDOWS_BACKUP_SAVED'
+
+      - name: Prune older Windows backup caches
+        if: steps.session.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = "managed-desktop-windows-$env:MACHINE_ID-"
+          $response = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to list Windows backup caches' }
+          $items = @((($response | ConvertFrom-Json).actions_caches) | Where-Object { ([string]$_.key).StartsWith($prefix,[System.StringComparison]::OrdinalIgnoreCase) } | Sort-Object created_at -Descending)
+          $keep = 2
+          $removed = 0
+          if ($items.Count -gt $keep) {
+            foreach ($cache in @($items | Select-Object -Skip $keep)) {
+              $cacheId = [int64]$cache.id
+              if ($cacheId -le 0) { continue }
+              gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/actions/caches/$cacheId" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "Failed to delete old Windows backup cache id=$cacheId key=$($cache.key)" }
+              $removed++
+              Write-Host "MANAGED_WINDOWS_OLD_BACKUP_CACHE_REMOVED id=$cacheId key=$($cache.key) created=$($cache.created_at)"
+            }
+          }
+          Write-Host "MANAGED_WINDOWS_BACKUP_CACHE_RETENTION_OK machine=$env:MACHINE_ID found=$($items.Count) keep=$keep removed=$removed"
 
       - name: Report Windows workflow failure to Cloudflare
         if: ${{ failure() }}

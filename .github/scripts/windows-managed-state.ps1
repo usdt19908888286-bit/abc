@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091703
+# csm-managed-support-version: 2026091704
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -89,6 +89,392 @@ function Get-ManagedStartupServiceBacking {
   return $null
 }
 
+function ConvertTo-ManagedSoftwareIdentityToken {
+  [CmdletBinding()]
+  param([string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+  return (($Value.ToLowerInvariant()) -replace '[^\p{L}\p{Nd}]','')
+}
+
+function Get-ManagedSoftwareIdentityTokens {
+  [CmdletBinding()]
+  param([string[]]$Values = @())
+
+  $tokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($value in @($Values)) {
+    if ([string]::IsNullOrWhiteSpace([string]$value)) { continue }
+    $full = ConvertTo-ManagedSoftwareIdentityToken -Value ([string]$value)
+    if ($full.Length -ge 4) { [void]$tokens.Add($full) }
+    foreach ($part in @(([string]$value) -split '[\.\-_\s\\/\(\)\[\]]+')) {
+      $token = ConvertTo-ManagedSoftwareIdentityToken -Value $part
+      if ($token.Length -ge 4) { [void]$tokens.Add($token) }
+    }
+  }
+  return @($tokens | Sort-Object Length -Descending -Unique)
+}
+
+function Find-ManagedPackageForApplication {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory=$true)]$Application,
+    [object[]]$PackagePlan = @()
+  )
+
+  $registryLeaf = (([string]$Application.registry_path -split '\\') | Select-Object -Last 1)
+  $appTokens = @(Get-ManagedSoftwareIdentityTokens -Values @(
+    [string]$Application.name,
+    [string]$registryLeaf,
+    [IO.Path]::GetFileName(([string]$Application.install_location).TrimEnd('\'))
+  ))
+  if (-not $appTokens.Count) { return $null }
+
+  $best = $null
+  $bestScore = -1
+  foreach ($package in @($PackagePlan)) {
+    if ($null -eq $package) { continue }
+    $packageTokens = @(Get-ManagedSoftwareIdentityTokens -Values @([string]$package.package_id,[string]$package.display_name))
+    foreach ($packageToken in $packageTokens) {
+      foreach ($appToken in $appTokens) {
+        $score = -1
+        if ($appToken.Equals($packageToken,[System.StringComparison]::OrdinalIgnoreCase)) {
+          $score = 1000 + $packageToken.Length
+        } elseif ($packageToken.Length -ge 5 -and (
+          $appToken.IndexOf($packageToken,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+          $packageToken.IndexOf($appToken,[System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        )) {
+          $score = 100 + [math]::Min($appToken.Length,$packageToken.Length)
+        }
+        if ($score -gt $bestScore) { $bestScore = $score; $best = $package }
+      }
+    }
+  }
+  if ($bestScore -lt 0) { return $null }
+  return $best
+}
+
+function Test-ManagedApplicationUsesRehydration {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory=$true)]$Application,
+    [object[]]$ApplicationPlan = @()
+  )
+
+  $registryPath = ([string]$Application.registry_path).Trim()
+  if (-not $registryPath) { return $false }
+  foreach ($entry in @($ApplicationPlan)) {
+    if ($null -eq $entry -or [string]$entry.strategy -ne 'rehydrate') { continue }
+    if ($registryPath.Equals(([string]$entry.registry_path).Trim(),[System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+  }
+  return $false
+}
+
+function Test-ManagedPathUsesRehydration {
+  [CmdletBinding()]
+  param(
+    [string]$Path,
+    [object[]]$ApplicationPlan = @()
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+  try { $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"')) } catch { $expanded = $Path }
+  $pathToken = ConvertTo-ManagedSoftwareIdentityToken -Value $expanded
+  $pathParts = @($expanded -split '[\\/]+')
+  $pathTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($part in $pathParts) {
+    $token = ConvertTo-ManagedSoftwareIdentityToken -Value $part
+    if ($token.Length -ge 4) { [void]$pathTokens.Add($token) }
+  }
+  foreach ($entry in @($ApplicationPlan)) {
+    if ($null -eq $entry -or [string]$entry.strategy -ne 'rehydrate') { continue }
+    $tokens = @(Get-ManagedSoftwareIdentityTokens -Values @([string]$entry.package_id,[string]$entry.app_name))
+    foreach ($token in $tokens) {
+      if ($pathTokens.Contains($token)) { return $true }
+      if ($token.Length -ge 5 -and $pathToken.IndexOf($token,[System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    }
+  }
+  return $false
+}
+
+function New-ManagedSoftwareRehydrationPlan {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory=$true)][string]$BaselineRoot,
+    [Parameter(Mandatory=$true)][string]$StateRoot,
+    [object[]]$AppDelta = @()
+  )
+
+  New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
+  $packages = [System.Collections.Generic.List[object]]::new()
+
+  function Add-ManagedPackagePlanEntry {
+    param([string]$Manager,[string]$PackageId,[string]$Version,[string]$Source,[string]$DisplayName='')
+    if ([string]::IsNullOrWhiteSpace($Manager) -or [string]::IsNullOrWhiteSpace($PackageId)) { return }
+    $existing = $packages | Where-Object {
+      ([string]$_.manager).Equals($Manager,[System.StringComparison]::OrdinalIgnoreCase) -and
+      ([string]$_.package_id).Equals($PackageId,[System.StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1
+    if ($null -ne $existing) { return }
+    [void]$packages.Add([pscustomobject]@{
+      manager=$Manager; package_id=$PackageId; version=$Version; source=$Source;
+      display_name=$DisplayName; strict_version=(-not [string]::IsNullOrWhiteSpace($Version))
+    })
+  }
+
+  if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+    try {
+      $currentPath = Join-Path $StateRoot 'winget-current.json'
+      & winget.exe export -o $currentPath --include-versions --accept-source-agreements --disable-interactivity | Out-Host
+      if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $currentPath -PathType Leaf)) {
+        $current = Get-Content -LiteralPath $currentPath -Raw | ConvertFrom-Json
+        $baselineVersions = @{}
+        $baselinePath = Join-Path $BaselineRoot 'winget.json'
+        if (Test-Path -LiteralPath $baselinePath -PathType Leaf) {
+          $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+          foreach ($source in @($baseline.Sources)) {
+            foreach ($pkg in @($source.Packages)) {
+              if ($pkg.PackageIdentifier) { $baselineVersions[[string]$pkg.PackageIdentifier] = [string]$pkg.Version }
+            }
+          }
+        }
+        $deltaSources = [System.Collections.Generic.List[object]]::new()
+        foreach ($source in @($current.Sources)) {
+          $deltaPackages = [System.Collections.Generic.List[object]]::new()
+          foreach ($pkg in @($source.Packages)) {
+            $id = ([string]$pkg.PackageIdentifier).Trim()
+            if (-not $id) { continue }
+            $version = ([string]$pkg.Version).Trim()
+            $changed = -not $baselineVersions.ContainsKey($id) -or -not ([string]$baselineVersions[$id]).Equals($version,[System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $changed) { continue }
+            [void]$deltaPackages.Add($pkg)
+            $sourceId = if ($source.SourceDetails.Identifier) { [string]$source.SourceDetails.Identifier } elseif ($source.SourceDetails.Name) { [string]$source.SourceDetails.Name } else { 'winget' }
+            Add-ManagedPackagePlanEntry -Manager 'winget' -PackageId $id -Version $version -Source $sourceId
+          }
+          if ($deltaPackages.Count) { [void]$deltaSources.Add([pscustomobject]@{ Packages=@($deltaPackages); SourceDetails=$source.SourceDetails }) }
+        }
+        if ($deltaSources.Count) {
+          $delta = [ordered]@{}
+          if ($current.PSObject.Properties.Name -contains '$schema') { $delta['$schema'] = $current.'$schema' }
+          $delta['CreationDate'] = [DateTime]::UtcNow.ToString('o')
+          $delta['Sources'] = @($deltaSources)
+          ConvertTo-Json -InputObject $delta -Depth 12 | Set-Content -LiteralPath (Join-Path $StateRoot 'winget.json') -Encoding UTF8
+        }
+      }
+      Remove-Item -LiteralPath $currentPath -Force -ErrorAction SilentlyContinue
+    } catch { Write-Warning "MANAGED_WINDOWS_REHYDRATION_WINGET_PLAN_SKIPPED reason=$($_.Exception.Message)" }
+  }
+
+  if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
+    try {
+      $baselineVersions = @{}
+      $baselinePath = Join-Path $BaselineRoot 'choco-packages.txt'
+      if (Test-Path -LiteralPath $baselinePath -PathType Leaf) {
+        foreach ($line in Get-Content -LiteralPath $baselinePath) {
+          $parts = ([string]$line) -split '\|', 2
+          if ($parts.Count -gt 0 -and $parts[0].Trim()) {
+            $baselineVersions[$parts[0].Trim().ToLowerInvariant()] = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+          }
+        }
+      }
+      $currentChoco = @(& choco.exe list --local-only --limit-output 2>$null)
+      if ($LASTEXITCODE -ne 0) { $currentChoco = @(& choco.exe list --limit-output 2>$null) }
+      $deltaChoco = [System.Collections.Generic.List[string]]::new()
+      foreach ($line in $currentChoco) {
+        $parts = ([string]$line) -split '\|', 2
+        if ($parts.Count -lt 1) { continue }
+        $name = $parts[0].Trim()
+        if (-not $name -or $name.StartsWith('Chocolatey ',[System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $version = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+        $key = $name.ToLowerInvariant()
+        $changed = -not $baselineVersions.ContainsKey($key) -or -not ([string]$baselineVersions[$key]).Equals($version,[System.StringComparison]::OrdinalIgnoreCase)
+        if (-not $changed) { continue }
+        [void]$deltaChoco.Add([string]$line)
+        Add-ManagedPackagePlanEntry -Manager 'choco' -PackageId $name -Version $version -Source 'chocolatey'
+      }
+      if ($deltaChoco.Count) { $deltaChoco | Set-Content -LiteralPath (Join-Path $StateRoot 'choco-packages.txt') -Encoding UTF8 }
+    } catch { Write-Warning "MANAGED_WINDOWS_REHYDRATION_CHOCO_PLAN_SKIPPED reason=$($_.Exception.Message)" }
+  }
+
+  if (Get-Command scoop -ErrorAction SilentlyContinue) {
+    try {
+      $currentPath = Join-Path $StateRoot 'scoop-current.json'
+      & scoop export | Set-Content -LiteralPath $currentPath -Encoding UTF8
+      $current = Get-Content -LiteralPath $currentPath -Raw | ConvertFrom-Json
+      $baselineVersions = @{}
+      $baselinePath = Join-Path $BaselineRoot 'scoop.json'
+      if (Test-Path -LiteralPath $baselinePath -PathType Leaf) {
+        $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+        foreach ($app in @($baseline.apps)) { if ($app.Name) { $baselineVersions[[string]$app.Name] = [string]$app.Version } }
+      }
+      $deltaApps = [System.Collections.Generic.List[object]]::new()
+      foreach ($app in @($current.apps)) {
+        $name = ([string]$app.Name).Trim()
+        if (-not $name) { continue }
+        $version = ([string]$app.Version).Trim()
+        $changed = -not $baselineVersions.ContainsKey($name) -or -not ([string]$baselineVersions[$name]).Equals($version,[System.StringComparison]::OrdinalIgnoreCase)
+        if (-not $changed) { continue }
+        [void]$deltaApps.Add($app)
+        Add-ManagedPackagePlanEntry -Manager 'scoop' -PackageId $name -Version $version -Source ([string]$app.Source)
+      }
+      if ($deltaApps.Count) {
+        [pscustomobject]@{ buckets=$current.buckets; apps=@($deltaApps) } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $StateRoot 'scoop.json') -Encoding UTF8
+      }
+      Remove-Item -LiteralPath $currentPath -Force -ErrorAction SilentlyContinue
+    } catch { Write-Warning "MANAGED_WINDOWS_REHYDRATION_SCOOP_PLAN_SKIPPED reason=$($_.Exception.Message)" }
+  }
+
+  $applicationPlan = [System.Collections.Generic.List[object]]::new()
+  foreach ($app in @($AppDelta)) {
+    $package = Find-ManagedPackageForApplication -Application $app -PackagePlan @($packages)
+    if ($null -ne $package) {
+      [void]$applicationPlan.Add([pscustomobject]@{
+        registry_path=[string]$app.registry_path; app_name=[string]$app.name; app_version=[string]$app.version;
+        strategy='rehydrate'; manager=[string]$package.manager; package_id=[string]$package.package_id; package_version=[string]$package.version
+      })
+      Write-Host "MANAGED_WINDOWS_APP_PLAN strategy=rehydrate app=$($app.name) manager=$($package.manager) package=$($package.package_id) version=$($package.version)"
+    } else {
+      [void]$applicationPlan.Add([pscustomobject]@{
+        registry_path=[string]$app.registry_path; app_name=[string]$app.name; app_version=[string]$app.version;
+        strategy='payload'; manager=''; package_id=''; package_version=''
+      })
+      Write-Host "MANAGED_WINDOWS_APP_PLAN strategy=payload app=$($app.name) version=$($app.version)"
+    }
+  }
+
+  ConvertTo-Json -InputObject @($packages) -Depth 7 | Set-Content -LiteralPath (Join-Path $StateRoot 'rehydration-plan.json') -Encoding UTF8
+  ConvertTo-Json -InputObject @($applicationPlan) -Depth 7 | Set-Content -LiteralPath (Join-Path $StateRoot 'application-plan.json') -Encoding UTF8
+  $fallbackCount = @($applicationPlan | Where-Object { [string]$_.strategy -eq 'payload' }).Count
+  $rehydrateCount = @($applicationPlan | Where-Object { [string]$_.strategy -eq 'rehydrate' }).Count
+  Write-Host "MANAGED_WINDOWS_REHYDRATION_PLAN packages=$($packages.Count) apps=$($applicationPlan.Count) rehydrateApps=$rehydrateCount fallbackApps=$fallbackCount"
+  return [pscustomobject]@{ packages=@($packages); applications=@($applicationPlan); rehydrate_apps=$rehydrateCount; fallback_apps=$fallbackCount }
+}
+
+function Invoke-ManagedSoftwareRehydrate {
+  [CmdletBinding()]
+  param([Parameter(Mandatory=$true)][string]$StateRoot)
+
+  $planPath = Join-Path $StateRoot 'rehydration-plan.json'
+  if (-not (Test-Path -LiteralPath $planPath -PathType Leaf)) {
+    Write-Host 'MANAGED_WINDOWS_REHYDRATION_NONE'
+    return [pscustomobject]@{ total=0; restored=0; failed=0; fallback_required=$false; failures=@() }
+  }
+  $plan = @(Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json)
+  if (-not $plan.Count) {
+    Write-Host 'MANAGED_WINDOWS_REHYDRATION_NONE'
+    return [pscustomobject]@{ total=0; restored=0; failed=0; fallback_required=$false; failures=@() }
+  }
+
+  $restored = 0
+  $failed = 0
+  $failures = [System.Collections.Generic.List[string]]::new()
+
+  $wingetEntries = @($plan | Where-Object { [string]$_.manager -eq 'winget' })
+  if ($wingetEntries.Count) {
+    $manifest = Join-Path $StateRoot 'winget.json'
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget -or -not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+      $failed += $wingetEntries.Count
+      [void]$failures.Add("winget prerequisites missing packages=$($wingetEntries.Count)")
+      Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=winget reason=prerequisites-missing packages=$($wingetEntries.Count)"
+    } else {
+      $ok = $false
+      for ($attempt=1; $attempt -le 2 -and -not $ok; $attempt++) {
+        & $winget.Source import -i $manifest --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Host
+        if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+        Write-Warning "MANAGED_WINDOWS_REHYDRATE_RETRY manager=winget attempt=$attempt exit=$LASTEXITCODE"
+        Start-Sleep -Seconds (3 * $attempt)
+      }
+      if ($ok) {
+        $restored += $wingetEntries.Count
+        Write-Host "MANAGED_WINDOWS_REHYDRATE_OK manager=winget packages=$($wingetEntries.Count)"
+      } else {
+        $failed += $wingetEntries.Count
+        [void]$failures.Add("winget import failed packages=$($wingetEntries.Count)")
+        Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=winget reason=import-failed packages=$($wingetEntries.Count)"
+      }
+    }
+  }
+
+  $chocoEntries = @($plan | Where-Object { [string]$_.manager -eq 'choco' })
+  if ($chocoEntries.Count) {
+    $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+    if (-not $choco) {
+      $failed += $chocoEntries.Count
+      [void]$failures.Add("choco prerequisites missing packages=$($chocoEntries.Count)")
+      Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=choco reason=prerequisites-missing packages=$($chocoEntries.Count)"
+    } else {
+      foreach ($entry in $chocoEntries) {
+        $id = ([string]$entry.package_id).Trim()
+        $version = ([string]$entry.version).Trim()
+        $ok = $false
+        for ($attempt=1; $attempt -le 2 -and -not $ok; $attempt++) {
+          $args = @('install',$id,'-y','--no-progress','--allow-downgrade','--force')
+          if ($version) { $args += @('--version',$version) }
+          & $choco.Source @args | Out-Host
+          if ($LASTEXITCODE -eq 0) { $ok=$true; break }
+          Write-Warning "MANAGED_WINDOWS_REHYDRATE_RETRY manager=choco package=$id version=$version attempt=$attempt exit=$LASTEXITCODE"
+          Start-Sleep -Seconds (3 * $attempt)
+        }
+        if ($ok) {
+          $restored++
+          Write-Host "MANAGED_WINDOWS_REHYDRATE_OK manager=choco package=$id version=$version"
+        } else {
+          $failed++
+          [void]$failures.Add("choco package=$id version=$version")
+          Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=choco package=$id version=$version reason=install-failed"
+        }
+      }
+    }
+  }
+
+  $scoopEntries = @($plan | Where-Object { [string]$_.manager -eq 'scoop' })
+  if ($scoopEntries.Count) {
+    $manifest = Join-Path $StateRoot 'scoop.json'
+    $scoop = Get-Command scoop -ErrorAction SilentlyContinue
+    if (-not $scoop -or -not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+      $failed += $scoopEntries.Count
+      [void]$failures.Add("scoop prerequisites missing packages=$($scoopEntries.Count)")
+      Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=scoop reason=prerequisites-missing packages=$($scoopEntries.Count)"
+    } else {
+      $ok = $false
+      for ($attempt=1; $attempt -le 2 -and -not $ok; $attempt++) {
+        & $scoop.Source import $manifest | Out-Host
+        if ($LASTEXITCODE -eq 0) { $ok=$true; break }
+        Write-Warning "MANAGED_WINDOWS_REHYDRATE_RETRY manager=scoop attempt=$attempt exit=$LASTEXITCODE"
+        Start-Sleep -Seconds (3 * $attempt)
+      }
+      if ($ok) {
+        $restored += $scoopEntries.Count
+        Write-Host "MANAGED_WINDOWS_REHYDRATE_OK manager=scoop packages=$($scoopEntries.Count)"
+      } else {
+        $failed += $scoopEntries.Count
+        [void]$failures.Add("scoop import failed packages=$($scoopEntries.Count)")
+        Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=scoop reason=import-failed packages=$($scoopEntries.Count)"
+      }
+    }
+  }
+
+  $known = $wingetEntries.Count + $chocoEntries.Count + $scoopEntries.Count
+  if ($known -lt $plan.Count) {
+    $unknown = $plan.Count - $known
+    $failed += $unknown
+    [void]$failures.Add("unknown package manager entries=$unknown")
+    Write-Warning "MANAGED_WINDOWS_REHYDRATE_FALLBACK manager=unknown packages=$unknown"
+  }
+
+  $fallbackRequired = ($failed -gt 0)
+  $result = [pscustomobject]@{
+    created_at=[DateTime]::UtcNow.ToString('o')
+    total=$plan.Count
+    restored=$restored
+    failed=$failed
+    fallback_required=$fallbackRequired
+    failures=@($failures)
+    packages=$plan
+  }
+  $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $StateRoot 'rehydration-result.json') -Encoding UTF8
+  Write-Host "MANAGED_WINDOWS_REHYDRATION_COMPLETE total=$($plan.Count) restored=$restored failed=$failed fallbackRequired=$fallbackRequired"
+  return $result
+}
 function Restore-ManagedStartupEntries {
   [CmdletBinding()]
   param(
