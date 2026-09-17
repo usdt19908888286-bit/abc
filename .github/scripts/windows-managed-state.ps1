@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091708
+# csm-managed-support-version: 2026091709
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -592,8 +592,11 @@ function Register-ManagedScheduledTaskXml {
     'BUILTIN\USERS'='S-1-5-32-545'; 'S-1-5-32-545'='S-1-5-32-545'
   }
 
-  $principalNodes = @($taskXml.SelectNodes("//*[local-name()='Principal']/*[local-name()='UserId' or local-name()='GroupId']"))
-  foreach ($node in $principalNodes) {
+  # Identity-bearing UserId/GroupId nodes can appear both under Principals and under
+  # trigger definitions (for example LogonTrigger/UserId). Raw scheduler XML must
+  # migrate all of them when a local account was renamed between ephemeral VMs.
+  $identityNodes = @($taskXml.SelectNodes("//*[local-name()='UserId' or local-name()='GroupId']"))
+  foreach ($node in $identityNodes) {
     $original = ([string]$node.InnerText).Trim()
     if (-not $original) { continue }
     $mapped = ''

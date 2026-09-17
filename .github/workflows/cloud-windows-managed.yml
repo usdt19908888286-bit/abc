@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091708
+# csm-managed-workflow-version: 2026091709
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -1982,12 +1982,14 @@ jobs:
             $expectedStartup = if ($null -eq $metadata.machine_startup_count) { 0 } else { [int]$metadata.machine_startup_count }
             $expectedStartupApproved = if ($null -eq $metadata.startup_approved_count) { 0 } else { [int]$metadata.startup_approved_count }
             $expectedCommonStartup = if ($null -eq $metadata.common_startup_count) { 0 } else { [int]$metadata.common_startup_count }
+            $expectedTasks = if ($null -eq $metadata.scheduled_task_count) { 0 } else { [int]$metadata.scheduled_task_count }
             $expectedDrivers = if ($null -eq $metadata.driver_delta_count) { 0 } else { [int]$metadata.driver_delta_count }
             $expectedDriverPackages = if ($null -eq $metadata.driver_package_delta_count) { 0 } else { [int]$metadata.driver_package_delta_count }
             if (($appRegistryRestored + $appRegistryPortabilitySkipped) -lt $expectedAppRegistry) { throw "V$version app registry restore incomplete expected=$expectedAppRegistry actual=$appRegistryRestored portabilitySkipped=$appRegistryPortabilitySkipped" }
             if ($startupRestored -lt $expectedStartup) { throw "V$version startup restore incomplete expected=$expectedStartup actual=$startupRestored" }
             if ($startupApprovedRestored -lt $expectedStartupApproved) { throw "V$version StartupApproved restore incomplete expected=$expectedStartupApproved actual=$startupApprovedRestored" }
             if ($commonStartupRestored -lt $expectedCommonStartup) { throw "V$version common Startup restore incomplete expected=$expectedCommonStartup actual=$commonStartupRestored" }
+            if ($taskRestored -lt $expectedTasks) { throw "V$version scheduled task restore incomplete expected=$expectedTasks actual=$taskRestored" }
             if ($driversRestored -lt $expectedDrivers -or $driversFailed -gt 0) { throw "V$version driver restore incomplete expected=$expectedDrivers actual=$driversRestored failed=$driversFailed" }
             if ($driverPackagesRestored -lt $expectedDriverPackages -or $driverPackagesFailed -gt 0) { throw "V$version driver package restore incomplete expected=$expectedDriverPackages actual=$driverPackagesRestored failed=$driverPackagesFailed" }
           }
