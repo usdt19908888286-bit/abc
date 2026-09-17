@@ -1,0 +1,87 @@
+name: Temporary Windows 2022 2025 compatibility probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.image }}
+    steps:
+      - name: Probe AppX guard
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:RUNNER_IMAGE = '${{ matrix.image }}'
+          function Get-ManagedAppxInventory {
+            $items = [System.Collections.Generic.List[object]]::new()
+            try {
+              Import-Module Appx -ErrorAction Stop
+              try { $packages = @(Get-AppxPackage -AllUsers -ErrorAction Stop) }
+              catch { $packages = @(Get-AppxPackage -ErrorAction Stop) }
+            } catch {
+              Write-Warning "MANAGED_WINDOWS_APPX_INVENTORY_UNAVAILABLE runner=$env:RUNNER_IMAGE reason=$($_.Exception.Message)"
+              return @()
+            }
+            foreach ($pkg in $packages) {
+              $family = [string]$pkg.PackageFamilyName
+              if ([string]::IsNullOrWhiteSpace($family)) { continue }
+              [void]$items.Add([pscustomobject]@{ family_name=$family; name=[string]$pkg.Name })
+            }
+            return @($items | Sort-Object family_name,name -Unique)
+          }
+          $items = @(Get-ManagedAppxInventory)
+          Write-Host "WINDOWS_COMPAT_APPX_GUARD_OK image=${{ matrix.image }} count=$($items.Count)"
+
+      - name: Probe VSS symlink and robocopy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testRoot = Join-Path $env:USERPROFILE 'managed-compat-probe'
+          $destRoot = Join-Path $env:RUNNER_TEMP 'managed-compat-copy'
+          $shadowLink = Join-Path $env:RUNNER_TEMP 'managed-compat-vss'
+          New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $testRoot 'probe.txt') -Value 'windows-compat-probe' -Encoding UTF8
+          $shadowId = ''
+          try {
+            $volumeRoot = [IO.Path]::GetPathRoot($testRoot)
+            $volumeSpec = $volumeRoot.TrimEnd('\')
+            $vssOutput = @(& vssadmin.exe create shadow "/for=$volumeSpec" 2>&1)
+            $vssExit = $LASTEXITCODE
+            $vssText = ($vssOutput | ForEach-Object { [string]$_ }) -join "`n"
+            if ($vssExit -ne 0) { throw "vssadmin create failed exit=$vssExit detail=$($vssText -replace '\r?\n',' | ')" }
+            $idMatch = [regex]::Match($vssText, '(?im)^\s*Shadow Copy ID:\s*(\{[0-9A-Fa-f-]+\})\s*$')
+            $deviceMatch = [regex]::Match($vssText, '(?im)^\s*Shadow Copy Volume Name:\s*(.+?)\s*$')
+            if (-not $idMatch.Success -or -not $deviceMatch.Success) { throw "VSS output parse failed: $($vssText -replace '\r?\n',' | ')" }
+            $shadowId = $idMatch.Groups[1].Value.Trim()
+            $snapshotRoot = $deviceMatch.Groups[1].Value.Trim().TrimEnd('\')
+            if (Test-Path -LiteralPath $shadowLink) { & cmd.exe /d /c rmdir $shadowLink 2>$null | Out-Null }
+            $linkOutput = @(& cmd.exe /d /c mklink /D $shadowLink "$snapshotRoot\" 2>&1)
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $shadowLink)) { throw "VSS link failed: $(($linkOutput -join ' | '))" }
+            $relative = $testRoot.Substring($volumeRoot.Length).TrimStart('\')
+            $source = Join-Path $shadowLink $relative
+            & robocopy.exe $source $destRoot /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /XJ /NFL /NDL /NP | Out-Host
+            $copyExit = $LASTEXITCODE
+            if ($copyExit -ge 8) { throw "robocopy failed exit=$copyExit" }
+            if (-not (Test-Path -LiteralPath (Join-Path $destRoot 'probe.txt') -PathType Leaf)) { throw 'VSS probe payload missing after copy' }
+            Write-Host "WINDOWS_COMPAT_VSS_OK image=${{ matrix.image }} copyExit=$copyExit"
+          } finally {
+            if (Test-Path -LiteralPath $shadowLink) { & cmd.exe /d /c rmdir $shadowLink 2>$null | Out-Null }
+            if ($shadowId) { & vssadmin.exe delete shadows "/shadow=$shadowId" /quiet | Out-Null }
+            Remove-Item -LiteralPath $testRoot,$destRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Probe PnP inventory commands
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $all = (& pnputil.exe /enum-devices 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "pnputil enum-devices failed exit=$LASTEXITCODE" }
+          $id = [regex]::Match($all, '(?im)^\s*Instance ID\s*:\s*(.+?)\s*$').Groups[1].Value.Trim()
+          if ($id) {
+            $detail = (& pnputil.exe /enum-devices /instanceid $id /deviceids /drivers 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "pnputil detail options failed image=${{ matrix.image }} id=$id exit=$LASTEXITCODE detail=$detail" }
+          }
+          Write-Host "WINDOWS_COMPAT_PNPUTIL_OK image=${{ matrix.image }} instance=$id"
