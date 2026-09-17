@@ -62,9 +62,6 @@ jobs:
       MACHINE_MODE: ${{ inputs.mode || 'new' }}
       WEB_URL: ${{ inputs.web_url }}
     steps:
-      - name: Checkout shared Windows restore primitives
-        uses: actions/checkout@v4
-
       - name: Bootstrap runtime from Cloudflare
         env:
           BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
@@ -938,7 +935,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          . (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\windows-managed-state.ps1')
           $restoreRoot = Join-Path $env:RUNNER_TEMP 'managed-desktop-backup'
           $stateRoot = Join-Path $restoreRoot 'state'
           $metadataPath = Join-Path $restoreRoot 'metadata.json'
@@ -1104,7 +1100,11 @@ jobs:
                 $appRegistryRestored++
                 Write-Host "MANAGED_WINDOWS_APP_REGISTRY_RESTORED path=$regPathText"
               } else {
-                $protectedElevationKey = Test-ManagedWindowsOwnedRegistryPath -RegistryPath $regPathText
+                $protectedElevationKey =
+                  $regPathText.StartsWith('HKEY_LOCAL_MACHINE\SOFTWARE\',[System.StringComparison]::OrdinalIgnoreCase) -and
+                  $regPathText.IndexOf('\Classes\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                  $regPathText.IndexOf('\CLSID\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                  ($regPathText.EndsWith('\Elevation',[System.StringComparison]::OrdinalIgnoreCase) -or $regPathText.IndexOf('\Elevation\',[System.StringComparison]::OrdinalIgnoreCase) -ge 0)
                 $providerPath = "Registry::$regPathText"
                 if ($protectedElevationKey -and (Test-Path -LiteralPath $providerPath)) {
                   $appRegistryPortabilitySkipped++
@@ -1747,7 +1747,19 @@ jobs:
           Write-ManagedRdpProbe -Stage 'step11-clean-shell-hives-skipped'
 
           $startupPath = Join-Path $stateRoot 'machine-startup.json'
-          $startupRestored = Restore-ManagedStartupEntries -ManifestPath $startupPath -Phase 'initial' -ReconcilePasses 1
+          $startupRestored = 0
+          if (Test-Path -LiteralPath $startupPath) {
+            $entries = @(Get-Content -LiteralPath $startupPath -Raw | ConvertFrom-Json)
+            foreach ($entry in $entries) {
+              try {
+                if (-not $entry.path -or -not $entry.name) { continue }
+                New-Item -Path ([string]$entry.path) -Force | Out-Null
+                $type = if ([string]$entry.kind -eq 'ExpandString') { 'ExpandString' } else { 'String' }
+                New-ItemProperty -Path ([string]$entry.path) -Name ([string]$entry.name) -Value ([string]$entry.value) -PropertyType $type -Force | Out-Null
+                $startupRestored++
+              } catch { Write-Warning "startup restore failed: $($_.Exception.Message)" }
+            }
+          }
 
           $startupApprovedRestored = 0
           $startupApprovedPath = Join-Path $stateRoot 'startup-approved.json'
@@ -1812,7 +1824,45 @@ jobs:
                 $xmlPath = Join-Path (Join-Path $stateRoot 'tasks') ([string]$task.file)
                 if (-not (Test-Path -LiteralPath $xmlPath)) { continue }
                 $xml = Get-Content -LiteralPath $xmlPath -Raw
-                Register-ManagedScheduledTaskXml -TaskName ([string]$task.name) -TaskPath ([string]$task.path) -Xml $xml -SourceSidMap $taskSourceSidMap -TargetSidByName $taskTargetSidByName | Out-Null
+                foreach ($oldSid in @($taskSourceSidMap.Keys)) { $xml = $xml.Replace([string]$oldSid,[string]$taskSourceSidMap[$oldSid]) }
+                $registrationUserOverride = ''
+                try {
+                  [xml]$taskXml = $xml
+                  $principalNodes = @($taskXml.SelectNodes("//*[local-name()='Principal']/*[local-name()='UserId' or local-name()='GroupId']"))
+                  foreach ($node in $principalNodes) {
+                    $originalPrincipal = ([string]$node.InnerText).Trim()
+                    if (-not $originalPrincipal) { continue }
+                    $mappedPrincipal = ''
+                    if ($wellKnownTaskPrincipals.ContainsKey($originalPrincipal)) {
+                      $mappedPrincipal = [string]$wellKnownTaskPrincipals[$originalPrincipal]
+                    } elseif ($taskSourceSidMap.ContainsKey($originalPrincipal)) {
+                      $mappedPrincipal = [string]$taskSourceSidMap[$originalPrincipal]
+                    } elseif ($originalPrincipal -match '^[^\\]+\\(?<name>[^\\]+)$' -and $taskTargetSidByName.ContainsKey($matches.name)) {
+                      $mappedPrincipal = [string]$taskTargetSidByName[$matches.name]
+                    }
+                    if ($mappedPrincipal -and -not $originalPrincipal.Equals($mappedPrincipal,[System.StringComparison]::OrdinalIgnoreCase)) {
+                      Write-Host "MANAGED_WINDOWS_TASK_PRINCIPAL_REWRITE task=$($task.name) old=$originalPrincipal new=$mappedPrincipal"
+                      $node.InnerText = $mappedPrincipal
+                    }
+                  }
+                  $primaryUserNode = $taskXml.SelectSingleNode("//*[local-name()='Principal']/*[local-name()='UserId']")
+                  if ($null -ne $primaryUserNode) {
+                    $principalValue = ([string]$primaryUserNode.InnerText).Trim()
+                    $registrationUserOverride = switch ($principalValue) {
+                      'S-1-5-18' { 'SYSTEM' }
+                      'S-1-5-19' { 'LOCAL SERVICE' }
+                      'S-1-5-20' { 'NETWORK SERVICE' }
+                      default { '' }
+                    }
+                  }
+                  $xml = $taskXml.OuterXml
+                } catch { Write-Warning "scheduled task principal normalization skipped task=$($task.name): $($_.Exception.Message)" }
+                if ($registrationUserOverride) {
+                  Register-ScheduledTask -TaskName ([string]$task.name) -TaskPath ([string]$task.path) -Xml $xml -User $registrationUserOverride -Force | Out-Null
+                  Write-Host "MANAGED_WINDOWS_TASK_SERVICE_ACCOUNT_OVERRIDE task=$($task.name) user=$registrationUserOverride"
+                } else {
+                  Register-ScheduledTask -TaskName ([string]$task.name) -TaskPath ([string]$task.path) -Xml $xml -Force | Out-Null
+                }
                 $taskRestored++
                 Write-Host "MANAGED_WINDOWS_SCHEDULED_TASK_RESTORED path=$($task.path) name=$($task.name)"
               } catch { Write-Warning "scheduled task restore failed name=$($task.name): $($_.Exception.Message)" }
@@ -1900,12 +1950,31 @@ jobs:
               }
             }
           }
-          # Stabilize startup state after services/installers have finished. Some software
-          # removes or normalizes its Run entry asynchronously after service activation, so
-          # use repeated reconciliation from the same helper covered by the preflight matrix.
+          # Reconcile machine startup entries after services/installers have finished restoring.
+          # Some applications (notably Everything) normalize/remove their Run entry while their
+          # service is being created or started. The backup manifest is the final portable intent,
+          # so write it last and immediately verify the exact registry value persisted.
+          $startupFinalReconciled = 0
           $startupFinalPath = Join-Path $stateRoot 'machine-startup.json'
-          $startupFinalReconciled = Restore-ManagedStartupEntries -ManifestPath $startupFinalPath -Phase 'final-stable' -ReconcilePasses 8 -PassDelayMilliseconds 1000
-          $startupRestored = [math]::Max([int]$startupRestored,[int]$startupFinalReconciled)
+          if (Test-Path -LiteralPath $startupFinalPath) {
+            foreach ($entry in @(Get-Content -LiteralPath $startupFinalPath -Raw | ConvertFrom-Json)) {
+              if (-not $entry.path -or -not $entry.name) { continue }
+              $entryPath = [string]$entry.path
+              $entryName = [string]$entry.name
+              $entryValue = [string]$entry.value
+              $entryType = if ([string]$entry.kind -eq 'ExpandString') { 'ExpandString' } else { 'String' }
+              New-Item -Path $entryPath -Force | Out-Null
+              New-ItemProperty -Path $entryPath -Name $entryName -Value $entryValue -PropertyType $entryType -Force | Out-Null
+              $entryItem = Get-Item -LiteralPath $entryPath -ErrorAction Stop
+              $persistedValue = [string]$entryItem.GetValue($entryName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              if ($persistedValue -ne $entryValue) {
+                throw "Final startup reconciliation failed path=$entryPath name=$entryName expected=[$entryValue] actual=[$persistedValue]"
+              }
+              $startupFinalReconciled++
+              Write-Host "MANAGED_WINDOWS_STARTUP_FINAL_RECONCILED path=$entryPath name=$entryName value=[$entryValue]"
+            }
+            $startupRestored = [math]::Max([int]$startupRestored,[int]$startupFinalReconciled)
+          }
           if ($pnpPending.Count -gt 0) {
             & pnputil.exe /scan-devices | Out-Host
             foreach ($device in $pnpPending) {
