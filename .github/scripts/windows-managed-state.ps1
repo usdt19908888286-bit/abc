@@ -1,4 +1,4 @@
-# csm-managed-support-version: 2026091707
+# csm-managed-support-version: 2026091708
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
@@ -531,6 +531,10 @@ function Restore-ManagedStartupEntries {
       $item = Get-Item -LiteralPath $entryPath -ErrorAction Stop
       $actual = [string]$item.GetValue($entryName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
       if ($actual -ne $entryValue) {
+        if ($pass -lt $ReconcilePasses) {
+          Write-Warning "MANAGED_WINDOWS_STARTUP_RECONCILE_RETRY phase=$Phase pass=$pass/$ReconcilePasses path=$entryPath name=$entryName expected=[$entryValue] actual=[$actual]"
+          continue
+        }
         throw "Managed startup reconciliation failed phase=$Phase pass=$pass path=$entryPath name=$entryName expected=[$entryValue] actual=[$actual]"
       }
       Write-Host "MANAGED_WINDOWS_STARTUP_RECONCILE_OK phase=$Phase pass=$pass/$ReconcilePasses path=$entryPath name=$entryName"
