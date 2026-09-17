@@ -1,3 +1,4 @@
+# csm-managed-support-version: 2026091701
 function Test-ManagedWindowsOwnedRegistryPath {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)][string]$RegistryPath)
