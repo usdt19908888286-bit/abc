@@ -1025,6 +1025,7 @@ jobs:
             # descriptor inside the state we are about to snapshot. This catches
             # daemons started outside systemd as well as future runner-image services.
             sudo python3 - "$DESKTOP_USERNAME" <<'PY'
+          import json
           import os
           import sys
           from pathlib import Path
@@ -1047,6 +1048,12 @@ jobs:
               f'/home/{desktop_user}/.cache',
               f'/home/{desktop_user}/.local/share/flatpak/repo',
           ]
+          infra_units_path = Path('/tmp/managed-ubuntu-quiesce-infra-units.txt')
+          infra_excludes_path = Path('/tmp/managed-ubuntu-infra-writer-excludes.json')
+          infra_units = set()
+          if infra_units_path.exists():
+              infra_units = set(infra_units_path.read_text(encoding='utf-8', errors='replace').splitlines())
+          coarse_dirs = set(roots) | {'/usr', '/var', '/home'}
 
           def beneath(path, base):
               return path == base or path.startswith(base + os.sep)
@@ -1057,7 +1064,35 @@ jobs:
                   return False
               return not any(beneath(path, item) for item in excludes)
 
+          def infra_unit_for(proc):
+              try:
+                  lines = (proc / 'cgroup').read_text(encoding='utf-8', errors='replace').splitlines()
+              except OSError:
+                  return ''
+              for line in lines:
+                  unit = line.rsplit('/', 1)[-1]
+                  if unit in infra_units:
+                      return unit
+              return ''
+
+          def infra_exclusion(target):
+              target = os.path.normpath(target)
+              try:
+                  if os.path.isdir(target):
+                      return target
+              except OSError:
+                  pass
+              parent = os.path.dirname(target)
+              # Prefer excluding the writer's runtime directory so rotations/new
+              # files cannot race the snapshot. Never broaden an exclusion to a
+              # managed top-level root such as /etc, /opt or /var/lib.
+              if not parent or parent == '/' or parent in coarse_dirs:
+                  return target
+              return parent
+
           writers = []
+          infra_writers = []
+          infra_excludes = set()
           for proc in Path('/proc').iterdir():
               if not proc.name.isdigit():
                   continue
@@ -1080,6 +1115,12 @@ jobs:
                       flags = int(flags_line.split(':', 1)[1].strip(), 8)
                       if (flags & os.O_ACCMODE) == os.O_RDONLY:
                           continue
+                      unit = infra_unit_for(proc)
+                      if unit:
+                          exclusion = infra_exclusion(target)
+                          infra_excludes.add(exclusion)
+                          infra_writers.append((int(proc.name), target, unit, exclusion))
+                          continue
                       try:
                           cmd = (proc / 'cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
                       except OSError:
@@ -1088,11 +1129,17 @@ jobs:
                   except (OSError, ValueError, StopIteration):
                       continue
 
+          infra_excludes_path.write_text(
+              json.dumps(sorted(infra_excludes), separators=(',', ':')),
+              encoding='utf-8',
+          )
+          for pid, path, unit, exclusion in sorted(set(infra_writers))[:20]:
+              print(f'MANAGED_UBUNTU_INFRA_WRITER_EXCLUDE unit={unit} pid={pid} path={path} exclude={exclusion}')
           if writers:
               for pid, path, cmd in sorted(set(writers))[:20]:
                   print(f'::error::Ubuntu snapshot still has writer pid={pid} path={path} cmd={cmd}')
               sys.exit(1)
-          print('MANAGED_UBUNTU_SNAPSHOT_WRITERS_QUIET')
+          print(f'MANAGED_UBUNTU_SNAPSHOT_WRITERS_QUIET infraExcludes={len(infra_excludes)}')
           PY
             echo 'MANAGED_UBUNTU_QUIESCED_FOR_BACKUP'
 
@@ -1213,6 +1260,19 @@ jobs:
               '/var/lib/NetworkManager', '/var/lib/dbus', '/var/lib/waagent',
               '/var/lib/private', '/root/.cache',
           ]
+          dynamic_excludes_path = Path('/tmp/managed-ubuntu-infra-writer-excludes.json')
+          dynamic_excludes = []
+          if dynamic_excludes_path.exists():
+              try:
+                  dynamic_excludes = json.loads(dynamic_excludes_path.read_text(encoding='utf-8'))
+              except (OSError, json.JSONDecodeError):
+                  dynamic_excludes = []
+          dynamic_excludes = sorted({
+              os.path.normpath(item) for item in dynamic_excludes
+              if isinstance(item, str) and item.startswith('/')
+          })
+          EXCLUDES.extend(dynamic_excludes)
+          print(f'MANAGED_UBUNTU_INFRA_DYNAMIC_EXCLUDES count={len(dynamic_excludes)}')
 
           def excluded(path):
               path = os.path.normpath(path)
