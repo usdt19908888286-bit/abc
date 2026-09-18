@@ -1,0 +1,302 @@
+name: Cloud Manager Automation
+run-name: ${{ inputs.action }} · ${{ inputs.instance_key }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: start / restore / backup / rotate / stop
+        required: true
+        type: choice
+        options:
+          - start
+          - restore
+          - backup
+          - rotate
+          - stop
+      instance_key:
+        description: Stable instance key
+        required: true
+        type: string
+      config_b64:
+        description: Base64 JSON instance configuration
+        required: true
+        type: string
+      bootstrap_ticket:
+        description: Short-lived Cloudflare runner capability
+        required: true
+        type: string
+      web_url:
+        description: Cloudflare control-plane URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+concurrency:
+  group: cloud-manager-automation-${{ inputs.instance_key }}
+  cancel-in-progress: false
+
+jobs:
+  automate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ACTION: ${{ inputs.action }}
+      INSTANCE_KEY: ${{ inputs.instance_key }}
+      CONFIG_B64: ${{ inputs.config_b64 }}
+      BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
+      WEB_URL: ${{ inputs.web_url }}
+    steps:
+      - name: Run managed automation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::add-mask::$BOOTSTRAP_TICKET"
+
+          cfg="$RUNNER_TEMP/cloud-manager-config.json"
+          printf '%s' "$CONFIG_B64" | base64 --decode > "$cfg"
+
+          SYSTEM="$(jq -r '.system_type // "android"' "$cfg" | tr '[:upper:]' '[:lower:]')"
+          ID="$(jq -r '.phone_id // empty' "$cfg")"
+          NAME="$(jq -r '.phone_name // empty' "$cfg")"
+          BRANCH="$(jq -r '.branch // "main"' "$cfg")"
+          CONFIG_REPO="$(jq -r '.repo // empty' "$cfg")"
+          RUNNER_IMAGE="$(jq -r '.runner_image // empty' "$cfg")"
+          DESKTOP_USERNAME="$(jq -r '.desktop_username // "admin"' "$cfg")"
+          PACKAGE_NAME="$(jq -r '.package_name // "com.temperaturecoin"' "$cfg")"
+          APK_URL="$(jq -r '.apk_url // empty' "$cfg")"
+          NEW_APPS_B64="$(jq -c '.new_phone_apk_urls // []' "$cfg" | base64 -w0)"
+          API_LEVEL="$(jq -r '.api_level // "35"' "$cfg")"
+          TARGET="$(jq -r '.target // "google_apis"' "$cfg")"
+          ARCH="$(jq -r '.arch // "x86_64"' "$cfg")"
+          PROFILE="$(jq -r '.profile // "pixel_6"' "$cfg")"
+          CORES="$(jq -r '.cores // "4"' "$cfg")"
+          RAM_MB="$(jq -r '.ram_mb // "8192"' "$cfg")"
+          MANUFACTURER="$(jq -r '.device_manufacturer // empty' "$cfg")"
+          BRAND="$(jq -r '.device_brand // empty' "$cfg")"
+          MODEL="$(jq -r '.device_model // empty' "$cfg")"
+          USE_S5="$(jq -r 'if .use_s5 then "true" else "false" end' "$cfg")"
+
+          REPO="$GITHUB_REPOSITORY"
+          CONFIG_REPO_LC="$(printf '%s' "$CONFIG_REPO" | tr '[:upper:]' '[:lower:]')"
+          REPO_LC="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          if [[ -z "$ID" || ! "$ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::invalid instance id: $ID"
+            exit 1
+          fi
+          if [[ -n "$CONFIG_REPO" && "$CONFIG_REPO_LC" != "$REPO_LC" ]]; then
+            echo "::error::automation repository mismatch: config=$CONFIG_REPO current=$REPO"
+            exit 1
+          fi
+          if [[ "$BRANCH" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::automation branch mismatch: config=$BRANCH control=$GITHUB_REF_NAME"
+            exit 1
+          fi
+          if [[ "$INSTANCE_KEY" != "instance:$SYSTEM:$ID" ]]; then
+            echo "::error::instance key mismatch: $INSTANCE_KEY != instance:$SYSTEM:$ID"
+            exit 1
+          fi
+
+          case "$SYSTEM" in
+            windows)
+              WORKFLOW="cloud-windows-managed.yml"
+              CACHE_PREFIX="managed-desktop-windows-$ID-"
+              COMMAND_TITLE="Cloud Windows Command $ID"
+              [[ -n "$RUNNER_IMAGE" ]] || RUNNER_IMAGE="windows-2025"
+              [[ -n "$DESKTOP_USERNAME" ]] || DESKTOP_USERNAME="admin"
+              ;;
+            ubuntu)
+              WORKFLOW="cloud-ubuntu-managed.yml"
+              CACHE_PREFIX="managed-desktop-ubuntu-$ID-"
+              COMMAND_TITLE="Cloud Ubuntu Command $ID"
+              [[ -n "$RUNNER_IMAGE" ]] || RUNNER_IMAGE="ubuntu-24.04"
+              [[ -n "$DESKTOP_USERNAME" ]] || DESKTOP_USERNAME="clouduser"
+              ;;
+            android)
+              WORKFLOW="cloud-phone-managed.yml"
+              CACHE_PREFIX="managed-avd-$ID-"
+              COMMAND_TITLE="Cloud Phone Command $ID"
+              ;;
+            *)
+              echo "::error::unsupported system_type: $SYSTEM"
+              exit 1
+              ;;
+          esac
+
+          latest_instance_run() {
+            gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
+              --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"· $ID /\")) | [.id,.status,(.conclusion // \"\"),(.created_at // \"\")] | @tsv" \
+              | head -n 1 || true
+          }
+
+          cache_for_run() {
+            local run_id="$1"
+            gh api "repos/$REPO/actions/caches?per_page=100&sort=created_at&direction=desc" \
+              --jq ".actions_caches[] | select((.key | startswith(\"$CACHE_PREFIX\")) and ((.key == \"$CACHE_PREFIX$run_id\") or (.key | endswith(\"-$run_id\")))) | .key" \
+              | head -n 1 || true
+          }
+
+          latest_cache() {
+            gh api "repos/$REPO/actions/caches?per_page=100&sort=created_at&direction=desc" \
+              --jq ".actions_caches[] | select(.key | startswith(\"$CACHE_PREFIX\")) | .key" \
+              | head -n 1 || true
+          }
+
+          request_backup() {
+            local run_id="$1"
+            local body issue_no
+            if [[ "$SYSTEM" == "android" ]]; then
+              body="$(jq -cn --arg id "$ID" --argjson run "$run_id" --arg requested "$(date -u +%FT%TZ)" \
+                '{version:1,command:"backup",phone_id:$id,run_id:$run,requested_at:$requested}')"
+            else
+              body="$(jq -cn --arg system "$SYSTEM" --arg id "$ID" --argjson run "$run_id" --arg requested "$(date -u +%FT%TZ)" \
+                '{version:1,command:"backup",system_type:$system,machine_id:$id,run_id:$run,requested_at:$requested}')"
+            fi
+            issue_no="$(gh api "repos/$REPO/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request|not) | select(.title == \"$COMMAND_TITLE\") | .number" | head -n 1 || true)"
+            if [[ -n "$issue_no" ]]; then
+              gh api --method PATCH "repos/$REPO/issues/$issue_no" -f body="$body" -f state=open >/dev/null
+            else
+              issue_no="$(gh api --method POST "repos/$REPO/issues" -f title="$COMMAND_TITLE" -f body="$body" --jq '.number')"
+            fi
+            echo "$issue_no"
+          }
+
+          wait_backup_complete() {
+            local run_id="$1"
+            local cache="" status="" conclusion=""
+            for attempt in $(seq 1 160); do
+              cache="$(cache_for_run "$run_id")"
+              read -r status conclusion < <(gh api "repos/$REPO/actions/runs/$run_id" --jq '[.status,(.conclusion // "")] | @tsv')
+              if [[ -n "$cache" && "$status" == "completed" && "$conclusion" == "success" ]]; then
+                echo "$cache"
+                return 0
+              fi
+              if [[ "$status" == "completed" && -n "$conclusion" && "$conclusion" != "success" ]]; then
+                echo "::error::backup run $run_id ended as $conclusion"
+                return 1
+              fi
+              sleep 15
+            done
+            echo "::error::backup timeout for run $run_id"
+            return 1
+          }
+
+          prune_fourth_completed_run() {
+            mapfile -t completed < <(
+              gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
+                --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"· $ID /\")) | select(.status == \"completed\") | .id" \
+                | head -n 4
+            )
+            if (( ${#completed[@]} >= 4 )); then
+              victim="${completed[3]}"
+              echo "Deleting fourth completed history Run $victim; keeping ${completed[0]} ${completed[1]} ${completed[2]}"
+              gh api --method DELETE "repos/$REPO/actions/runs/$victim" >/dev/null
+            fi
+          }
+
+          dispatch_managed() {
+            local mode="$1"
+            local payload
+            if [[ "$SYSTEM" == "windows" || "$SYSTEM" == "ubuntu" ]]; then
+              payload="$(jq -cn \
+                --arg ref "$BRANCH" --arg mode "$mode" --arg id "$ID" --arg name "$NAME" \
+                --arg image "$RUNNER_IMAGE" --arg user "$DESKTOP_USERNAME" \
+                --arg ticket "$BOOTSTRAP_TICKET" --arg web "$WEB_URL" \
+                '{ref:$ref,inputs:{mode:$mode,machine_id:$id,machine_name:$name,runner_image:$image,desktop_username:$user,bootstrap_ticket:$ticket,web_url:$web}}')"
+            else
+              payload="$(jq -cn \
+                --arg ref "$BRANCH" --arg mode "$mode" --arg id "$ID" --arg name "$NAME" \
+                --arg ticket "$BOOTSTRAP_TICKET" --arg web "$WEB_URL" --arg package "$PACKAGE_NAME" \
+                --arg apk "$APK_URL" --arg apps "$NEW_APPS_B64" --arg api "$API_LEVEL" \
+                --arg target "$TARGET" --arg arch "$ARCH" --arg profile "$PROFILE" \
+                --arg cores "$CORES" --arg ram "$RAM_MB" --arg manufacturer "$MANUFACTURER" \
+                --arg brand "$BRAND" --arg model "$MODEL" --arg s5 "$USE_S5" \
+                '{ref:$ref,inputs:{mode:$mode,phone_id:$id,phone_name:$name,bootstrap_ticket:$ticket,web_url:$web,package_name:$package,apk_url:$apk,new_phone_apk_urls_b64:$apps,api_level:$api,target:$target,arch:$arch,profile:$profile,cores:$cores,ram_mb:$ram,device_manufacturer:$manufacturer,device_brand:$brand,device_model:$model,use_s5:$s5}}')"
+            fi
+            printf '%s' "$payload" | gh api --method POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" --input - >/dev/null
+          }
+
+          wait_new_run() {
+            local previous_id="$1"
+            local line="" new_id=""
+            for attempt in $(seq 1 30); do
+              line="$(latest_instance_run)"
+              new_id="$(cut -f1 <<<"$line")"
+              if [[ -n "$new_id" && "$new_id" != "$previous_id" ]]; then
+                echo "$line"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::new managed run was not created"
+            return 1
+          }
+
+          echo "Automation action=$ACTION instance=$INSTANCE_KEY workflow=$WORKFLOW"
+
+          current="$(latest_instance_run)"
+          current_id="$(cut -f1 <<<"$current")"
+          current_status="$(cut -f2 <<<"$current")"
+          old_id="$current_id"
+
+          case "$ACTION" in
+            start)
+              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
+                echo "Instance already has active Run $current_id ($current_status)"
+                exit 0
+              fi
+              dispatch_managed new
+              wait_new_run "$old_id"
+              ;;
+            restore)
+              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
+                echo "::error::instance already running: $current_id"
+                exit 1
+              fi
+              backup="$(latest_cache)"
+              [[ -n "$backup" ]] || { echo "::error::no restorable backup exists"; exit 1; }
+              dispatch_managed restore
+              wait_new_run "$old_id"
+              ;;
+            backup)
+              [[ "$current_status" == "in_progress" ]] || { echo "::error::no active Runner to back up"; exit 1; }
+              issue="$(request_backup "$current_id")"
+              echo "Backup requested via issue #$issue for Run $current_id"
+              cache="$(wait_backup_complete "$current_id")"
+              echo "Backup saved: $cache"
+              prune_fourth_completed_run
+              ;;
+            rotate)
+              if [[ "$current_status" == "in_progress" ]]; then
+                issue="$(request_backup "$current_id")"
+                echo "Rotation backup requested via issue #$issue for Run $current_id"
+                cache="$(wait_backup_complete "$current_id")"
+                echo "Rotation backup saved: $cache"
+                prune_fourth_completed_run
+              fi
+              backup="$(latest_cache)"
+              mode="new"
+              [[ -n "$backup" ]] && mode="restore"
+              old_id="$current_id"
+              dispatch_managed "$mode"
+              wait_new_run "$old_id"
+              ;;
+            stop)
+              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
+                gh api --method POST "repos/$REPO/actions/runs/$current_id/cancel" >/dev/null
+                echo "Cancel requested for Run $current_id"
+              else
+                echo "No active Run to stop"
+              fi
+              ;;
+            *)
+              echo "::error::unsupported action: $ACTION"
+              exit 1
+              ;;
+          esac
