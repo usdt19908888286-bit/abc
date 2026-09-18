@@ -18,6 +18,21 @@ on:
         description: Stable instance key
         required: true
         type: string
+      operation_id:
+        description: Idempotent control-plane operation ID
+        required: false
+        default: ''
+        type: string
+      source_run_id:
+        description: Original managed Run ID for a rotate/restart operation
+        required: false
+        default: '0'
+        type: string
+      automatic:
+        description: Whether Cloudflare scheduler owns retry-until-ready
+        required: false
+        default: 'false'
+        type: string
       config_b64:
         description: Base64 JSON instance configuration
         required: true
@@ -43,11 +58,14 @@ concurrency:
 jobs:
   automate:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
     env:
       GH_TOKEN: ${{ github.token }}
       ACTION: ${{ inputs.action }}
       INSTANCE_KEY: ${{ inputs.instance_key }}
+      OPERATION_ID: ${{ inputs.operation_id }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      AUTOMATIC: ${{ inputs.automatic }}
       CONFIG_B64: ${{ inputs.config_b64 }}
       BOOTSTRAP_TICKET: ${{ inputs.bootstrap_ticket }}
       WEB_URL: ${{ inputs.web_url }}
@@ -83,6 +101,10 @@ jobs:
           USE_S5="$(jq -r 'if .use_s5 then "true" else "false" end' "$cfg")"
 
           REPO="$GITHUB_REPOSITORY"
+          WEB_URL="${WEB_URL%/}"
+          OPERATION_ID="${OPERATION_ID:-op-${GITHUB_RUN_ID}}"
+          SOURCE_RUN_ID="${SOURCE_RUN_ID:-0}"
+          AUTOMATIC="$(printf '%s' "${AUTOMATIC:-false}" | tr '[:upper:]' '[:lower:]')"
           CONFIG_REPO_LC="$(printf '%s' "$CONFIG_REPO" | tr '[:upper:]' '[:lower:]')"
           REPO_LC="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
           if [[ -z "$ID" || ! "$ID" =~ ^[0-9]+$ ]]; then
@@ -128,10 +150,62 @@ jobs:
               ;;
           esac
 
+          cf_post() {
+            local path="$1"
+            local body="$2"
+            curl -fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+              -H "X-Bootstrap-Ticket: $BOOTSTRAP_TICKET" \
+              -H 'content-type: application/json' \
+              --data "$body" \
+              "$WEB_URL$path"
+          }
+
+          cf_status() {
+            local body
+            body="$(jq -cn \
+              --arg key "$INSTANCE_KEY" \
+              --arg repo "$REPO" \
+              --arg op "$OPERATION_ID" \
+              '{instanceKey:$key,repository:$repo,operationId:$op}')"
+            cf_post "/api/automation/status" "$body"
+          }
+
+          report_cf() {
+            local status="$1"
+            local message="${2:-}"
+            local ready_run_id="${3:-0}"
+            local body
+            body="$(jq -cn \
+              --arg key "$INSTANCE_KEY" \
+              --arg repo "$REPO" \
+              --arg op "$OPERATION_ID" \
+              --arg status "$status" \
+              --arg message "$message" \
+              --argjson source "${SOURCE_RUN_ID:-0}" \
+              --argjson ready "$ready_run_id" \
+              '{instanceKey:$key,repository:$repo,operationId:$op,status:$status,message:$message,sourceRunId:$source,readyRunId:$ready}')"
+            cf_post "/api/automation/report" "$body" >/dev/null
+          }
+
+          unexpected_error() {
+            local rc=$?
+            trap - ERR
+            if [[ "$AUTOMATIC" == "true" && "$ACTION" == "rotate" ]]; then
+              report_cf failed "unexpected control failure rc=$rc line=${BASH_LINENO[0]:-0}" 0 || true
+            fi
+            exit "$rc"
+          }
+          trap unexpected_error ERR
+
           latest_instance_run() {
             gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
               --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"· $ID /\")) | [.id,.status,(.conclusion // \"\"),(.created_at // \"\")] | @tsv" \
               | head -n 1 || true
+          }
+
+          run_status() {
+            local run_id="$1"
+            gh api "repos/$REPO/actions/runs/$run_id" --jq '[.status,(.conclusion // "")] | @tsv' 2>/dev/null || true
           }
 
           cache_for_run() {
@@ -172,48 +246,53 @@ jobs:
             local cache="" status="" conclusion=""
             for attempt in $(seq 1 160); do
               cache="$(cache_for_run "$run_id")"
-              read -r status conclusion < <(gh api "repos/$REPO/actions/runs/$run_id" --jq '[.status,(.conclusion // "")] | @tsv')
+              read -r status conclusion < <(run_status "$run_id")
               if [[ -n "$cache" && "$status" == "completed" && "$conclusion" == "success" ]]; then
                 echo "$cache"
                 return 0
               fi
               if [[ "$status" == "completed" && -n "$conclusion" && "$conclusion" != "success" ]]; then
-                echo "::error::backup run $run_id ended as $conclusion"
+                if [[ -n "$cache" ]]; then
+                  echo "::warning::source run ended $conclusion but backup cache exists: $cache" >&2
+                  echo "$cache"
+                  return 0
+                fi
+                echo "::error::backup run $run_id ended as $conclusion without a cache" >&2
                 return 1
               fi
               sleep 15
             done
-            echo "::error::backup timeout for run $run_id"
+            echo "::error::backup timeout for run $run_id" >&2
             return 1
           }
 
-          prune_fourth_completed_run() {
+          prune_managed_history() {
             mapfile -t completed < <(
               gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
-                --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"· $ID /\")) | select(.status == \"completed\") | .id" \
-                | head -n 4
+                --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"· $ID /\")) | select(.status == \"completed\") | .id"
             )
-            if (( ${#completed[@]} >= 4 )); then
-              victim="${completed[3]}"
-              echo "Deleting fourth completed history Run $victim; keeping ${completed[0]} ${completed[1]} ${completed[2]}"
-              gh api --method DELETE "repos/$REPO/actions/runs/$victim" >/dev/null
+            if (( ${#completed[@]} > 3 )); then
+              for victim in "${completed[@]:3}"; do
+                [[ -n "$victim" ]] || continue
+                echo "Deleting old managed Run $victim; keeping latest three completed"
+                gh api --method DELETE "repos/$REPO/actions/runs/$victim" >/dev/null || true
+              done
             fi
           }
 
           prune_control_history() {
-            # The current control Run is still in progress, so keep only the two
-            # newest completed control Runs for this instance. Once this Run
-            # completes, the instance will again have exactly three recent
-            # completed control Runs.
             mapfile -t completed_control < <(
               gh api "repos/$REPO/actions/workflows/cloud-manager-automation.yml/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
-                --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"$INSTANCE_KEY\")) | select(.status == \"completed\") | .id" \
-                | head -n 3
+                --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"$INSTANCE_KEY\")) | select(.status == \"completed\") | .id"
             )
-            if (( ${#completed_control[@]} >= 3 )); then
-              victim="${completed_control[2]}"
-              echo "Deleting oldest control history Run $victim; current Run will become the third retained entry"
-              gh api --method DELETE "repos/$REPO/actions/runs/$victim" >/dev/null
+            # Current control Run is active; keep two completed now so current
+            # becomes the third retained Run when it finishes.
+            if (( ${#completed_control[@]} > 2 )); then
+              for victim in "${completed_control[@]:2}"; do
+                [[ -n "$victim" ]] || continue
+                echo "Deleting old control Run $victim; current Run will become third retained"
+                gh api --method DELETE "repos/$REPO/actions/runs/$victim" >/dev/null || true
+              done
             fi
           }
 
@@ -242,7 +321,7 @@ jobs:
           wait_new_run() {
             local previous_id="$1"
             local line="" new_id=""
-            for attempt in $(seq 1 30); do
+            for attempt in $(seq 1 40); do
               line="$(latest_instance_run)"
               new_id="$(cut -f1 <<<"$line")"
               if [[ -n "$new_id" && "$new_id" != "$previous_id" ]]; then
@@ -251,36 +330,144 @@ jobs:
               fi
               sleep 2
             done
-            echo "::error::new managed run was not created"
+            echo "::error::new managed run was not created" >&2
             return 1
           }
 
-          echo "Automation action=$ACTION instance=$INSTANCE_KEY workflow=$WORKFLOW"
+          wait_ready() {
+            local run_id="$1"
+            local status_json="" service_status="" service_run_id=0 intent_status="" ready_id=0
+            local run_state="" conclusion=""
+            for attempt in $(seq 1 120); do
+              status_json="$(cf_status 2>/dev/null || true)"
+              if [[ -n "$status_json" ]]; then
+                service_status="$(jq -r '.serviceStatus // ""' <<<"$status_json")"
+                service_run_id="$(jq -r '.serviceRunId // 0' <<<"$status_json")"
+                intent_status="$(jq -r '.intentStatus // ""' <<<"$status_json")"
+                if [[ "$AUTOMATIC" == "true" && "$ACTION" == "rotate" && "$intent_status" == "complete" ]]; then
+                  ready_id="$(jq -r '.intentReadyRunId // .serviceRunId // 0' <<<"$status_json")"
+                  [[ "$ready_id" != "0" ]] && { echo "$ready_id"; return 0; }
+                fi
+                if [[ "$service_run_id" == "$run_id" && "$service_status" == "ready" ]]; then
+                  echo "$run_id"
+                  return 0
+                fi
+                if [[ "$service_run_id" == "$run_id" && "$service_status" == "failed" ]]; then
+                  echo "::error::managed run $run_id reported failed to Cloudflare" >&2
+                  return 1
+                fi
+              fi
+
+              read -r run_state conclusion < <(run_status "$run_id")
+              if [[ "$run_state" == "completed" ]]; then
+                if [[ "$conclusion" == "success" ]]; then
+                  echo "::error::managed run $run_id completed before reporting ready" >&2
+                else
+                  echo "::error::managed run $run_id ended as ${conclusion:-unknown}" >&2
+                fi
+                return 1
+              fi
+              sleep 15
+            done
+            echo "::error::managed run $run_id did not become ready within 30 minutes" >&2
+            return 1
+          }
+
+          cancel_run_if_active() {
+            local run_id="$1"
+            local st="" conclusion=""
+            read -r st conclusion < <(run_status "$run_id")
+            if [[ "$st" == "queued" || "$st" == "in_progress" ]]; then
+              gh api --method POST "repos/$REPO/actions/runs/$run_id/cancel" >/dev/null 2>&1 || true
+            fi
+          }
+
+          ensure_ready() {
+            local mode="$1"
+            local candidate="" candidate_id="" candidate_status=""
+            local before_id="" new_line="" new_id=""
+            local delay=20
+            local status_json="" ready_id=0
+
+            for attempt in 1 2 3; do
+              if [[ "$AUTOMATIC" == "true" && "$ACTION" == "rotate" ]]; then
+                status_json="$(cf_status 2>/dev/null || true)"
+                if [[ -n "$status_json" && "$(jq -r '.intentStatus // ""' <<<"$status_json")" == "complete" ]]; then
+                  ready_id="$(jq -r '.intentReadyRunId // .serviceRunId // 0' <<<"$status_json")"
+                  echo "Operation already completed by managed Run $ready_id" >&2
+                  echo "$ready_id"
+                  return 0
+                fi
+              fi
+
+              candidate="$(latest_instance_run)"
+              candidate_id="$(cut -f1 <<<"$candidate")"
+              candidate_status="$(cut -f2 <<<"$candidate")"
+
+              if [[ -n "$candidate_id" && "$candidate_id" != "0" && "$candidate_id" != "$SOURCE_RUN_ID"                     && ( "$candidate_status" == "queued" || "$candidate_status" == "in_progress" ) ]]; then
+                echo "Adopting existing replacement candidate Run $candidate_id" >&2
+                if wait_ready "$candidate_id"; then
+                  echo "$candidate_id"
+                  return 0
+                fi
+                cancel_run_if_active "$candidate_id"
+              fi
+
+              before_id="$candidate_id"
+              echo "Dispatching $SYSTEM managed mode=$mode attempt=$attempt/3" >&2
+              dispatch_managed "$mode"
+              new_line="$(wait_new_run "$before_id")"
+              new_id="$(cut -f1 <<<"$new_line")"
+              if [[ -z "$new_id" || "$new_id" == "0" ]]; then
+                echo "::warning::dispatch did not yield a managed Run" >&2
+              elif wait_ready "$new_id"; then
+                echo "$new_id"
+                return 0
+              else
+                cancel_run_if_active "$new_id"
+              fi
+
+              if (( attempt < 3 )); then
+                echo "Managed replacement attempt $attempt failed; retrying after ${delay}s" >&2
+                sleep "$delay"
+                delay=$((delay * 2))
+              fi
+            done
+            return 1
+          }
+
           prune_control_history
+          echo "Automation action=$ACTION instance=$INSTANCE_KEY operation=$OPERATION_ID source=$SOURCE_RUN_ID system=$SYSTEM"
+
+          if [[ "$AUTOMATIC" == "true" && "$ACTION" == "rotate" ]]; then
+            early_status="$(cf_status 2>/dev/null || true)"
+            if [[ -n "$early_status" && "$(jq -r '.intentStatus // ""' <<<"$early_status")" == "complete" ]]; then
+              echo "Operation $OPERATION_ID is already complete; exiting idempotently"
+              exit 0
+            fi
+            report_cf running "GitHub control run $GITHUB_RUN_ID started" 0 || true
+          fi
 
           current="$(latest_instance_run)"
           current_id="$(cut -f1 <<<"$current")"
           current_status="$(cut -f2 <<<"$current")"
-          old_id="$current_id"
 
           case "$ACTION" in
             start)
-              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
-                echo "Instance already has active Run $current_id ($current_status)"
-                exit 0
-              fi
-              dispatch_managed new
-              wait_new_run "$old_id"
+              ready_run="$(ensure_ready new)" || {
+                echo "::error::start failed after all managed retries"
+                exit 1
+              }
+              echo "START_READY_RUN=$ready_run"
               ;;
             restore)
-              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
-                echo "::error::instance already running: $current_id"
-                exit 1
-              fi
               backup="$(latest_cache)"
               [[ -n "$backup" ]] || { echo "::error::no restorable backup exists"; exit 1; }
-              dispatch_managed restore
-              wait_new_run "$old_id"
+              ready_run="$(ensure_ready restore)" || {
+                echo "::error::restore failed after all managed retries"
+                exit 1
+              }
+              echo "RESTORE_READY_RUN=$ready_run"
               ;;
             backup)
               [[ "$current_status" == "in_progress" ]] || { echo "::error::no active Runner to back up"; exit 1; }
@@ -288,27 +475,69 @@ jobs:
               echo "Backup requested via issue #$issue for Run $current_id"
               cache="$(wait_backup_complete "$current_id")"
               echo "Backup saved: $cache"
-              prune_fourth_completed_run
+              prune_managed_history
               ;;
             rotate)
-              if [[ "$current_status" == "in_progress" ]]; then
-                issue="$(request_backup "$current_id")"
-                echo "Rotation backup requested via issue #$issue for Run $current_id"
-                cache="$(wait_backup_complete "$current_id")"
-                echo "Rotation backup saved: $cache"
-                prune_fourth_completed_run
+              source_id="$SOURCE_RUN_ID"
+              if [[ -z "$source_id" || "$source_id" == "0" ]]; then
+                source_id="$current_id"
+                SOURCE_RUN_ID="$source_id"
+                if [[ "$AUTOMATIC" == "true" && "$source_id" != "0" ]]; then
+                  report_cf running "source Run locked to $source_id" 0 || true
+                fi
               fi
+
+              source_cache=""
+              if [[ -n "$source_id" && "$source_id" != "0" ]]; then
+                source_cache="$(cache_for_run "$source_id")"
+                read -r source_status source_conclusion < <(run_status "$source_id")
+                if [[ "$source_status" == "in_progress" || "$source_status" == "queued" ]]; then
+                  issue="$(request_backup "$source_id")"
+                  echo "Rotation backup requested via issue #$issue for source Run $source_id"
+                  source_cache="$(wait_backup_complete "$source_id")"
+                  echo "Rotation source backup saved: $source_cache"
+                elif [[ -n "$source_cache" ]]; then
+                  echo "Source Run $source_id already has backup cache: $source_cache"
+                else
+                  echo "::warning::source Run $source_id is not active and has no fresh cache; using latest available backup if present"
+                fi
+              fi
+
               backup="$(latest_cache)"
               mode="new"
               [[ -n "$backup" ]] && mode="restore"
-              old_id="$current_id"
-              dispatch_managed "$mode"
-              wait_new_run "$old_id"
+              echo "Replacement mode=$mode backup=${backup:-none}"
+
+              ready_run="$(ensure_ready "$mode")" || {
+                message="rotation replacement failed after all managed retries"
+                if [[ "$AUTOMATIC" == "true" ]]; then
+                  report_cf failed "$message" 0 || true
+                fi
+                echo "::error::$message"
+                exit 1
+              }
+
+              echo "ROTATION_READY_RUN=$ready_run"
+              prune_managed_history
+              if [[ "$AUTOMATIC" == "true" ]]; then
+                report_cf complete "replacement ready" "$ready_run" || true
+              fi
               ;;
             stop)
               if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
-                gh api --method POST "repos/$REPO/actions/runs/$current_id/cancel" >/dev/null
-                echo "Cancel requested for Run $current_id"
+                stopped=false
+                for cancel_attempt in 1 2 3; do
+                  gh api --method POST "repos/$REPO/actions/runs/$current_id/cancel" >/dev/null 2>&1 || true
+                  for _ in $(seq 1 20); do
+                    read -r st conclusion < <(run_status "$current_id")
+                    if [[ "$st" == "completed" ]]; then stopped=true; break; fi
+                    sleep 3
+                  done
+                  [[ "$stopped" == "true" ]] && break
+                  sleep 5
+                done
+                [[ "$stopped" == "true" ]] || { echo "::error::Run $current_id did not stop"; exit 1; }
+                echo "Stopped Run $current_id conclusion=$conclusion"
               else
                 echo "No active Run to stop"
               fi
@@ -318,3 +547,6 @@ jobs:
               exit 1
               ;;
           esac
+
+          prune_managed_history
+          echo "AUTOMATION_COMPLETE action=$ACTION operation=$OPERATION_ID"
