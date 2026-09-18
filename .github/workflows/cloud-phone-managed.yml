@@ -630,9 +630,9 @@ jobs:
           adb shell wm size 720x1600 || true
           adb shell wm density 280 || true
 
-          # Optional new-phone-only APK installation. Restore mode deliberately skips
-          # this block so backed-up application/data state is never overwritten.
-          if [ "${PHONE_MODE:-}" = 'new' ] && [ -n "${NEW_PHONE_APK_URLS_B64:-}" ]; then
+          # Desired-state APK installation/update. Run after both fresh boot and restore.
+          # adb install -r preserves app data; restored apps are updated in place.
+          if [ -n "${NEW_PHONE_APK_URLS_B64:-}" ]; then
             python3 - <<'PY' >/tmp/new-phone-apk-urls.txt
           import base64
           import json
@@ -672,19 +672,24 @@ jobs:
                 echo "::error::AUTO_APP_INVALID_APK index=${APP_INDEX}"
                 exit 1
               fi
-              echo "AUTO_APP_INSTALL_START index=${APP_INDEX}"
-              if ! adb install -r "$APP_FILE"; then
-                echo "::error::AUTO_APP_INSTALL_FAILED index=${APP_INDEX}"
-                exit 1
+              echo "AUTO_APP_INSTALL_START index=${APP_INDEX} mode=${PHONE_MODE:-unknown}"
+              INSTALL_OUTPUT=$(adb install -r "$APP_FILE" 2>&1) && INSTALL_RC=0 || INSTALL_RC=$?
+              printf '%s\n' "$INSTALL_OUTPUT"
+              if [ "$INSTALL_RC" -ne 0 ]; then
+                if printf '%s\n' "$INSTALL_OUTPUT" | grep -q 'INSTALL_FAILED_VERSION_DOWNGRADE'; then
+                  echo "::warning::AUTO_APP_KEEP_NEWER_INSTALLED index=${APP_INDEX}"
+                else
+                  echo "::error::AUTO_APP_INSTALL_FAILED index=${APP_INDEX}"
+                  exit "$INSTALL_RC"
+                fi
+              else
+                echo "AUTO_APP_INSTALL_OK index=${APP_INDEX}"
               fi
               rm -f "$APP_FILE"
-              echo "AUTO_APP_INSTALL_OK index=${APP_INDEX}"
             done </tmp/new-phone-apk-urls.txt
-            echo "AUTO_APP_INSTALL_COMPLETE count=${APP_INDEX}"
-          elif [ "${PHONE_MODE:-}" = 'restore' ]; then
-            echo 'RESTORE_SKIPS_AUTO_APP_INSTALL'
+            echo "AUTO_APP_INSTALL_COMPLETE count=${APP_INDEX} mode=${PHONE_MODE:-unknown}"
           else
-            echo 'NEW_PHONE_AUTO_APP_INSTALL_NONE'
+            echo "AUTO_APP_INSTALL_NONE mode=${PHONE_MODE:-unknown}"
           fi
 
           DEFAULT_PACKAGE="$PACKAGE_NAME"
