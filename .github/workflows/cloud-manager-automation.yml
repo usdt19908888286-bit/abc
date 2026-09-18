@@ -115,10 +115,7 @@ jobs:
             echo "::error::automation repository mismatch: config=$CONFIG_REPO current=$REPO"
             exit 1
           fi
-          if [[ "$BRANCH" != "$GITHUB_REF_NAME" ]]; then
-            echo "::error::automation branch mismatch: config=$BRANCH control=$GITHUB_REF_NAME"
-            exit 1
-          fi
+          echo "Control ref=$GITHUB_REF_NAME target ref=$BRANCH"
           if [[ "$INSTANCE_KEY" != "instance:$SYSTEM:$ID" ]]; then
             echo "::error::instance key mismatch: $INSTANCE_KEY != instance:$SYSTEM:$ID"
             exit 1
@@ -282,7 +279,7 @@ jobs:
 
           prune_control_history() {
             mapfile -t completed_control < <(
-              gh api "repos/$REPO/actions/workflows/cloud-manager-automation.yml/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
+              gh api "repos/$REPO/actions/workflows/cloud-manager-automation.yml/runs?branch=$GITHUB_REF_NAME&event=workflow_dispatch&per_page=100" \
                 --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"$INSTANCE_KEY\")) | select(.status == \"completed\") | .id"
             )
             # Current control Run is active; keep two completed now so current
@@ -454,13 +451,29 @@ jobs:
 
           case "$ACTION" in
             start)
-              ready_run="$(ensure_ready new)" || {
-                echo "::error::start failed after all managed retries"
-                exit 1
-              }
+              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
+                if wait_ready "$current_id"; then
+                  ready_run="$current_id"
+                else
+                  cancel_run_if_active "$current_id"
+                  ready_run="$(ensure_ready new)" || {
+                    echo "::error::start failed after all managed retries"
+                    exit 1
+                  }
+                fi
+              else
+                ready_run="$(ensure_ready new)" || {
+                  echo "::error::start failed after all managed retries"
+                  exit 1
+                }
+              fi
               echo "START_READY_RUN=$ready_run"
               ;;
             restore)
+              if [[ "$current_status" == "queued" || "$current_status" == "in_progress" ]]; then
+                echo "::error::instance already has active Run $current_id; use rotate for replacement"
+                exit 1
+              fi
               backup="$(latest_cache)"
               [[ -n "$backup" ]] || { echo "::error::no restorable backup exists"; exit 1; }
               ready_run="$(ensure_ready restore)" || {
