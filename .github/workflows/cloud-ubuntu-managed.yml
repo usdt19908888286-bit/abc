@@ -602,6 +602,21 @@ jobs:
             sudo rsync -aHAX /tmp/managed-desktop-backup/home/ "/home/${DESKTOP_USERNAME}/"
             sudo chown -R "${DESKTOP_USERNAME}:${DESKTOP_USERNAME}" "/home/${DESKTOP_USERNAME}"
 
+            # Every bind source that existed (or was materialized from a live
+            # container) before backup must exist again before Docker is allowed to
+            # resume. This catches non-portable application state before a daemon
+            # restart can silently create a directory where a file was expected.
+            if [ -s "$DOCKER_STATE/bind-mounts.tsv" ]; then
+              while IFS=$'\t' read -r bind_cid bind_name bind_source bind_dest bind_running || [ -n "$bind_source" ]; do
+                [ -n "$bind_source" ] || continue
+                if ! sudo test -e "$bind_source" && ! sudo test -L "$bind_source"; then
+                  echo "::error::Restored Docker bind source is missing: container=$bind_name source=$bind_source target=$bind_dest"
+                  exit 1
+                fi
+              done <"$DOCKER_STATE/bind-mounts.tsv"
+              echo 'MANAGED_UBUNTU_DOCKER_BIND_SOURCES_VERIFIED'
+            fi
+
             # Flatpak is reconstructed from signed remotes instead of restoring a
             # partial OSTree repository. We retain each remote's trusted GPG key,
             # recreate the remote, then reinstall the recorded refs. This avoids
@@ -766,6 +781,54 @@ jobs:
             managed_start_unit_file "$RESTORE_RUNTIME_DIR/sockets.txt"
             managed_start_unit_file "$RESTORE_RUNTIME_DIR/paths.txt"
             managed_start_unit_file "$RESTORE_RUNTIME_DIR/timers.txt"
+
+            # Restore Docker runtime state explicitly. The Docker daemon may restart
+            # containers with their own restart policy, but that is not enough for
+            # restart=no/on-failure containers. Only containers that were actually
+            # running when the backup began are required to be running here.
+            if [ -s "$DOCKER_STATE/running-containers.txt" ]; then
+              sudo systemctl start containerd.service >/dev/null 2>&1 || true
+              sudo systemctl start docker.socket docker.service >/dev/null 2>&1 || true
+              DOCKER_READY=0
+              for _ in $(seq 1 30); do
+                if sudo docker info >/dev/null 2>&1; then
+                  DOCKER_READY=1
+                  break
+                fi
+                sleep 1
+              done
+              [ "$DOCKER_READY" = '1' ] || { echo '::error::Docker daemon did not become ready after Ubuntu restore'; exit 1; }
+
+              DOCKER_RUNTIME_FAILED=()
+              for round in 1 2 3 4; do
+                DOCKER_RUNTIME_FAILED=()
+                while IFS= read -r container_name || [ -n "$container_name" ]; do
+                  [ -n "$container_name" ] || continue
+                  sudo docker inspect "$container_name" >/dev/null 2>&1                     || { echo "::error::Restored Docker container is missing: $container_name"; exit 1; }
+                  if [ "$(sudo docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)" != 'true' ]; then
+                    sudo docker start "$container_name" >/dev/null 2>&1 || true
+                  fi
+                done <"$DOCKER_STATE/running-containers.txt"
+
+                sleep 8
+                while IFS= read -r container_name || [ -n "$container_name" ]; do
+                  [ -n "$container_name" ] || continue
+                  [ "$(sudo docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)" = 'true' ]                     || DOCKER_RUNTIME_FAILED+=("$container_name")
+                done <"$DOCKER_STATE/running-containers.txt"
+                [ "${#DOCKER_RUNTIME_FAILED[@]}" -eq 0 ] && break
+              done
+
+              if [ "${#DOCKER_RUNTIME_FAILED[@]}" -gt 0 ]; then
+                printf '::error::Restored Docker containers did not remain running: %s\n' "${DOCKER_RUNTIME_FAILED[*]}"
+                for container_name in "${DOCKER_RUNTIME_FAILED[@]}"; do
+                  sudo docker inspect -f '{{.State.Error}}' "$container_name" 2>/dev/null || true
+                  sudo docker logs --tail 80 "$container_name" 2>&1 || true
+                done
+                exit 1
+              fi
+              echo 'MANAGED_UBUNTU_DOCKER_RUNTIME_RESTORED'
+            fi
+
             echo 'MANAGED_UBUNTU_RUNTIME_STATE_RESTORED'
             echo 'MANAGED_DESKTOP_RESTORE_APPLIED'
           else
@@ -1069,13 +1132,63 @@ jobs:
 
             # Capture Docker inventory while the daemon is still available. The
             # actual Docker root state is archived only after docker/containerd are
-            # fully quiesced below.
-            if command -v docker >/dev/null 2>&1; then
+            # fully quiesced below. V7 also repairs a portability edge case seen in
+            # installers that launch Compose from a temporary checkout and delete
+            # the bind-mount source afterwards: the running container still works,
+            # but the first daemon restart would fail. Materialize any missing bind
+            # source from the live container before taking the filesystem snapshot.
+            if command -v docker >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
               sudo docker version --format '{{json .}}' >/tmp/managed-desktop-backup/docker/version.json 2>/dev/null || true
               sudo docker ps -a --no-trunc --format '{{json .}}' >/tmp/managed-desktop-backup/docker/containers.jsonl 2>/dev/null || true
               sudo docker image ls --no-trunc --format '{{json .}}' >/tmp/managed-desktop-backup/docker/images.jsonl 2>/dev/null || true
               sudo docker volume ls --format '{{json .}}' >/tmp/managed-desktop-backup/docker/volumes.jsonl 2>/dev/null || true
               sudo docker network ls --no-trunc --format '{{json .}}' >/tmp/managed-desktop-backup/docker/networks.jsonl 2>/dev/null || true
+              sudo docker ps --format '{{.Names}}' | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u \
+                >/tmp/managed-desktop-backup/docker/running-containers.txt
+
+              mapfile -t MANAGED_DOCKER_IDS < <(sudo docker ps -aq)
+              if [ "${#MANAGED_DOCKER_IDS[@]}" -gt 0 ]; then
+                sudo docker inspect "${MANAGED_DOCKER_IDS[@]}" >/tmp/managed-desktop-backup/docker/inspect.json
+                python3 - <<'PY' >/tmp/managed-desktop-backup/docker/bind-mounts.tsv
+          import json
+          data = json.load(open('/tmp/managed-desktop-backup/docker/inspect.json', encoding='utf-8'))
+          for item in data:
+              cid = str(item.get('Id') or '')
+              name = str(item.get('Name') or '').lstrip('/')
+              running = 'true' if bool((item.get('State') or {}).get('Running')) else 'false'
+              for mount in item.get('Mounts') or []:
+                  if str(mount.get('Type') or '') != 'bind':
+                      continue
+                  source = str(mount.get('Source') or '')
+                  dest = str(mount.get('Destination') or '')
+                  if source and dest and '\t' not in source and '\n' not in source and '\t' not in dest and '\n' not in dest:
+                      print('\t'.join((cid, name, source, dest, running)))
+          PY
+              else
+                : >/tmp/managed-desktop-backup/docker/inspect.json
+                : >/tmp/managed-desktop-backup/docker/bind-mounts.tsv
+              fi
+
+              while IFS=$'\t' read -r bind_cid bind_name bind_source bind_dest bind_running || [ -n "$bind_source" ]; do
+                [ -n "$bind_source" ] || continue
+                if sudo test -e "$bind_source" || sudo test -L "$bind_source"; then
+                  continue
+                fi
+                if [ "$bind_running" != 'true' ]; then
+                  echo "::error::Docker bind source is missing and its container is not running, cannot materialize safely: container=$bind_name source=$bind_source target=$bind_dest"
+                  exit 1
+                fi
+                sudo mkdir -p "$(dirname "$bind_source")"
+                sudo docker cp "$bind_cid:$bind_dest" "$bind_source"
+                if ! sudo test -e "$bind_source" && ! sudo test -L "$bind_source"; then
+                  echo "::error::Docker bind source materialization failed: container=$bind_name source=$bind_source target=$bind_dest"
+                  exit 1
+                fi
+                echo "MANAGED_UBUNTU_DOCKER_BIND_MATERIALIZED container=$bind_name source=$bind_source target=$bind_dest"
+              done </tmp/managed-desktop-backup/docker/bind-mounts.tsv
+            else
+              : >/tmp/managed-desktop-backup/docker/running-containers.txt
+              : >/tmp/managed-desktop-backup/docker/bind-mounts.tsv
             fi
 
             # End interactive/user workloads, disable systemd activators, then stop
@@ -1110,7 +1223,6 @@ jobs:
               '/var/lib/cloud', '/var/lib/snapd', '/var/lib/flatpak',
               '/var/lib/tailscale', '/var/lib/docker', '/var/lib/containerd',
               '/var/lib/NetworkManager', '/var/lib/dbus',
-              '/var/lib/waagent', '/var/lib/private', '/root/.cache',
               '/var/lib/waagent', '/var/lib/private', '/root/.cache',
               f'/home/{desktop_user}/.cache',
               f'/home/{desktop_user}/.local/share/flatpak/repo',
@@ -1466,18 +1578,18 @@ jobs:
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 6,
+              'version': 7,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-home-plus-installer-state-v6-docker-cold-quiesced-runtime-delta-without-dot-cache',
-              'features': ['apt','apt-config','snap','flatpak','docker-cold-state','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state','runtime-unit-delta'],
+              'scope': 'managed-home-plus-installer-state-v7-docker-bind-runtime-quiesced-delta-without-dot-cache',
+              'features': ['apt','apt-config','snap','flatpak','docker-cold-state','docker-bind-materialize','docker-runtime-state','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state','runtime-unit-delta'],
           }, separators=(',', ':')))
           PY
-            echo 'MANAGED_UBUNTU_V6_BACKUP_STAGED'
+            echo 'MANAGED_UBUNTU_V7_BACKUP_STAGED'
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
