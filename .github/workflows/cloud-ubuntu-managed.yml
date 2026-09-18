@@ -1178,13 +1178,37 @@ jobs:
                   echo "::error::Docker bind source is missing and its container is not running, cannot materialize safely: container=$bind_name source=$bind_source target=$bind_dest"
                   exit 1
                 fi
+                # docker cp cannot be used here: when the host bind source was
+                # unlinked after container start, Docker may try to reconstruct the
+                # bind mount before copy and fail before entering the live mount
+                # namespace. docker exec runs inside the already-running container,
+                # where the mounted inode is still accessible.
+                bind_kind=$(sudo docker exec "$bind_cid" sh -c 'if [ -f "$1" ]; then echo file; elif [ -d "$1" ]; then echo dir; elif [ -L "$1" ]; then echo link; else echo other; fi' sh "$bind_dest")
                 sudo mkdir -p "$(dirname "$bind_source")"
-                sudo docker cp "$bind_cid:$bind_dest" "$bind_source"
+                case "$bind_kind" in
+                  file)
+                    sudo docker exec "$bind_cid" cat "$bind_dest" | sudo tee "$bind_source" >/dev/null
+                    bind_mode=$(sudo docker exec "$bind_cid" stat -c '%a' "$bind_dest" 2>/dev/null || true)
+                    [ -z "$bind_mode" ] || sudo chmod "$bind_mode" "$bind_source"
+                    ;;
+                  dir)
+                    sudo mkdir -p "$bind_source"
+                    sudo docker exec "$bind_cid" tar -C "$bind_dest" -cpf - . | sudo tar -C "$bind_source" -xpf -
+                    ;;
+                  link)
+                    bind_link=$(sudo docker exec "$bind_cid" readlink "$bind_dest")
+                    sudo ln -s "$bind_link" "$bind_source"
+                    ;;
+                  *)
+                    echo "::error::Unsupported live Docker bind target type: container=$bind_name source=$bind_source target=$bind_dest"
+                    exit 1
+                    ;;
+                esac
                 if ! sudo test -e "$bind_source" && ! sudo test -L "$bind_source"; then
                   echo "::error::Docker bind source materialization failed: container=$bind_name source=$bind_source target=$bind_dest"
                   exit 1
                 fi
-                echo "MANAGED_UBUNTU_DOCKER_BIND_MATERIALIZED container=$bind_name source=$bind_source target=$bind_dest"
+                echo "MANAGED_UBUNTU_DOCKER_BIND_MATERIALIZED kind=$bind_kind container=$bind_name source=$bind_source target=$bind_dest"
               done </tmp/managed-desktop-backup/docker/bind-mounts.tsv
             else
               : >/tmp/managed-desktop-backup/docker/running-containers.txt
@@ -1578,18 +1602,18 @@ jobs:
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 7,
+              'version': 8,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-home-plus-installer-state-v7-docker-bind-runtime-quiesced-delta-without-dot-cache',
+              'scope': 'managed-home-plus-installer-state-v8-live-bind-materialize-runtime-quiesced-delta-without-dot-cache',
               'features': ['apt','apt-config','snap','flatpak','docker-cold-state','docker-bind-materialize','docker-runtime-state','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state','runtime-unit-delta'],
           }, separators=(',', ':')))
           PY
-            echo 'MANAGED_UBUNTU_V7_BACKUP_STAGED'
+            echo 'MANAGED_UBUNTU_V8_BACKUP_STAGED'
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
