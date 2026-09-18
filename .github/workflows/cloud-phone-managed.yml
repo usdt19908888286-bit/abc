@@ -1043,7 +1043,11 @@ jobs:
             -camera-back none
             -camera-front none
           )
-          if [ -n "${DEVICE_MODEL:-}" ] || [ "$PHONE_MODE" = 'restore' ]; then
+          # A normal full-AVD restore must boot with the same read-only system
+          # mode as a fresh emulator. Forcing -writable-system only on restore can
+          # leave newer API 37+ guests with adbd permanently offline. Writable
+          # system is needed only when custom device identity patching is requested.
+          if [ -n "${DEVICE_MODEL:-}" ]; then
             EMU_ARGS+=( -writable-system )
           fi
           if [ "${USE_S5:-false}" = 'true' ]; then
