@@ -134,7 +134,7 @@ jobs:
               CACHE_PREFIX="managed-desktop-ubuntu-$ID-"
               COMMAND_TITLE="Cloud Ubuntu Command $ID"
               [[ -n "$RUNNER_IMAGE" ]] || RUNNER_IMAGE="ubuntu-24.04"
-              [[ -n "$DESKTOP_USERNAME" ]] || DESKTOP_USERNAME="clouduser"
+              [[ -n "$DESKTOP_USERNAME" ]] || DESKTOP_USERNAME="admin"
               ;;
             android)
               WORKFLOW="cloud-phone-managed.yml"
