@@ -87,6 +87,8 @@ jobs:
           UBUNTU_SOCKS5_PASSWORD=$(jq -r '.ubuntuSocks5Password // empty' /tmp/cloud-bootstrap.json)
           UBUNTU_SOCKS5_HOSTNAME=$(jq -r '.ubuntuSocks5Hostname // empty' /tmp/cloud-bootstrap.json)
           FANOUT_ENABLED=$(jq -r 'if .fanoutEnabled then "true" else "false" end' /tmp/cloud-bootstrap.json)
+          FANOUT_HTTP_HOSTNAME=$(jq -r '.fanoutHttpHostname // empty' /tmp/cloud-bootstrap.json)
+          FANOUT_TCP_HOSTNAME=$(jq -r '.fanoutTcpHostname // empty' /tmp/cloud-bootstrap.json)
           [ -n "$TS_CLIENT_ID" ] && [ -n "$TS_CLIENT_SECRET" ] || { echo '::error::Cloudflare Tailscale configuration is incomplete'; exit 1; }
           [ -n "$CLOUD_PASSWORD" ] || { echo '::error::Cloudflare desktop password is empty'; exit 1; }
           if [ "$TUNNEL_MODE" = 'cloudflare' ] || [ "$TUNNEL_MODE" = 'dual' ]; then
@@ -97,8 +99,8 @@ jobs:
             [ -n "$UBUNTU_SOCKS5_HOSTNAME" ] && [ -n "$CF_TUNNEL_TOKEN" ] || { echo '::error::Ubuntu SOCKS5 Cloudflare bootstrap is incomplete'; exit 1; }
           fi
           for value in "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_PASSWORD"; do [ -z "$value" ] || echo "::add-mask::$value"; done
-          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\nUBUNTU_SOCKS5_ENABLED=%s\nUBUNTU_SOCKS5_PORT=%s\nUBUNTU_SOCKS5_USERNAME=%s\nUBUNTU_SOCKS5_PASSWORD=%s\nUBUNTU_SOCKS5_HOSTNAME=%s\nFANOUT_ENABLED=%s\n' \
-            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_ENABLED" "$UBUNTU_SOCKS5_PORT" "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" "$UBUNTU_SOCKS5_HOSTNAME" "$FANOUT_ENABLED" >> "$GITHUB_ENV"
+          printf 'TS_CLIENT_ID=%s\nTS_CLIENT_SECRET=%s\nCLOUD_PASSWORD=%s\nINSTANCE_KEY=%s\nTUNNEL_MODE=%s\nTS_DNS_HOSTNAME=%s\nCF_TUNNEL_HOSTNAME=%s\nCF_TUNNEL_TOKEN=%s\nUBUNTU_SOCKS5_ENABLED=%s\nUBUNTU_SOCKS5_PORT=%s\nUBUNTU_SOCKS5_USERNAME=%s\nUBUNTU_SOCKS5_PASSWORD=%s\nUBUNTU_SOCKS5_HOSTNAME=%s\nFANOUT_ENABLED=%s\nFANOUT_HTTP_HOSTNAME=%s\nFANOUT_TCP_HOSTNAME=%s\n' \
+            "$TS_CLIENT_ID" "$TS_CLIENT_SECRET" "$CLOUD_PASSWORD" "$INSTANCE_KEY" "$TUNNEL_MODE" "$TS_DNS_HOSTNAME" "$CF_TUNNEL_HOSTNAME" "$CF_TUNNEL_TOKEN" "$UBUNTU_SOCKS5_ENABLED" "$UBUNTU_SOCKS5_PORT" "$UBUNTU_SOCKS5_USERNAME" "$UBUNTU_SOCKS5_PASSWORD" "$UBUNTU_SOCKS5_HOSTNAME" "$FANOUT_ENABLED" "$FANOUT_HTTP_HOSTNAME" "$FANOUT_TCP_HOSTNAME" >> "$GITHUB_ENV"
           rm -f /tmp/cloud-bootstrap.json
           echo 'CLOUDFLARE_BOOTSTRAP_OK'
 
@@ -971,11 +973,17 @@ jobs:
           TS_IPV4=$(tailscale ip -4 | head -n1)
           [ -n "$TS_IPV4" ] || { echo '::error::No Tailscale IPv4 address was assigned'; exit 1; }
           INSTANCE_KEY="instance:ubuntu:${MACHINE_ID}"
+          S5_READY=false
+          FANOUT_READY=false
+          [ "${UBUNTU_SOCKS5_ENABLED:-false}" = 'true' ] && S5_READY=true
+          [ "${FANOUT_ENABLED:-false}" = 'true' ] && FANOUT_READY=true
           BODY=$(jq -nc \
             --arg key "$INSTANCE_KEY" --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
             --arg node "ubuntu-${MACHINE_ID}" --arg ts "${TS_IPV4}:22" \
             --arg tsHost "${TS_DNS_HOSTNAME:-}" --arg cf "${CF_TUNNEL_HOSTNAME:-}" --arg mode "${TUNNEL_MODE:-tailscale}" \
-            '{instanceKey:$key,repository:$repo,runId:$run,nodeName:$node,address:$ts,tailscaleAddress:$ts,tailscaleHostname:$tsHost,cloudflareAddress:$cf,cloudflareHostname:$cf,tunnelMode:$mode,status:"in_progress"}')
+            --argjson s5Ready "$S5_READY" --arg s5Host "${UBUNTU_SOCKS5_HOSTNAME:-}" \
+            --argjson fanoutReady "$FANOUT_READY" --arg fanHttp "${FANOUT_HTTP_HOSTNAME:-}" --arg fanTcp "${FANOUT_TCP_HOSTNAME:-}" \
+            '{instanceKey:$key,repository:$repo,runId:$run,nodeName:$node,address:$ts,tailscaleAddress:$ts,tailscaleHostname:$tsHost,cloudflareAddress:$cf,cloudflareHostname:$cf,tunnelMode:$mode,ubuntuSocks5Ready:$s5Ready,ubuntuSocks5Hostname:$s5Host,fanoutReady:$fanoutReady,fanoutHttpHostname:$fanHttp,fanoutTcpHostname:$fanTcp,status:"in_progress"}')
           WEB_URL="${WEB_URL%/}"
           case "$WEB_URL" in https://*) ;; *) echo '::error::Cloudflare control URL is invalid'; exit 1 ;; esac
           curl -fsS --retry 3 -H "X-Bootstrap-Ticket: ${BOOTSTRAP_TICKET}" -H 'content-type: application/json' --data "$BODY" "${WEB_URL}/api/runner/report" -o /tmp/cloud-report.json
