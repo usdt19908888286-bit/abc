@@ -200,6 +200,23 @@ jobs:
             fi
           }
 
+          prune_control_history() {
+            # The current control Run is still in progress, so keep only the two
+            # newest completed control Runs for this instance. Once this Run
+            # completes, the instance will again have exactly three recent
+            # completed control Runs.
+            mapfile -t completed_control < <(
+              gh api "repos/$REPO/actions/workflows/cloud-manager-automation.yml/runs?branch=$BRANCH&event=workflow_dispatch&per_page=100" \
+                --jq ".workflow_runs[] | select((.display_title // .name // \"\") | contains(\"$INSTANCE_KEY\")) | select(.status == \"completed\") | .id" \
+                | head -n 3
+            )
+            if (( ${#completed_control[@]} >= 3 )); then
+              victim="${completed_control[2]}"
+              echo "Deleting oldest control history Run $victim; current Run will become the third retained entry"
+              gh api --method DELETE "repos/$REPO/actions/runs/$victim" >/dev/null
+            fi
+          }
+
           dispatch_managed() {
             local mode="$1"
             local payload
@@ -239,6 +256,7 @@ jobs:
           }
 
           echo "Automation action=$ACTION instance=$INSTANCE_KEY workflow=$WORKFLOW"
+          prune_control_history
 
           current="$(latest_instance_run)"
           current_id="$(cut -f1 <<<"$current")"
