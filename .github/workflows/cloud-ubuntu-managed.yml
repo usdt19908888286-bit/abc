@@ -362,6 +362,7 @@ jobs:
               '/etc/ssh/sshd_config.d/99-managed-cloud.conf', '/var/lib/apt',
               '/var/lib/dpkg', '/var/lib/systemd', '/var/lib/cloud',
               '/var/lib/snapd', '/var/lib/flatpak', '/var/lib/tailscale',
+              '/var/lib/docker', '/var/lib/containerd',
               '/var/lib/NetworkManager', '/var/lib/dbus', '/var/lib/waagent',
               '/var/lib/private', '/root/.cache',
           ]
@@ -533,7 +534,33 @@ jobs:
             sudo pkill -TERM -u "$DESKTOP_USERNAME" >/dev/null 2>&1 || true
             sleep 2
             managed_quiesce_from_dir "$RESTORE_QUIESCE_DIR"
+
+            # Package replay may have started Docker again. Freeze it explicitly
+            # before applying either a V6 cold Docker archive or a legacy system
+            # delta that may still contain /var/lib/docker paths.
+            sudo systemctl stop docker.socket docker.service containerd.service >/dev/null 2>&1 || true
+            sudo pkill -TERM -x dockerd >/dev/null 2>&1 || true
+            sudo pkill -TERM -x containerd >/dev/null 2>&1 || true
+            sudo pkill -TERM -f 'containerd-shim' >/dev/null 2>&1 || true
+            sleep 2
+            sudo pkill -KILL -x dockerd >/dev/null 2>&1 || true
+            sudo pkill -KILL -x containerd >/dev/null 2>&1 || true
+            sudo pkill -KILL -f 'containerd-shim' >/dev/null 2>&1 || true
+            if pgrep -x dockerd >/dev/null 2>&1 || pgrep -x containerd >/dev/null 2>&1 || pgrep -f 'containerd-shim' >/dev/null 2>&1; then
+              echo '::error::Docker/containerd did not quiesce before Ubuntu restore'
+              exit 1
+            fi
             echo 'MANAGED_UBUNTU_QUIESCED_FOR_RESTORE'
+
+            DOCKER_STATE=/tmp/managed-desktop-backup/docker
+            if [ -s "$DOCKER_STATE/state.tar" ]; then
+              if [ -s "$DOCKER_STATE/state.tar.sha256" ]; then
+                (cd "$DOCKER_STATE" && sha256sum -c state.tar.sha256)
+              fi
+              sudo rm -rf /var/lib/docker /var/lib/containerd
+              sudo tar --acls --xattrs --sparse --numeric-owner -xpf "$DOCKER_STATE/state.tar" -C /
+              echo 'MANAGED_UBUNTU_DOCKER_COLD_RESTORE_APPLIED'
+            fi
 
             SYSTEM_STATE=/tmp/managed-desktop-backup/system
             if [ -s "$SYSTEM_STATE/delta.tar" ]; then
@@ -1006,6 +1033,7 @@ jobs:
               /tmp/managed-desktop-backup/flatpak/user-keys \
               /tmp/managed-desktop-backup/systemd \
               /tmp/managed-desktop-backup/cron \
+              /tmp/managed-desktop-backup/docker \
               /tmp/managed-desktop-backup/system
 
             # Capture exact desired runtime state before anything is stopped. New
@@ -1039,6 +1067,17 @@ jobs:
               : >/tmp/managed-ubuntu-current-snap-list.txt
             fi
 
+            # Capture Docker inventory while the daemon is still available. The
+            # actual Docker root state is archived only after docker/containerd are
+            # fully quiesced below.
+            if command -v docker >/dev/null 2>&1; then
+              sudo docker version --format '{{json .}}' >/tmp/managed-desktop-backup/docker/version.json 2>/dev/null || true
+              sudo docker ps -a --no-trunc --format '{{json .}}' >/tmp/managed-desktop-backup/docker/containers.jsonl 2>/dev/null || true
+              sudo docker image ls --no-trunc --format '{{json .}}' >/tmp/managed-desktop-backup/docker/images.jsonl 2>/dev/null || true
+              sudo docker volume ls --format '{{json .}}' >/tmp/managed-desktop-backup/docker/volumes.jsonl 2>/dev/null || true
+              sudo docker network ls --no-trunc --format '{{json .}}' >/tmp/managed-desktop-backup/docker/networks.jsonl 2>/dev/null || true
+            fi
+
             # End interactive/user workloads, disable systemd activators, then stop
             # every non-infrastructure running service. This includes baseline Docker,
             # containerd, cron, snapd and any future application daemon without having
@@ -1068,9 +1107,10 @@ jobs:
               '/etc/resolv.conf', '/etc/machine-id', '/etc/fstab', '/etc/crypttab',
               '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow',
               '/etc/subuid', '/etc/subgid', '/etc/netplan', '/etc/network',
-              '/etc/cloud', '/var/lib/apt', '/var/lib/dpkg', '/var/lib/systemd',
               '/var/lib/cloud', '/var/lib/snapd', '/var/lib/flatpak',
-              '/var/lib/tailscale', '/var/lib/NetworkManager', '/var/lib/dbus',
+              '/var/lib/tailscale', '/var/lib/docker', '/var/lib/containerd',
+              '/var/lib/NetworkManager', '/var/lib/dbus',
+              '/var/lib/waagent', '/var/lib/private', '/root/.cache',
               '/var/lib/waagent', '/var/lib/private', '/root/.cache',
               f'/home/{desktop_user}/.cache',
               f'/home/{desktop_user}/.local/share/flatpak/repo',
@@ -1168,7 +1208,37 @@ jobs:
               sys.exit(1)
           print(f'MANAGED_UBUNTU_SNAPSHOT_WRITERS_QUIET infraExcludes={len(infra_excludes)}')
           PY
+
+            # Docker/containerd are explicitly frozen even though the generic
+            # systemd quiescer already stops non-infrastructure services. This
+            # prevents container logs, overlay metadata, browser/GPU caches, and
+            # containerd snapshots from mutating while the cold state is archived.
+            sudo systemctl stop docker.socket docker.service containerd.service >/dev/null 2>&1 || true
+            sudo pkill -TERM -x dockerd >/dev/null 2>&1 || true
+            sudo pkill -TERM -x containerd >/dev/null 2>&1 || true
+            sudo pkill -TERM -f 'containerd-shim' >/dev/null 2>&1 || true
+            sleep 2
+            sudo pkill -KILL -x dockerd >/dev/null 2>&1 || true
+            sudo pkill -KILL -x containerd >/dev/null 2>&1 || true
+            sudo pkill -KILL -f 'containerd-shim' >/dev/null 2>&1 || true
+            if pgrep -x dockerd >/dev/null 2>&1 || pgrep -x containerd >/dev/null 2>&1 || pgrep -f 'containerd-shim' >/dev/null 2>&1; then
+              echo '::error::Docker/containerd did not quiesce before Ubuntu backup'
+              exit 1
+            fi
             echo 'MANAGED_UBUNTU_QUIESCED_FOR_BACKUP'
+
+            DOCKER_STATE_PATHS=()
+            [ ! -d /var/lib/docker ] || DOCKER_STATE_PATHS+=(var/lib/docker)
+            [ ! -d /var/lib/containerd ] || DOCKER_STATE_PATHS+=(var/lib/containerd)
+            if [ "${#DOCKER_STATE_PATHS[@]}" -gt 0 ]; then
+              sudo tar --acls --xattrs --sparse --numeric-owner \
+                --exclude='var/lib/docker/containers/*/*-json.log' \
+                -C / -cpf /tmp/managed-desktop-backup/docker/state.tar \
+                "${DOCKER_STATE_PATHS[@]}"
+              sudo chown "$USER:$USER" /tmp/managed-desktop-backup/docker/state.tar
+              (cd /tmp/managed-desktop-backup/docker && sha256sum state.tar >state.tar.sha256)
+              echo "MANAGED_UBUNTU_DOCKER_COLD_BACKUP_BYTES=$(stat -c %s /tmp/managed-desktop-backup/docker/state.tar)"
+            fi
 
             sudo rsync -aHAX --delete --exclude='.cache/' --exclude='.local/share/flatpak/repo/' "/home/${DESKTOP_USERNAME}/" /tmp/managed-desktop-backup/home/
 
@@ -1281,8 +1351,9 @@ jobs:
               '/etc/passwd', '/etc/group', '/etc/shadow', '/etc/gshadow',
               '/etc/subuid', '/etc/subgid', '/etc/netplan', '/etc/network',
               '/etc/cloud', '/etc/ssh/ssh_host_*',
-              '/etc/ssh/sshd_config.d/99-managed-cloud.conf', '/var/lib/apt',
-              '/var/lib/dpkg', '/var/lib/systemd', '/var/lib/cloud',
+              '/var/lib/snapd', '/var/lib/flatpak', '/var/lib/tailscale',
+              '/var/lib/docker', '/var/lib/containerd',
+              '/var/lib/NetworkManager', '/var/lib/dbus', '/var/lib/waagent',
               '/var/lib/snapd', '/var/lib/flatpak', '/var/lib/tailscale',
               '/var/lib/NetworkManager', '/var/lib/dbus', '/var/lib/waagent',
               '/var/lib/private', '/root/.cache',
@@ -1395,18 +1466,18 @@ jobs:
           import json, os
           from datetime import datetime, timezone
           print(json.dumps({
-              'version': 5,
+              'version': 6,
               'system_type': 'ubuntu',
               'machine_id': os.environ['MACHINE_ID'],
               'desktop_username': os.environ['DESKTOP_USERNAME'],
               'runner_image': os.environ['RUNNER_IMAGE'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'created_at': datetime.now(timezone.utc).isoformat(),
-              'scope': 'managed-home-plus-installer-state-v5-quiesced-runtime-delta-without-dot-cache',
-              'features': ['apt','apt-config','snap','flatpak','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state','runtime-unit-delta'],
+              'scope': 'managed-home-plus-installer-state-v6-docker-cold-quiesced-runtime-delta-without-dot-cache',
+              'features': ['apt','apt-config','snap','flatpak','docker-cold-state','system-delta','systemd','cron','quiesced-snapshot','runtime-unit-state','runtime-unit-delta'],
           }, separators=(',', ':')))
           PY
-            echo 'MANAGED_UBUNTU_V5_BACKUP_STAGED'
+            echo 'MANAGED_UBUNTU_V6_BACKUP_STAGED'
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
