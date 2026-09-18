@@ -30,7 +30,7 @@ on:
       desktop_username:
         description: Ubuntu local account used for SSH
         required: true
-        default: clouduser
+        default: admin
         type: string
       bootstrap_ticket:
         description: Cloudflare bootstrap ticket
@@ -57,7 +57,7 @@ jobs:
     env:
       MACHINE_ID: ${{ inputs.machine_id || '001' }}
       MACHINE_NAME: ${{ inputs.machine_name || 'UBUNTU-001' }}
-      DESKTOP_USERNAME: ${{ inputs.desktop_username || 'clouduser' }}
+      DESKTOP_USERNAME: ${{ inputs.desktop_username || 'admin' }}
       RUNNER_IMAGE: ${{ inputs.runner_image }}
       MACHINE_MODE: ${{ inputs.mode || 'new' }}
       WEB_URL: ${{ inputs.web_url }}
