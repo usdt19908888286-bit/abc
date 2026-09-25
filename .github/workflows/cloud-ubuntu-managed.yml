@@ -1,3 +1,4 @@
+# csm-managed-workflow-version: 1
 name: Managed Ubuntu Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Ubuntu' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'ubuntu-24.04' }} / ${{ inputs.mode || 'new' }}
 
