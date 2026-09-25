@@ -434,10 +434,39 @@ jobs:
                 RESTORE_APT_SPECS=()
                 for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
                   saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
+                  actual_status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)
+                  actual_version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+                  # A fresh GitHub runner may already contain a newer package than
+                  # the saved backup. Never downgrade a working newer baseline just
+                  # to reproduce an older snapshot version.
+                  if [ "$actual_status" = installed ]; then
+                    if [ -z "$saved_version" ]; then
+                      continue
+                    fi
+                    if dpkg --compare-versions "$actual_version" ge "$saved_version"; then
+                      if dpkg --compare-versions "$actual_version" gt "$saved_version"; then
+                        echo "MANAGED_UBUNTU_APT_KEEP_NEWER package=$pkg current=$actual_version saved=$saved_version"
+                      fi
+                      continue
+                    fi
+                  fi
                   if [ -n "$saved_version" ]; then RESTORE_APT_SPECS+=("${pkg}=${saved_version}"); else RESTORE_APT_SPECS+=("$pkg"); fi
                 done
-                if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_SPECS[@]}"; then
-                  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}" || true
+                if [ "${#RESTORE_APT_SPECS[@]}" -gt 0 ]; then
+                  if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_SPECS[@]}"; then
+                    FALLBACK_APT_PACKAGES=()
+                    for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
+                      saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
+                      actual_status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)
+                      actual_version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+                      if [ "$actual_status" != installed ] || { [ -n "$saved_version" ] && dpkg --compare-versions "$actual_version" lt "$saved_version"; }; then
+                        FALLBACK_APT_PACKAGES+=("$pkg")
+                      fi
+                    done
+                    if [ "${#FALLBACK_APT_PACKAGES[@]}" -gt 0 ]; then
+                      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${FALLBACK_APT_PACKAGES[@]}" || true
+                    fi
+                  fi
                 fi
 
                 NEED_DEB_APT_PACKAGES=()
@@ -445,21 +474,37 @@ jobs:
                   saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
                   actual_status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)
                   actual_version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
-                  if [ "$actual_status" != installed ] || { [ -n "$saved_version" ] && [ "$actual_version" != "$saved_version" ]; }; then
+                  if [ "$actual_status" != installed ] || { [ -n "$saved_version" ] && dpkg --compare-versions "$actual_version" lt "$saved_version"; }; then
                     NEED_DEB_APT_PACKAGES+=("$pkg")
+                  elif [ -n "$saved_version" ] && dpkg --compare-versions "$actual_version" gt "$saved_version"; then
+                    echo "MANAGED_UBUNTU_APT_KEEP_NEWER package=$pkg current=$actual_version saved=$saved_version"
                   fi
                 done
                 if [ "${#NEED_DEB_APT_PACKAGES[@]}" -gt 0 ]; then
                   shopt -s nullglob
                   RESTORE_DEBS=("$APT_STATE"/debs/*.deb)
                   shopt -u nullglob
-                  if [ "${#RESTORE_DEBS[@]}" -gt 0 ]; then
-                    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "${RESTORE_DEBS[@]}" || true
-                  fi
+                  for pkg in "${NEED_DEB_APT_PACKAGES[@]}"; do
+                    saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
+                    MATCHED_DEB=""
+                    for deb in "${RESTORE_DEBS[@]}"; do
+                      deb_pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || true)
+                      [ "$deb_pkg" = "$pkg" ] || continue
+                      deb_version=$(dpkg-deb -f "$deb" Version 2>/dev/null || true)
+                      if [ -z "$saved_version" ] || [ "$deb_version" = "$saved_version" ]; then
+                        MATCHED_DEB="$deb"
+                        break
+                      fi
+                    done
+                    if [ -n "$MATCHED_DEB" ]; then
+                      echo "MANAGED_UBUNTU_APT_CACHED_DEB package=$pkg saved=$saved_version file=$(basename "$MATCHED_DEB")"
+                      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$MATCHED_DEB" || true
+                    fi
+                  done
                 fi
 
                 UNRESTORED_APT_PACKAGES=()
-                VERSION_MISMATCH_APT_PACKAGES=()
+                TOO_OLD_APT_PACKAGES=()
                 for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
                   actual_status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)
                   if [ "$actual_status" != installed ]; then
@@ -468,16 +513,18 @@ jobs:
                   fi
                   saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
                   actual_version=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
-                  if [ -n "$saved_version" ] && [ "$actual_version" != "$saved_version" ]; then
-                    VERSION_MISMATCH_APT_PACKAGES+=("${pkg}:${actual_version}->${saved_version}")
+                  if [ -n "$saved_version" ] && dpkg --compare-versions "$actual_version" lt "$saved_version"; then
+                    TOO_OLD_APT_PACKAGES+=("${pkg}:${actual_version}<${saved_version}")
+                  elif [ -n "$saved_version" ] && dpkg --compare-versions "$actual_version" gt "$saved_version"; then
+                    echo "MANAGED_UBUNTU_APT_KEEP_NEWER package=$pkg current=$actual_version saved=$saved_version"
                   fi
                 done
                 if [ "${#UNRESTORED_APT_PACKAGES[@]}" -gt 0 ]; then
                   printf '::error::Ubuntu package restore failed for: %s\n' "${UNRESTORED_APT_PACKAGES[*]}"
                   exit 1
                 fi
-                if [ "${#VERSION_MISMATCH_APT_PACKAGES[@]}" -gt 0 ]; then
-                  printf '::error::Exact saved apt version restore failed for: %s\n' "${VERSION_MISMATCH_APT_PACKAGES[*]}"
+                if [ "${#TOO_OLD_APT_PACKAGES[@]}" -gt 0 ]; then
+                  printf '::error::Minimum saved apt version restore failed for: %s\n' "${TOO_OLD_APT_PACKAGES[*]}"
                   exit 1
                 fi
                 if [ "${#RESTORE_APT_MANUAL[@]}" -gt 0 ]; then
