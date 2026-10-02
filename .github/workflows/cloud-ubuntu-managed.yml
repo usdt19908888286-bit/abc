@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 1
+# csm-managed-workflow-version: 2
 name: Managed Ubuntu Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Ubuntu' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'ubuntu-24.04' }} / ${{ inputs.mode || 'new' }}
 
@@ -309,8 +309,35 @@ jobs:
             done <"$file"
           }
 
+          # This VM is a long-lived GitHub-hosted runner. Package replay can make
+          # needrestart consider the provider agent itself stale. Restarting that
+          # parent service terminates this Actions process tree, so explicitly
+          # defer runner/provider infrastructure services.
+          sudo install -d -m 0755 /etc/needrestart/conf.d
+          sudo tee /etc/needrestart/conf.d/99-cloud-manager-runner.conf >/dev/null <<'EOF'
+          $nrconf{override_rc}{qr(^hosted-compute-agent\.service$)} = 0;
+          $nrconf{override_rc}{qr(^waagent\.service$)} = 0;
+          $nrconf{override_rc}{qr(^walinuxagent\.service$)} = 0;
+          $nrconf{override_rc}{qr(^WALinuxAgent\.service$)} = 0;
+          $nrconf{override_rc}{qr(^actions\.runner\..*\.service$)} = 0;
+          $nrconf{override_rc}{qr(^github-actions-runner.*\.service$)} = 0;
+          $nrconf{override_rc}{qr(^user@\d+\.service$)} = 0;
+          EOF
+
+          # Do not let unattended APT work mutate/restart the ephemeral host while
+          # it is serving the interactive desktop. Manual apt commands still work.
+          # /etc/apt is excluded from managed backups, so this guard is session-only.
+          sudo tee /etc/apt/apt.conf.d/99-cloud-manager-session-guard >/dev/null <<'EOF'
+          APT::Periodic::Enable "0";
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Download-Upgradeable-Packages "0";
+          APT::Periodic::AutocleanInterval "0";
+          APT::Periodic::Unattended-Upgrade "0";
+          EOF
+          echo 'MANAGED_UBUNTU_HOST_MAINTENANCE_GUARD_READY'
+
           sudo apt-get update -qq
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server rsync jq dpkg-repack acl
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y openssh-server rsync jq dpkg-repack acl
 
           # V3/V4 use a clean-runner baseline. Installer/package state is replayed by
           # package managers where possible; non-package filesystem changes are
@@ -454,7 +481,7 @@ jobs:
                   if [ -n "$saved_version" ]; then RESTORE_APT_SPECS+=("${pkg}=${saved_version}"); else RESTORE_APT_SPECS+=("$pkg"); fi
                 done
                 if [ "${#RESTORE_APT_SPECS[@]}" -gt 0 ]; then
-                  if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_SPECS[@]}"; then
+                  if ! sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y --no-install-recommends "${RESTORE_APT_SPECS[@]}"; then
                     FALLBACK_APT_PACKAGES=()
                     for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
                       saved_version=$(awk -F '\t' -v p="$pkg" '$1 == p {print $2; exit}' "$APT_STATE/versions.tsv" 2>/dev/null || true)
@@ -465,7 +492,7 @@ jobs:
                       fi
                     done
                     if [ "${#FALLBACK_APT_PACKAGES[@]}" -gt 0 ]; then
-                      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${FALLBACK_APT_PACKAGES[@]}" || true
+                      sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y --no-install-recommends "${FALLBACK_APT_PACKAGES[@]}" || true
                     fi
                   fi
                 fi
@@ -499,7 +526,7 @@ jobs:
                     done
                     if [ -n "$MATCHED_DEB" ]; then
                       echo "MANAGED_UBUNTU_APT_CACHED_DEB package=$pkg saved=$saved_version file=$(basename "$MATCHED_DEB")"
-                      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$MATCHED_DEB" || true
+                      sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y --no-install-recommends "$MATCHED_DEB" || true
                     fi
                   done
                 fi
@@ -538,7 +565,7 @@ jobs:
               mapfile -t RESTORE_APT_PACKAGES < <(sed '/^[[:space:]]*$/d' "$APT_STATE/manual-added.txt" | LC_ALL=C sort -u)
               if [ "${#RESTORE_APT_PACKAGES[@]}" -gt 0 ]; then
                 sudo apt-get update -qq || true
-                sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}" || true
+                sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y --no-install-recommends "${RESTORE_APT_PACKAGES[@]}" || true
                 for pkg in "${RESTORE_APT_PACKAGES[@]}"; do
                   dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed \
                     || { echo "::error::Ubuntu V2 package restore failed for $pkg"; exit 1; }
@@ -915,7 +942,7 @@ jobs:
           echo "::add-mask::${UBUNTU_SOCKS5_PASSWORD}"
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends dante-server libpam-pwdfile openssl
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y --no-install-recommends dante-server libpam-pwdfile openssl
 
           # SOCKS5 credentials are intentionally isolated from Linux/SSH accounts.
           # The proxy username may be identical to DESKTOP_USERNAME without sharing
@@ -1673,8 +1700,70 @@ jobs:
             echo 'MANAGED_DESKTOP_BACKUP_STAGED'
           }
 
+          managed_session_diagnostics() {
+            local reason="$1"
+            set +e
+            echo "::warning::MANAGED_UBUNTU_SESSION_DIAGNOSTICS reason=${reason} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "MANAGED_UBUNTU_SESSION_CGROUP=$(tr '\n' ';' </proc/$$/cgroup 2>/dev/null)"
+            if [ -s "$MANAGED_UBUNTU_INFRA_UNITS" ]; then
+              while IFS= read -r unit || [ -n "$unit" ]; do
+                [ -n "$unit" ] || continue
+                echo "MANAGED_UBUNTU_INFRA_STATE unit=${unit} active=$(systemctl is-active "$unit" 2>/dev/null || true) failed=$(systemctl is-failed "$unit" 2>/dev/null || true)"
+              done <"$MANAGED_UBUNTU_INFRA_UNITS"
+            fi
+            echo '--- managed Ubuntu maintenance timers ---'
+            systemctl list-timers --all --no-pager 2>/dev/null \
+              | grep -Ei 'apt|unattended|packagekit|update|upgrade' || true
+            echo '--- managed Ubuntu provider-agent journal ---'
+            timeout 8s sudo journalctl -b --no-pager -n 180 \
+              -u hosted-compute-agent.service \
+              -u walinuxagent.service \
+              -u waagent.service \
+              -u unattended-upgrades.service \
+              -u apt-daily.service \
+              -u apt-daily-upgrade.service 2>/dev/null || true
+            echo '--- managed Ubuntu process tree ---'
+            ps -eo pid,ppid,stat,etimes,cmd --sort=ppid 2>/dev/null | tail -n 160 || true
+          }
+
+          managed_session_signal() {
+            local signal="$1" code="$2"
+            trap - TERM INT
+            echo "::error::MANAGED_UBUNTU_SESSION_SIGNAL signal=${signal} code=${code}"
+            managed_session_diagnostics "signal-${signal}"
+            exit "$code"
+          }
+          trap 'managed_session_signal TERM 143' TERM
+          trap 'managed_session_signal INT 130' INT
+
+          RUN_STARTED_AT=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.run_started_at // .created_at // ""' 2>/dev/null || true)
+          if [ -n "$RUN_STARTED_AT" ] && RUN_STARTED_EPOCH=$(date -d "$RUN_STARTED_AT" +%s 2>/dev/null); then
+            SESSION_SAFETY_DEADLINE=$((RUN_STARTED_EPOCH + 335 * 60))
+            SESSION_SAFETY_SOURCE=github-run-start
+          else
+            # If GitHub metadata is temporarily unavailable, use a conservative
+            # local fallback that still leaves ample time for a multi-GB cache save.
+            SESSION_SAFETY_DEADLINE=$(($(date +%s) + 300 * 60))
+            SESSION_SAFETY_SOURCE=local-fallback
+          fi
+          echo "MANAGED_UBUNTU_SESSION_SAFETY deadline_epoch=${SESSION_SAFETY_DEADLINE} source=${SESSION_SAFETY_SOURCE}"
+
           COMMAND_TITLE="Cloud Ubuntu Command ${MACHINE_ID}"
+          LAST_HEARTBEAT=0
           while true; do
+            NOW_EPOCH=$(date +%s)
+            if [ "$LAST_HEARTBEAT" -eq 0 ] || [ $((NOW_EPOCH - LAST_HEARTBEAT)) -ge 300 ]; then
+              INFRA_SUMMARY=""
+              if [ -s "$MANAGED_UBUNTU_INFRA_UNITS" ]; then
+                while IFS= read -r unit || [ -n "$unit" ]; do
+                  [ -n "$unit" ] || continue
+                  INFRA_SUMMARY="${INFRA_SUMMARY}${unit}=$(systemctl is-active "$unit" 2>/dev/null || true);"
+                done <"$MANAGED_UBUNTU_INFRA_UNITS"
+              fi
+              echo "MANAGED_UBUNTU_SESSION_HEARTBEAT epoch=${NOW_EPOCH} ssh=$(systemctl is-active ssh 2>/dev/null || true) infra=${INFRA_SUMMARY}"
+              LAST_HEARTBEAT="$NOW_EPOCH"
+            fi
+
             ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
               --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | .number" \
               2>/dev/null | head -n1 || true)
@@ -1695,6 +1784,15 @@ jobs:
                 fi
               fi
             fi
+
+            if [ "$NOW_EPOCH" -ge "$SESSION_SAFETY_DEADLINE" ]; then
+              echo "::warning::MANAGED_UBUNTU_SAFETY_BACKUP_TRIGGERED epoch=${NOW_EPOCH}; control-plane backup command was not received before the local 335-minute safety deadline"
+              stage_backup
+              echo 'should_save=true' >> "$GITHUB_OUTPUT"
+              echo 'MANAGED_UBUNTU_SAFETY_BACKUP_STAGED'
+              exit 0
+            fi
+
             sleep 10
             systemctl is-active --quiet ssh || sudo systemctl restart ssh
           done
