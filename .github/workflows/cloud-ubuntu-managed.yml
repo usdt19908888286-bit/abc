@@ -334,6 +334,17 @@ jobs:
           APT::Periodic::AutocleanInterval "0";
           APT::Periodic::Unattended-Upgrade "0";
           EOF
+          # Runtime-only masks live under /run and therefore cannot leak into
+          # the managed backup. They prevent a later timer/service activation from
+          # updating packages or restarting provider services behind this job.
+          for unit in \
+            apt-daily.timer apt-daily.service \
+            apt-daily-upgrade.timer apt-daily-upgrade.service \
+            unattended-upgrades.service packagekit.service; do
+            sudo systemctl stop "$unit" >/dev/null 2>&1 || true
+            sudo systemctl mask --runtime "$unit" >/dev/null 2>&1 || true
+          done
+          sudo systemctl daemon-reload >/dev/null 2>&1 || true
           echo 'MANAGED_UBUNTU_HOST_MAINTENANCE_GUARD_READY'
 
           sudo apt-get update -qq
