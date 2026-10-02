@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026100201
+# csm-managed-workflow-version: 2026100202
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -4707,6 +4707,7 @@ jobs:
 
       - name: Prune older Windows backup caches
         if: steps.session.outputs.should_save == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
