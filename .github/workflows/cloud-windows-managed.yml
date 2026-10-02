@@ -1,4 +1,4 @@
-# csm-managed-workflow-version: 2026091713
+# csm-managed-workflow-version: 2026100201
 name: Managed Windows Cloud PC
 run-name: ${{ inputs.machine_name || 'Managed Windows' }} · ${{ inputs.machine_id || '001' }} / ${{ inputs.runner_image || 'windows-2025' }} / ${{ inputs.mode || 'new' }}
 
@@ -4600,11 +4600,79 @@ jobs:
 
 
       - name: Save Windows user backup to GitHub Actions Cache
+        id: save_primary_cache
         if: steps.session.outputs.should_save == 'true'
+        continue-on-error: true
         uses: actions/cache/save@v5
         with:
           path: '${{ runner.temp }}\managed-desktop-backup'
           key: managed-desktop-windows-${{ inputs.machine_id }}-${{ github.run_id }}
+
+      - name: Verify primary Windows backup cache
+        id: verify_primary_cache
+        if: steps.session.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $expected = "managed-desktop-windows-$env:MACHINE_ID-$env:GITHUB_RUN_ID"
+          $found = $false
+          for ($attempt = 1; $attempt -le 8; $attempt++) {
+            $response = & gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100&sort=created_at&direction=desc" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $response) {
+              try {
+                $items = @((($response | ConvertFrom-Json).actions_caches))
+                $found = @($items | Where-Object { [string]$_.key -eq $expected }).Count -gt 0
+              } catch {
+                $found = $false
+              }
+            }
+            if ($found) { break }
+            Start-Sleep -Seconds 5
+          }
+          "exists=$($found.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($found) {
+            Write-Host "MANAGED_WINDOWS_PRIMARY_BACKUP_CACHE_CONFIRMED key=$expected"
+          } else {
+            Write-Warning "Primary cache key was not persisted; fallback save will be attempted: $expected"
+          }
+
+      - name: Save Windows backup with fallback cache key
+        if: steps.session.outputs.should_save == 'true' && steps.verify_primary_cache.outputs.exists != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: '${{ runner.temp }}\managed-desktop-backup'
+          key: managed-desktop-windows-${{ inputs.machine_id }}-retry-${{ github.run_attempt }}-${{ github.run_id }}
+
+      - name: Verify Windows backup cache persisted
+        if: steps.session.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prefix = "managed-desktop-windows-$env:MACHINE_ID-"
+          $runId = [string]$env:GITHUB_RUN_ID
+          $cache = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $response = & gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100&sort=created_at&direction=desc"
+            if ($LASTEXITCODE -eq 0 -and $response) {
+              $items = @((($response | ConvertFrom-Json).actions_caches))
+              $cache = $items | Where-Object {
+                $key = [string]$_.key
+                $key.StartsWith($prefix,[System.StringComparison]::OrdinalIgnoreCase) -and
+                ($key -eq "$prefix$runId" -or $key.EndsWith("-$runId",[System.StringComparison]::OrdinalIgnoreCase))
+              } | Sort-Object created_at -Descending | Select-Object -First 1
+            }
+            if ($null -ne $cache) { break }
+            Start-Sleep -Seconds 5
+          }
+          if ($null -eq $cache) {
+            throw "Windows backup cache did not persist for run $runId after primary and fallback save attempts"
+          }
+          Write-Host "MANAGED_WINDOWS_BACKUP_CACHE_CONFIRMED id=$($cache.id) key=$($cache.key) size=$($cache.size_in_bytes)"
 
       - name: Close consumed Windows backup command
         if: steps.session.outputs.should_save == 'true'
@@ -4612,11 +4680,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $issueFile = Join-Path $env:RUNNER_TEMP 'managed-backup-issue-number.txt'
+          $closed = $true
           if (Test-Path $issueFile) {
             $issueNo = (Get-Content $issueFile -Raw).Trim()
             if ($issueNo -match '^\d+$') {
-              & gh api --method PATCH "/repos/$env:GITHUB_REPOSITORY/issues/$issueNo" -f state=closed | Out-Null
+              $closed = $false
+              for ($attempt = 1; $attempt -le 5; $attempt++) {
+                & gh api --method PATCH "/repos/$env:GITHUB_REPOSITORY/issues/$issueNo" -f state=closed | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                  $closed = $true
+                  Write-Host "MANAGED_WINDOWS_BACKUP_COMMAND_CLOSED issue=$issueNo attempt=$attempt"
+                  break
+                }
+                Write-Warning "Failed to close consumed backup command issue=$issueNo attempt=$attempt; retrying"
+                Start-Sleep -Seconds ([Math]::Min(15, 2 * $attempt))
+              }
+              if (-not $closed) {
+                Write-Warning "Backup is safely persisted but command issue=$issueNo could not be closed; future control runs may reuse it"
+              }
             }
           }
           Write-Host 'MANAGED_DESKTOP_BACKUP_SAVED'
