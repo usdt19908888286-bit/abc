@@ -254,7 +254,17 @@ jobs:
                   echo "$cache"
                   return 0
                 fi
-                echo "::error::backup run $run_id ended as $conclusion without a cache" >&2
+                echo "::warning::backup run $run_id ended as $conclusion; waiting briefly for cache propagation" >&2
+                for grace in $(seq 1 6); do
+                  sleep 10
+                  cache="$(cache_for_run "$run_id")"
+                  if [[ -n "$cache" ]]; then
+                    echo "::warning::backup cache appeared during completion grace period: $cache" >&2
+                    echo "$cache"
+                    return 0
+                  fi
+                done
+                echo "::error::backup run $run_id ended as $conclusion without a cache after propagation grace period" >&2
                 return 1
               fi
               sleep 15
